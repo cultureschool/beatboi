@@ -678,8 +678,10 @@ struct EditorView: View {
                     .frame(height: 1)
                     .padding(.vertical, 2)
                 HStack {
-                    Text("CHANNEL SENDS")
+                    Text("CHANNEL SENDS / PULSE 1 · PULSE 2 · TRIANGLE · DRUM")
                         .font(.system(size: 8, weight: .black, design: .monospaced))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.55)
                         .foregroundStyle(Color.gbInk)
                     Spacer()
                     Text("0% DRY / 100% WET")
@@ -687,7 +689,7 @@ struct EditorView: View {
                         .foregroundStyle(Color.screenShadow)
                 }
                 ForEach(ByteChannel.allCases) { channel in
-                    RestoredAmountCard(title: "SEND \\(channel.title)", amount: store.effectSendPercent(channel)) { store.setEffectSend(channel: channel, percent: $0); requestPlaybackRefresh() }
+                    RestoredAmountCard(title: "FX SEND / \(channel == .pulseA ? "PULSE 1" : channel == .pulseB ? "PULSE 2" : channel.title)", amount: store.effectSendPercent(channel)) { store.setEffectSend(channel: channel, percent: $0); requestPlaybackRefresh() }
                 }
             }
         }
