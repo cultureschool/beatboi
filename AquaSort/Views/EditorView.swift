@@ -19,6 +19,7 @@ struct EditorView: View {
     @State private var patternRenameText = ""
     @State private var patternRenameID: UUID?
     @State private var playbackRefreshTask: Task<Void, Never>?
+    @State private var scrubbedSongSlot: Int?
 
     private var pageTitle: String {
         switch page {
@@ -43,7 +44,7 @@ struct EditorView: View {
             GeometryReader { proxy in
                 ArcadeShell {
                     VStack(spacing: 0) {
-                        ScrollView(.vertical, showsIndicators: false) {
+                        FittedEditorContent {
                             restoredPageContent
                                 .frame(maxWidth: .infinity, alignment: .top)
                                 .padding(.horizontal, 10)
@@ -51,8 +52,6 @@ struct EditorView: View {
                                 .padding(.bottom, 18)
                         }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .scrollBounceBehavior(.basedOnSize)
-                        .scrollIndicators(.hidden)
 
                         restoredPageSwitcher
                             .padding(.horizontal, 5)
@@ -136,7 +135,7 @@ struct EditorView: View {
                 .overlay(Capsule().stroke(Color.plasticHighlight, lineWidth: 1))
             }
             HStack(spacing: 8) {
-                Text(page == 0 ? "PERFORMANCE / 4 PARTS" : page == 1 ? "SOUND DESIGN / PATCH + FX" : "ARRANGEMENT / 16 SLOTS")
+                Text(page == 0 ? "PERFORMANCE / 4 PARTS" : page == 1 ? "SOUND DESIGN / PATCH + FX" : "ARRANGEMENT / \(store.songArrangementLength) SLOTS")
                     .font(.system(size: 8, weight: .black, design: .monospaced))
                     .tracking(0.6)
                     .foregroundStyle(Color.amber)
@@ -195,7 +194,7 @@ struct EditorView: View {
     private var restoredSongPage: some View {
         VStack(spacing: 10) {
             restoredHeader
-            HardwareSection(title: "SONG MACHINE", detail: "16 BARS / LOOP-BOUNDARY SAFE") {
+            HardwareSection(title: "SONG MACHINE", detail: "\(store.songArrangementLength) BARS / LOOP-BOUNDARY SAFE") {
                 VStack(spacing: 9) {
                     restoredTransport
                     songTimelineReadout
@@ -215,15 +214,37 @@ struct EditorView: View {
                     .font(.system(size: 9, weight: .black, design: .monospaced))
                     .foregroundStyle(Color.gbLight)
                 Spacer()
-                Text(currentSongSlot >= 0 ? "BAR \(String(format: "%02d", currentSongSlot + 1)) / 16" : "BAR — / 16")
+                Text(arrangementReadoutSlot.map { "BAR \(String(format: "%02d", $0 + 1)) / \(store.songArrangementLength)" } ?? "BAR — / \(store.songArrangementLength)")
                     .font(.system(size: 8, weight: .black, design: .monospaced))
-                    .foregroundStyle(Color.amber)
+                    .foregroundStyle(arrangementReadoutSlot.map { restoredSongColor(at: $0) } ?? Color.amber)
             }
             HStack(spacing: 3) {
-                ForEach(0..<16, id: \.self) { index in
-                    SongTimelineTick(index: index, current: index == currentSongSlot)
+                GeometryReader { proxy in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.screenShadow.opacity(0.28))
+                        if let scrubbedSongSlot {
+                            Capsule()
+                                .fill(restoredSongColor(at: scrubbedSongSlot))
+                                .frame(width: max(12, proxy.size.width * CGFloat(scrubbedSongSlot + 1) / CGFloat(max(1, store.songArrangementLength))))
+                        }
+                        HStack(spacing: 2) {
+                            ForEach(0..<store.songArrangementLength, id: \.self) { index in
+                                SongTimelineTick(index: index, current: index == currentSongSlot, color: restoredSongColor(at: index), showLabel: store.songArrangementLength <= 32)
+                            }
+                        }
+                    }
+                    .contentShape(Rectangle())
+                    .gesture(DragGesture(minimumDistance: 0).onChanged { gesture in
+                        scrubSongTimeline(at: gesture.location.x, width: proxy.size.width)
+                    }.onEnded { gesture in
+                        scrubSongTimeline(at: gesture.location.x, width: proxy.size.width, commit: true)
+                    })
                 }
+                .frame(height: 22)
             }
+            Text("DRAG THE TIMELINE TO AUDITION A BAR  ·  ACTIVE PATTERN COLOR MATCHES BELOW")
+                .font(.system(size: 6, weight: .black, design: .monospaced))
+                .foregroundStyle(Color.mutedText)
             .animation(.easeOut(duration: 0.12), value: currentSongSlot)
             .accessibilityHidden(true)
         }
@@ -234,19 +255,33 @@ struct EditorView: View {
     }
 
     private var songArrangementPanel: some View {
-        LCDPanel(title: "ARRANGEMENT TIMELINE / 16 BARS") {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("TAP EMPTY BAR TO ASSIGN CURRENT PATTERN")
+        LCDPanel(title: "ARRANGEMENT TIMELINE / \(store.songArrangementLength) BARS") {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 5) {
+                    Text("LENGTH")
                         .font(.system(size: 7, weight: .black, design: .monospaced))
+                        .foregroundStyle(Color.screenShadow)
+                    ForEach([16, 32, 64], id: \.self) { length in
+                        Button { setSongArrangementLength(length) } label: {
+                            Text("\(length)")
+                                .font(.system(size: 8, weight: .black, design: .monospaced))
+                                .foregroundStyle(store.songArrangementLength == length ? Color.gbInk : Color.screenShadow)
+                                .frame(minWidth: 38, minHeight: 30)
+                                .background(store.songArrangementLength == length ? Color.amber : Color.screenShadow.opacity(0.12))
+                                .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.screenShadow.opacity(0.55), lineWidth: 1))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("\(length) bar arrangement")
+                        .accessibilityAddTraits(store.songArrangementLength == length ? .isSelected : [])
+                    }
                     Spacer()
-                    Text("SWIPE ↑↓ TO CYCLE")
-                        .font(.system(size: 7, weight: .black, design: .monospaced))
+                    Text("TAP ASSIGN · SWIPE ↑↓ CYCLE")
+                        .font(.system(size: 6, weight: .black, design: .monospaced))
+                        .foregroundStyle(Color.screenShadow)
                 }
-                .foregroundStyle(Color.screenShadow)
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 5), count: 4), spacing: 7) {
-                    ForEach(0..<store.project.songArrangement.count, id: \.self) { index in
-                        RestoredSongPad(index: index, slot: store.songSlot(at: index), pattern: restoredSongPattern(at: index), color: restoredSongColor(at: index), current: index == currentSongSlot) {
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: store.songArrangementLength > 16 ? 3 : 5), count: store.songArrangementLength > 16 ? 8 : 4), spacing: store.songArrangementLength > 16 ? 4 : 7) {
+                    ForEach(0..<store.songArrangementLength, id: \.self) { index in
+                        RestoredSongPad(index: index, slot: store.songSlot(at: index), pattern: restoredSongPattern(at: index), color: restoredSongColor(at: index), current: index == currentSongSlot, compact: store.songArrangementLength > 16) {
                             if store.songSlot(at: index).patternID == nil { store.assignSongPattern(at: index, patternID: store.currentPatternID) } else { store.clearSongSlot(at: index) }
                             requestPlaybackRefresh()
                         } onCycle: { delta in
@@ -624,10 +659,48 @@ struct EditorView: View {
     }
 
     private var restoredKeyNames: [String] { ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"] }
+    private var arrangementReadoutSlot: Int? {
+        if currentSongSlot >= 0 { return currentSongSlot }
+        if let scrubbedSongSlot, store.songSlot(at: scrubbedSongSlot).patternID != nil { return scrubbedSongSlot }
+        return store.project.songArrangement.prefix(store.songArrangementLength).firstIndex(where: { $0.patternID == store.currentPatternID })
+    }
     private func restoredSongPattern(at index: Int) -> BytePattern? { guard let id = store.songSlot(at: index).patternID else { return nil }; return store.project.patterns.first(where: { $0.id == id }) }
     private func restoredSongColor(at index: Int) -> Color {
         guard let id = store.songSlot(at: index).patternID, let patternIndex = store.project.patterns.firstIndex(where: { $0.id == id }) else { return Color.gbLight.opacity(0.25) }
         return Color(hue: Double(patternIndex) / 16.0, saturation: 0.82, brightness: 0.95)
+    }
+    private func setSongArrangementLength(_ length: Int) {
+        guard !store.isPlaying else { store.presentToast("STOP PLAYBACK TO CHANGE ARRANGEMENT LENGTH"); return }
+        store.setSongArrangementLength(length)
+        scrubbedSongSlot = nil
+        currentSongSlot = -1
+        requestPlaybackRefresh()
+    }
+    private func scrubSongTimeline(at x: CGFloat, width: CGFloat, commit: Bool = false) {
+        guard width > 0 else { return }
+        let index = min(max(Int((x / width * CGFloat(store.songArrangementLength)).rounded(.down)), 0), store.songArrangementLength - 1)
+        scrubbedSongSlot = index
+        guard store.songSlot(at: index).patternID != nil else {
+            if commit { store.presentToast("BAR \(index + 1) IS EMPTY") }
+            return
+        }
+        if store.isPlaying {
+            audio.seekSongSlot(index)
+            currentSongSlot = index
+        } else if commit {
+            startSongPlayback(at: index)
+        }
+    }
+    private func startSongPlayback(at slot: Int? = nil) {
+        guard store.project.hasAssignedSongPattern else { store.presentToast("ASSIGN A PATTERN FIRST"); return }
+        store.isPlaying = true
+        audio.play(project: store.project, patterns: store.songPlaybackPatterns, useSongArrangement: true, startSongSlot: slot) { step, songSlot in
+            Task { @MainActor in
+                currentStep = step
+                currentSongSlot = songSlot
+                scrubbedSongSlot = songSlot >= 0 ? songSlot : scrubbedSongSlot
+            }
+        }
     }
     private func restoredClamp(_ value: Int, _ low: Int, _ high: Int) -> Int { min(max(value, low), high) }
     private func restoredChannelAccent(_ channel: ByteChannel) -> Color {
@@ -669,7 +742,7 @@ struct EditorView: View {
         playbackRefreshTask?.cancel()
         if store.isPlaying { pendingPatternID = nil; pendingPage = nil; store.stopPlayback(); audio.stop(); return }
         store.isPlaying = true
-        audio.play(project: store.project, patterns: page == 2 ? store.songPlaybackPatterns : [selectedPattern], useSongArrangement: page == 2) { step, slot in
+        audio.play(project: store.project, patterns: page == 2 ? store.songPlaybackPatterns : [selectedPattern], useSongArrangement: page == 2, startSongSlot: page == 2 ? scrubbedSongSlot : nil) { step, slot in
             Task { @MainActor in
                 if step == 0 && currentStep == 15 {
                     if let pendingPatternID { store.selectPattern(pendingPatternID); self.pendingPatternID = nil }
@@ -686,6 +759,46 @@ struct EditorView: View {
         if url.pathExtension.lowercased() == "mid", let imported = ByteMIDI.importIntoProject(data, project: store.project) { store.importProject(imported); store.presentToast("MIDI IMPORTED") }
         else if let imported = try? JSONDecoder.bytePocketDecoder.decode(ByteProject.self, from: data) { store.importProject(imported); store.presentToast("PROJECT OPENED") }
         else { store.presentToast("UNKNOWN FILE") }
+    }
+}
+
+/// Fits each complete editor page into the phone viewport instead of introducing a
+/// competing vertical scroll surface. The page keeps its natural layout and is scaled
+/// only when its full height exceeds the available space, preserving all hit targets.
+private struct FittedEditorContent<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+    @State private var contentHeight: CGFloat = 1
+
+    var body: some View {
+        GeometryReader { proxy in
+            content()
+                .frame(width: proxy.size.width)
+                .fixedSize(horizontal: false, vertical: true)
+                .background(
+                    GeometryReader { measured in
+                        Color.clear.preference(key: FittedContentHeightKey.self, value: measured.size.height)
+                    }
+                )
+                .scaleEffect(scale(for: proxy.size.height), anchor: .top)
+                .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
+                .clipped()
+        }
+        .onPreferenceChange(FittedContentHeightKey.self) { height in
+            if height > 1 { contentHeight = height }
+        }
+    }
+
+    private func scale(for availableHeight: CGFloat) -> CGFloat {
+        guard contentHeight > 1, availableHeight > 1 else { return 1 }
+        return min(1, availableHeight / contentHeight)
+    }
+}
+
+private struct FittedContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 1
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
 
@@ -833,16 +946,20 @@ private struct RestoredChannelFader: View {
 private struct SongTimelineTick: View {
     let index: Int
     let current: Bool
+    var color: Color = Color.plasticHighlight.opacity(0.55)
+    var showLabel = true
 
     var body: some View {
         VStack(spacing: 3) {
             RoundedRectangle(cornerRadius: 2, style: .continuous)
-                .fill(current ? Color.amber : Color.plasticHighlight.opacity(index % 4 == 0 ? 0.75 : 0.38))
+                .fill(current ? color : color.opacity(index % 4 == 0 ? 0.75 : 0.38))
                 .frame(maxWidth: .infinity)
                 .frame(height: current ? 10 : 6)
-            Text(String(index + 1))
-                .font(.system(size: 5, weight: .black, design: .monospaced))
-                .foregroundStyle(Color.mutedText)
+            if showLabel {
+                Text(String(index + 1))
+                    .font(.system(size: 5, weight: .black, design: .monospaced))
+                    .foregroundStyle(Color.mutedText)
+            }
         }
     }
 }
@@ -853,6 +970,7 @@ private struct RestoredSongPad: View {
     let pattern: BytePattern?
     let color: Color
     let current: Bool
+    let compact: Bool
     let onTap: () -> Void
     let onCycle: (Int) -> Void
     @State private var lastY: CGFloat = 0
@@ -877,7 +995,7 @@ private struct RestoredSongPad: View {
                     .font(.system(size: 6, weight: .black, design: .monospaced))
             }
             .foregroundStyle(Color.gbInk)
-            .padding(7)
+            .padding(compact ? 3 : 7)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(
                 LinearGradient(colors: pattern == nil ? [Color.gbDeep.opacity(0.3), Color.gbDeep.opacity(0.16)] : [color, color.opacity(0.68)], startPoint: .topLeading, endPoint: .bottomTrailing)
@@ -895,7 +1013,7 @@ private struct RestoredSongPad: View {
                 }
             }.onEnded { _ in suppressTap = Date().addingTimeInterval(0.45); lastY = 0 })
         }
-        .frame(height: 58)
+        .frame(height: compact ? 38 : 58)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Song bar \\(index + 1)")
         .accessibilityValue(pattern?.name ?? "Empty")

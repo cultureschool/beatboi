@@ -86,12 +86,13 @@ private final class ByteLiveAudioState: @unchecked Sendable {
     private var currentStepValue = 0
     private var currentSongSlotValue = -1
 
-    func begin(project: ByteProject, patterns: [BytePattern], slotIndices: [Int] = []) {
+    func begin(project: ByteProject, patterns: [BytePattern], slotIndices: [Int] = [], startSongSlot: Int? = nil) {
         dataLock.lock()
         self.project = project
         self.patterns = patterns
         self.slotIndices = slotIndices
-        self.patternIndex = 0
+        let startIndex = startSongSlot.flatMap { slotIndices.firstIndex(of: $0) } ?? 0
+        self.patternIndex = min(max(0, startIndex), max(0, patterns.count - 1))
         self.active = true
         dataLock.unlock()
         stepElapsed = 0
@@ -103,7 +104,7 @@ private final class ByteLiveAudioState: @unchecked Sendable {
         noiseAccumulators = Array(repeating: 0.0, count: 4)
         effectsProcessor = ByteMixEffects(sampleRate: 44_100)
         setCurrentStep(0)
-        setCurrentSongSlot(slotIndices.first ?? -1)
+        setCurrentSongSlot(slotIndices.indices.contains(patternIndex) ? slotIndices[patternIndex] : -1)
     }
 
     func update(project: ByteProject, patterns: [BytePattern], slotIndices: [Int] = [], restartSequence: Bool = false) {
@@ -113,6 +114,23 @@ private final class ByteLiveAudioState: @unchecked Sendable {
         self.slotIndices = slotIndices
         if restartSequence { self.patternIndex = 0 }
         dataLock.unlock()
+    }
+
+    /// Moves the song transport to the requested arrangement bar. The editor calls this at
+    /// a 16-step boundary so scrubbing never cuts a bar in half.
+    func seekSongSlot(_ slot: Int) {
+        dataLock.lock()
+        if let index = slotIndices.firstIndex(of: slot) {
+            patternIndex = index
+        }
+        dataLock.unlock()
+        playbackStep = 0
+        stepElapsed = 0
+        lastStep = -1
+        phases = Array(repeating: 0.0, count: 4)
+        drumSamplePositions = Array(repeating: 0, count: 4)
+        setCurrentStep(0)
+        setCurrentSongSlot(slotIndices.indices.contains(patternIndex) ? slotIndices[patternIndex] : -1)
     }
 
     func end() {
@@ -408,15 +426,15 @@ final class ByteAudioEngine {
     }
 
     /// Starts one continuous source. Subsequent update calls never stop or reset this transport.
-    func play(project: ByteProject, patterns: [BytePattern]? = nil, useSongArrangement: Bool = false, onStep: @escaping (Int, Int) -> Void) {
+    func play(project: ByteProject, patterns: [BytePattern]? = nil, useSongArrangement: Bool = false, startSongSlot: Int? = nil, onStep: @escaping (Int, Int) -> Void) {
         stop()
         let playbackPatterns = useSongArrangement ? project.songPatterns : (patterns ?? [project.patterns[0]])
         let slotIndices = useSongArrangement ? project.songSlotIndices : []
-        liveState.begin(project: project, patterns: playbackPatterns, slotIndices: slotIndices)
+        liveState.begin(project: project, patterns: playbackPatterns, slotIndices: slotIndices, startSongSlot: startSongSlot)
         do {
             try engine.start()
             playing = true
-            onStep(0, slotIndices.first ?? -1)
+            onStep(0, startSongSlot.flatMap { slotIndices.firstIndex(of: $0) }.flatMap { slotIndices[$0] } ?? slotIndices.first ?? -1)
             timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
                 guard let self else { return }
                 let position = self.liveState.currentPosition()
@@ -432,6 +450,10 @@ final class ByteAudioEngine {
         let playbackPatterns = useSongArrangement ? project.songPatterns : (patterns ?? [project.patterns[0]])
         let slotIndices = useSongArrangement ? project.songSlotIndices : []
         liveState.update(project: project, patterns: playbackPatterns, slotIndices: slotIndices, restartSequence: restartSequence)
+    }
+
+    func seekSongSlot(_ slot: Int) {
+        liveState.seekSongSlot(slot)
     }
 
     func stop() {

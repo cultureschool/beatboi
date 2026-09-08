@@ -329,7 +329,7 @@ final class BeatboiTests: XCTestCase {
         project.songArrangement[0] = ByteSongSlot(patternID: first.id, isContinuation: false)
         project.songArrangement[1] = ByteSongSlot(patternID: second.id, isContinuation: false)
         let samples = ByteRenderer.render(project: project, patterns: project.songPatterns, sampleRate: 8_000)
-        let expectedFrames = Int(Double(32) * ByteTransportClock.stepDuration(bpm: project.tempo) * 8_000)
+        let expectedFrames = Int(Double(project.songArrangementLength * 16) * ByteTransportClock.stepDuration(bpm: project.tempo) * 8_000)
         XCTAssertEqual(samples.count, expectedFrames * 2)
     }
 
@@ -455,6 +455,48 @@ final class BeatboiTests: XCTestCase {
         let decoded = try! JSONDecoder.bytePocketDecoder.decode(ByteProject.self, from: data)
         XCTAssertEqual(decoded.projectEffectsForTests.delay, 0)
         defaults.removePersistentDomain(forName: suite)
+    }
+
+    func testSongArrangementLengthSupportsSixteenThirtyTwoAndSixtyFourBars() throws {
+        let suite = "BeatboiArrangementLengthTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+        let firstID = store.project.patterns[0].id
+        XCTAssertEqual(store.songArrangementLength, 16)
+
+        XCTAssertTrue(store.assignSongPattern(at: 15, patternID: firstID))
+        store.setSongArrangementLength(32)
+        XCTAssertEqual(store.songArrangementLength, 32)
+        XCTAssertEqual(store.project.songArrangement.count, 32)
+        XCTAssertEqual(store.songSlot(at: 15).patternID, firstID)
+
+        XCTAssertTrue(store.assignSongPattern(at: 31, patternID: firstID))
+        store.setSongArrangementLength(64)
+        XCTAssertEqual(store.songArrangementLength, 64)
+        XCTAssertEqual(store.project.songArrangement.count, 64)
+        XCTAssertEqual(store.songSlot(at: 31).patternID, firstID)
+
+        let data = try JSONEncoder.bytePocketEncoder.encode(store.project)
+        let decoded = try JSONDecoder.bytePocketDecoder.decode(ByteProject.self, from: data)
+        XCTAssertEqual(decoded.songArrangementLength, 64)
+        XCTAssertEqual(decoded.songArrangement.count, 64)
+        XCTAssertEqual(decoded.songArrangement[31].patternID, firstID)
+
+        store.setSongArrangementLength(16)
+        XCTAssertEqual(store.songArrangementLength, 16)
+        XCTAssertEqual(store.project.songArrangement.count, 16)
+        XCTAssertEqual(store.songSlot(at: 15).patternID, firstID)
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    func testLegacySongArrangementDefaultsToSixteenBars() throws {
+        let data = try JSONEncoder.bytePocketEncoder.encode(ByteProject.starter)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        object.removeValue(forKey: "songArrangementLength")
+        let legacy = try JSONSerialization.data(withJSONObject: object)
+        let recovered = try JSONDecoder.bytePocketDecoder.decode(ByteProject.self, from: legacy)
+        XCTAssertEqual(recovered.songArrangementLength, 16)
+        XCTAssertEqual(recovered.songArrangement.count, 16)
     }
 
     func testMalformedProjectDecodeRecoversSafeEditorShape() throws {

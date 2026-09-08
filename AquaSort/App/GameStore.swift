@@ -141,7 +141,7 @@ final class GameStore {
     }
 
     func toggleSongSlot(at index: Int) {
-        guard project.songArrangement.indices.contains(index) else { return }
+        guard project.songArrangement.indices.contains(index), index < project.songArrangementLength else { return }
         if project.songArrangement[index].patternID != nil {
             clearSongSlot(at: index)
         } else {
@@ -152,7 +152,7 @@ final class GameStore {
     /// Assigns one 16-step pattern to one Song Mode pad.
     @discardableResult
     func assignSongPattern(at index: Int, patternID: UUID) -> Bool {
-        guard project.songArrangement.indices.contains(index), project.pattern(with: patternID) != nil else { return false }
+        guard project.songArrangement.indices.contains(index), index < project.songArrangementLength, project.pattern(with: patternID) != nil else { return false }
         clearSongSlot(at: index)
         project.songArrangement[index] = ByteSongSlot(patternID: patternID, isContinuation: false)
         touch()
@@ -160,8 +160,22 @@ final class GameStore {
     }
 
     func clearSongSlot(at index: Int) {
-        guard project.songArrangement.indices.contains(index) else { return }
+        guard project.songArrangement.indices.contains(index), index < project.songArrangementLength else { return }
         project.songArrangement[index] = .empty
+        touch()
+    }
+
+    var songArrangementLength: Int { project.songArrangementLength }
+
+    func setSongArrangementLength(_ value: Int) {
+        let length = [16, 32, 64].min(by: { abs($0 - value) < abs($1 - value) }) ?? 16
+        guard length != project.songArrangementLength else { return }
+        if project.songArrangement.count < length {
+            project.songArrangement.append(contentsOf: Array(repeating: .empty, count: length - project.songArrangement.count))
+        } else if project.songArrangement.count > length {
+            project.songArrangement = Array(project.songArrangement.prefix(length))
+        }
+        project.songArrangementLength = length
         touch()
     }
 
@@ -169,7 +183,7 @@ final class GameStore {
     /// Selection is clamped so dragging down stops at the first pattern and dragging up
     /// stops at the last pattern instead of wrapping around.
     func cycleSongSlot(at index: Int, delta: Int) {
-        guard !project.patterns.isEmpty, project.songArrangement.indices.contains(index) else { return }
+        guard !project.patterns.isEmpty, project.songArrangement.indices.contains(index), index < project.songArrangementLength else { return }
         let currentID = project.songArrangement[index].patternID ?? currentPatternID
         let currentIndex = project.patterns.firstIndex(where: { $0.id == currentID }) ?? 0
         let nextIndex = (currentIndex + delta).clamped(to: 0...(project.patterns.count - 1))

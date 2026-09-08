@@ -841,6 +841,7 @@ struct ByteSongSlot: Codable, Hashable, Sendable {
 
 struct ByteProject: Codable, Hashable, Identifiable, Sendable {
     static let maximumPatternCount = 16
+    static let songArrangementLengths = [16, 32, 64]
 
     var id: UUID
     var name: String
@@ -854,6 +855,8 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
     var arrangement: [UUID]
     /// Song Mode slots play in reading order. A continuation slot belongs to the 32-step slot before it.
     var songArrangement: [ByteSongSlot]
+    /// Number of bars visible and played by Song Mode. Legacy projects default to 16.
+    var songArrangementLength: Int
     /// Song Mode can be enabled independently so older projects keep their pattern-list playback.
     var songModeEnabled: Bool
     /// Exactly 32 four-bit samples, stored as integers from 0 through 15.
@@ -868,6 +871,7 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         name: String = "UNTITLED QUEST",
         tempo: Int = 132,
         loopLength: Int = 16,
+        songArrangementLength: Int = 16,
         key: Int = 0,
         mode: ByteScaleMode = .chromatic,
         patterns: [BytePattern] = [BytePattern()],
@@ -882,6 +886,7 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         self.name = name
         self.tempo = tempo
         self.loopLength = 16
+        self.songArrangementLength = Self.normalizedSongArrangementLength(songArrangementLength)
         self.key = min(11, max(0, key))
         self.mode = mode
         var resizedPatterns = Array(patterns.prefix(Self.maximumPatternCount))
@@ -891,7 +896,7 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         for index in resizedPatterns.indices { resizedPatterns[index].resize(to: 16) }
         self.patterns = resizedPatterns
         self.arrangement = Self.normalizedArrangement(arrangement ?? resizedPatterns.map(\.id), patterns: resizedPatterns)
-        self.songArrangement = Array(repeating: .empty, count: 16)
+        self.songArrangement = Array(repeating: .empty, count: self.songArrangementLength)
         if let first = resizedPatterns.first { self.songArrangement[0] = ByteSongSlot(patternID: first.id, isContinuation: false) }
         self.songModeEnabled = false
         self.waveform = Array(waveform.prefix(32)) + Array(repeating: 8, count: max(0, 32 - waveform.count))
@@ -909,18 +914,25 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         return result.isEmpty ? patterns : result
     }
 
+    /// Returns one playback bar for every visible arrangement slot. Empty slots are silent
+    /// bars rather than being compacted away, so playback and scrubbing retain bar numbers.
     var songPatterns: [BytePattern] {
         let lookup = Dictionary(uniqueKeysWithValues: patterns.map { ($0.id, $0) })
-        return songArrangement.compactMap { slot in
-            guard !slot.isContinuation, let patternID = slot.patternID else { return nil }
-            return lookup[patternID]
+        return songArrangement.prefix(songArrangementLength).map { slot in
+            guard !slot.isContinuation, let patternID = slot.patternID, let pattern = lookup[patternID] else {
+                return BytePattern.empty(name: "EMPTY BAR")
+            }
+            return pattern
         }
     }
 
+    /// Each playback pattern maps directly to its arrangement bar, including silent bars.
     var songSlotIndices: [Int] {
-        songArrangement.enumerated().compactMap { index, slot in
-            slot.isContinuation || slot.patternID == nil ? nil : index
-        }
+        Array(0..<min(songArrangementLength, songArrangement.count))
+    }
+
+    var hasAssignedSongPattern: Bool {
+        songArrangement.prefix(songArrangementLength).contains { $0.patternID != nil && !$0.isContinuation }
     }
 
     /// Returns the selected pattern for Beatpad and Sound Lab playback.
@@ -932,6 +944,10 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         patterns.first(where: { $0.id == id })
     }
 
+    private static func normalizedSongArrangementLength(_ value: Int) -> Int {
+        songArrangementLengths.min(by: { abs($0 - value) < abs($1 - value) }) ?? 16
+    }
+
     private static func normalizedArrangement(_ arrangement: [UUID], patterns: [BytePattern]) -> [UUID] {
         let validIDs = Set(patterns.map(\.id))
         let filtered = arrangement.filter { validIDs.contains($0) }
@@ -939,7 +955,7 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, tempo, loopLength, key, mode, patterns, arrangement, songArrangement, songModeEnabled, waveform, channelPatches, effects, createdAt, modifiedAt
+        case id, name, tempo, loopLength, songArrangementLength, key, mode, patterns, arrangement, songArrangement, songModeEnabled, waveform, channelPatches, effects, createdAt, modifiedAt
     }
 
     init(from decoder: Decoder) throws {
@@ -948,6 +964,7 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         name = try container.decode(String.self, forKey: .name)
         tempo = try container.decode(Int.self, forKey: .tempo)
         loopLength = 16
+        songArrangementLength = Self.normalizedSongArrangementLength(try container.decodeIfPresent(Int.self, forKey: .songArrangementLength) ?? 16)
         key = min(11, max(0, try container.decodeIfPresent(Int.self, forKey: .key) ?? 0))
         mode = try container.decodeIfPresent(ByteScaleMode.self, forKey: .mode) ?? .chromatic
         patterns = Array(try container.decode([BytePattern].self, forKey: .patterns).prefix(Self.maximumPatternCount))
@@ -958,12 +975,12 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         let decodedArrangement = try container.decodeIfPresent([UUID].self, forKey: .arrangement) ?? []
         arrangement = Self.normalizedArrangement(decodedArrangement, patterns: patterns)
         let validPatternIDs = Set(patterns.map(\.id))
-        let decodedSongArrangement = try container.decodeIfPresent([ByteSongSlot].self, forKey: .songArrangement) ?? Array(repeating: .empty, count: 16)
-        songArrangement = decodedSongArrangement.prefix(16).map { slot in
+        let decodedSongArrangement = try container.decodeIfPresent([ByteSongSlot].self, forKey: .songArrangement) ?? Array(repeating: .empty, count: songArrangementLength)
+        songArrangement = decodedSongArrangement.prefix(songArrangementLength).map { slot in
             guard !slot.isContinuation, let patternID = slot.patternID, validPatternIDs.contains(patternID) else { return .empty }
             return ByteSongSlot(patternID: patternID, isContinuation: false)
         }
-        if songArrangement.count < 16 { songArrangement.append(contentsOf: Array(repeating: .empty, count: 16 - songArrangement.count)) }
+        if songArrangement.count < songArrangementLength { songArrangement.append(contentsOf: Array(repeating: .empty, count: songArrangementLength - songArrangement.count)) }
         songModeEnabled = try container.decodeIfPresent(Bool.self, forKey: .songModeEnabled) ?? false
 
         if let values = try? container.decode([Int].self, forKey: .waveform) {
@@ -987,6 +1004,7 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         try container.encode(name, forKey: .name)
         try container.encode(tempo, forKey: .tempo)
         try container.encode(loopLength, forKey: .loopLength)
+        try container.encode(songArrangementLength, forKey: .songArrangementLength)
         try container.encode(key, forKey: .key)
         try container.encode(mode, forKey: .mode)
         try container.encode(patterns, forKey: .patterns)
