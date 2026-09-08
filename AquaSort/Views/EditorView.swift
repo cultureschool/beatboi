@@ -686,11 +686,16 @@ struct EditorView: View {
             if commit { store.presentToast("BAR \(index + 1) IS EMPTY") }
             return
         }
-        if store.isPlaying {
-            audio.seekSongSlot(index)
-            currentSongSlot = index
-        } else if commit {
-            startSongPlayback(at: index)
+        // Preview the selection while dragging, but perform only one transport change on
+        // release. Repeatedly restarting the realtime engine during a gesture can race the
+        // render callback; a committed scrub always begins the selected bar at step 1.
+        if commit {
+            if store.isPlaying {
+                audio.seekSongSlot(index)
+                currentSongSlot = index
+            } else {
+                startSongPlayback(at: index)
+            }
         }
     }
     private func startSongPlayback(at slot: Int? = nil) {

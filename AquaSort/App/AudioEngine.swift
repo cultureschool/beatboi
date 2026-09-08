@@ -85,6 +85,8 @@ private final class ByteLiveAudioState: @unchecked Sendable {
     private var effectsProcessor = ByteMixEffects(sampleRate: 44_100)
     private var currentStepValue = 0
     private var currentSongSlotValue = -1
+    /// UI scrubbing submits one command; the realtime callback consumes it at a safe render boundary.
+    private var pendingSongSlot: Int?
 
     func begin(project: ByteProject, patterns: [BytePattern], slotIndices: [Int] = [], startSongSlot: Int? = nil) {
         dataLock.lock()
@@ -93,6 +95,7 @@ private final class ByteLiveAudioState: @unchecked Sendable {
         self.slotIndices = slotIndices
         let startIndex = startSongSlot.flatMap { slotIndices.firstIndex(of: $0) } ?? 0
         self.patternIndex = min(max(0, startIndex), max(0, patterns.count - 1))
+        self.pendingSongSlot = nil
         self.active = true
         dataLock.unlock()
         stepElapsed = 0
@@ -119,18 +122,13 @@ private final class ByteLiveAudioState: @unchecked Sendable {
     /// Moves the song transport to the requested arrangement bar. The editor calls this at
     /// a 16-step boundary so scrubbing never cuts a bar in half.
     func seekSongSlot(_ slot: Int) {
+        // Do not mutate render-thread state from the gesture callback. The next audio render
+        // consumes this request and begins the selected arrangement bar at step 1.
         dataLock.lock()
-        if let index = slotIndices.firstIndex(of: slot) {
-            patternIndex = index
+        if slotIndices.contains(slot) {
+            pendingSongSlot = slot
         }
         dataLock.unlock()
-        playbackStep = 0
-        stepElapsed = 0
-        lastStep = -1
-        phases = Array(repeating: 0.0, count: 4)
-        drumSamplePositions = Array(repeating: 0, count: 4)
-        setCurrentStep(0)
-        setCurrentSongSlot(slotIndices.indices.contains(patternIndex) ? slotIndices[patternIndex] : -1)
     }
 
     func end() {
@@ -151,8 +149,26 @@ private final class ByteLiveAudioState: @unchecked Sendable {
         let isActive = active
         let project = self.project
         let patterns = self.patterns
+        var resetTransport = false
+        if let pendingSongSlot, let index = slotIndices.firstIndex(of: pendingSongSlot), patterns.indices.contains(index) {
+            patternIndex = index
+            self.pendingSongSlot = nil
+            resetTransport = true
+        }
         let pattern = patterns.isEmpty ? nil : patterns[min(patternIndex, patterns.count - 1)]
         dataLock.unlock()
+
+        // Only the realtime callback mutates oscillator and step state. This avoids racing
+        // the audio thread when the user scrubs repeatedly across the timeline.
+        if resetTransport {
+            stepElapsed = 0
+            playbackStep = 0
+            lastStep = -1
+            phases = Array(repeating: 0.0, count: 4)
+            drumSamplePositions = Array(repeating: 0, count: 4)
+            setCurrentStep(0)
+            setCurrentSongSlot(slotIndices.indices.contains(patternIndex) ? slotIndices[patternIndex] : -1)
+        }
 
         let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
         guard !buffers.isEmpty else { return }
