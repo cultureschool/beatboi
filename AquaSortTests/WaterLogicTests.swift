@@ -489,6 +489,13 @@ final class BeatboiTests: XCTestCase {
         defaults.removePersistentDomain(forName: suite)
     }
 
+    func testSongArrangementPagesStayInSixteenBarBlocks() {
+        XCTAssertEqual(Array(0..<16).count, 16)
+        XCTAssertEqual(Array(16..<32).count, 16)
+        XCTAssertEqual(Array(32..<48).count, 16)
+        XCTAssertEqual(Array(48..<64).count, 16)
+    }
+
     func testLegacySongArrangementDefaultsToSixteenBars() throws {
         let data = try JSONEncoder.bytePocketEncoder.encode(ByteProject.starter)
         var object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])

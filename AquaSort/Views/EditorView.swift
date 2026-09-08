@@ -20,6 +20,7 @@ struct EditorView: View {
     @State private var patternRenameID: UUID?
     @State private var playbackRefreshTask: Task<Void, Never>?
     @State private var scrubbedSongSlot: Int?
+    @State private var songArrangementPage = 0
 
     private var pageTitle: String {
         switch page {
@@ -259,6 +260,7 @@ struct EditorView: View {
     private var songArrangementPanel: some View {
         LCDPanel(title: "ARRANGEMENT TIMELINE / \(store.songArrangementLength) BARS") {
             VStack(alignment: .leading, spacing: 7) {
+                arrangementPageSelector
                 HStack(spacing: 5) {
                     Text("LENGTH")
                         .font(.system(size: 7, weight: .black, design: .monospaced))
@@ -281,9 +283,9 @@ struct EditorView: View {
                         .font(.system(size: 6, weight: .black, design: .monospaced))
                         .foregroundStyle(Color.screenShadow)
                 }
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: store.songArrangementLength > 16 ? 3 : 5), count: store.songArrangementLength > 16 ? 8 : 4), spacing: store.songArrangementLength > 16 ? 4 : 7) {
-                    ForEach(0..<store.songArrangementLength, id: \.self) { index in
-                        RestoredSongPad(index: index, slot: store.songSlot(at: index), pattern: restoredSongPattern(at: index), color: restoredSongColor(at: index), current: index == currentSongSlot, compact: store.songArrangementLength > 16) {
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 5), count: 4), spacing: 7) {
+                    ForEach(songArrangementPageStart..<songArrangementPageEnd, id: \.self) { index in
+                        RestoredSongPad(index: index, slot: store.songSlot(at: index), pattern: restoredSongPattern(at: index), color: restoredSongColor(at: index), current: index == currentSongSlot) {
                             if store.songSlot(at: index).patternID == nil { store.assignSongPattern(at: index, patternID: store.currentPatternID) } else { store.clearSongSlot(at: index) }
                             requestPlaybackRefresh()
                         } onCycle: { delta in
@@ -661,10 +663,43 @@ struct EditorView: View {
     }
 
     private var restoredKeyNames: [String] { ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"] }
+    private var songArrangementPageStart: Int { songArrangementPage * 16 }
+    private var songArrangementPageEnd: Int { min(songArrangementPageStart + 16, store.songArrangementLength) }
     private var arrangementReadoutSlot: Int? {
         if currentSongSlot >= 0 { return currentSongSlot }
         if let scrubbedSongSlot, store.songSlot(at: scrubbedSongSlot).patternID != nil { return scrubbedSongSlot }
         return store.project.songArrangement.prefix(store.songArrangementLength).firstIndex(where: { $0.patternID == store.currentPatternID })
+    }
+    private var arrangementPageSelector: some View {
+        HStack(spacing: 5) {
+            Text("ARRANGEMENT PAGE")
+                .font(.system(size: 7, weight: .black, design: .monospaced))
+                .foregroundStyle(Color.screenShadow)
+            ForEach(0..<4, id: \.self) { pageIndex in
+                let start = pageIndex * 16
+                let end = start + 16
+                Button {
+                    songArrangementPage = pageIndex
+                } label: {
+                    VStack(spacing: 1) {
+                        Text(["A", "B", "C", "D"][pageIndex])
+                            .font(.system(size: 9, weight: .black, design: .monospaced))
+                        Text("\(start + 1)-\(end)")
+                            .font(.system(size: 5, weight: .black, design: .monospaced))
+                    }
+                    .foregroundStyle(songArrangementPage == pageIndex ? Color.gbInk : Color.screenShadow)
+                    .frame(maxWidth: .infinity, minHeight: 34)
+                    .background(songArrangementPage == pageIndex ? Color.amber : Color.screenShadow.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.screenShadow.opacity(0.55), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .disabled(start >= store.songArrangementLength)
+                .opacity(start >= store.songArrangementLength ? 0.32 : 1)
+                .accessibilityLabel("Arrangement page \(["A", "B", "C", "D"][pageIndex]), bars \(start + 1) through \(end)")
+                .accessibilityAddTraits(songArrangementPage == pageIndex ? .isSelected : [])
+            }
+        }
     }
     private func restoredSongPattern(at index: Int) -> BytePattern? { guard let id = store.songSlot(at: index).patternID else { return nil }; return store.project.patterns.first(where: { $0.id == id }) }
     private func restoredSongColor(at index: Int) -> Color {
@@ -674,6 +709,7 @@ struct EditorView: View {
     private func setSongArrangementLength(_ length: Int) {
         guard !store.isPlaying else { store.presentToast("STOP PLAYBACK TO CHANGE ARRANGEMENT LENGTH"); return }
         store.setSongArrangementLength(length)
+        songArrangementPage = min(songArrangementPage, max(0, (length - 1) / 16))
         scrubbedSongSlot = nil
         currentSongSlot = -1
         requestPlaybackRefresh()
@@ -681,6 +717,7 @@ struct EditorView: View {
     private func scrubSongTimeline(at x: CGFloat, width: CGFloat, commit: Bool = false) {
         guard width > 0 else { return }
         let index = min(max(Int((x / width * CGFloat(store.songArrangementLength)).rounded(.down)), 0), store.songArrangementLength - 1)
+        songArrangementPage = index / 16
         scrubbedSongSlot = index
         guard store.songSlot(at: index).patternID != nil else {
             if commit { store.presentToast("BAR \(index + 1) IS EMPTY") }
@@ -705,6 +742,7 @@ struct EditorView: View {
             Task { @MainActor in
                 currentStep = step
                 currentSongSlot = songSlot
+                if songSlot >= 0 { songArrangementPage = min(3, songSlot / 16) }
                 scrubbedSongSlot = songSlot >= 0 ? songSlot : scrubbedSongSlot
             }
         }
@@ -758,6 +796,7 @@ struct EditorView: View {
                 }
                 currentStep = step
                 currentSongSlot = slot
+                if page == 2, slot >= 0 { songArrangementPage = min(3, slot / 16) }
             }
         }
     }
@@ -937,7 +976,6 @@ private struct RestoredSongPad: View {
     let pattern: BytePattern?
     let color: Color
     let current: Bool
-    let compact: Bool
     let onTap: () -> Void
     let onCycle: (Int) -> Void
     @State private var lastY: CGFloat = 0
@@ -962,7 +1000,7 @@ private struct RestoredSongPad: View {
                     .font(.system(size: 6, weight: .black, design: .monospaced))
             }
             .foregroundStyle(Color.gbInk)
-            .padding(compact ? 3 : 7)
+            .padding(7)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(
                 LinearGradient(colors: pattern == nil ? [Color.gbDeep.opacity(0.3), Color.gbDeep.opacity(0.16)] : [color, color.opacity(0.68)], startPoint: .topLeading, endPoint: .bottomTrailing)
@@ -980,7 +1018,7 @@ private struct RestoredSongPad: View {
                 }
             }.onEnded { _ in suppressTap = Date().addingTimeInterval(0.45); lastY = 0 })
         }
-        .frame(height: compact ? 38 : 58)
+        .frame(height: 58)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Song bar \\(index + 1)")
         .accessibilityValue(pattern?.name ?? "Empty")
