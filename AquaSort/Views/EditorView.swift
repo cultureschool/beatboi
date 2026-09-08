@@ -235,6 +235,30 @@ struct EditorView: View {
                                 SongTimelineTick(index: index, current: index == currentSongSlot, color: restoredSongColor(at: index), showLabel: store.songArrangementLength <= 32)
                             }
                         }
+                        if let scrubbedSongSlot {
+                            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                .stroke(restoredSongColor(at: scrubbedSongSlot), lineWidth: 2)
+                                .frame(width: max(10, proxy.size.width / CGFloat(max(1, store.songArrangementLength)) - 2), height: 28)
+                                .position(
+                                    x: proxy.size.width / CGFloat(max(1, store.songArrangementLength)) * (CGFloat(scrubbedSongSlot) + 0.5),
+                                    y: 11
+                                )
+                                .shadow(color: restoredSongColor(at: scrubbedSongSlot).opacity(0.75), radius: 4)
+                                .accessibilityHidden(true)
+                        }
+                        if store.isPlaying, currentSongSlot >= 0 {
+                            let totalBars = CGFloat(max(1, store.songArrangementLength))
+                            let stepProgress = CGFloat(max(0, min(15, currentStep))) / 16.0
+                            let playheadX = proxy.size.width * (CGFloat(currentSongSlot) + stepProgress + 0.5) / totalBars
+                            Capsule()
+                                .fill(Color.gbLight)
+                                .frame(width: 3, height: 27)
+                                .position(x: min(proxy.size.width - 2, max(2, playheadX)), y: 11)
+                                .shadow(color: Color.gbLight.opacity(0.95), radius: 5)
+                                .animation(.linear(duration: 0.08), value: currentStep)
+                                .animation(.easeOut(duration: 0.12), value: currentSongSlot)
+                                .accessibilityHidden(true)
+                        }
                     }
                     .contentShape(Rectangle())
                     .gesture(DragGesture(minimumDistance: 0).onChanged { gesture in
@@ -244,6 +268,21 @@ struct EditorView: View {
                     })
                 }
                 .frame(height: 22)
+            }
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(Color.gbLight)
+                    .frame(width: 5, height: 5)
+                    .shadow(color: Color.gbLight.opacity(0.9), radius: 3)
+                Text("PLAYHEAD")
+                    .font(.system(size: 6, weight: .black, design: .monospaced))
+                    .foregroundStyle(Color.gbLight)
+                Text("·")
+                    .foregroundStyle(Color.mutedText)
+                Text("OUTLINE = SELECTED BAR")
+                    .font(.system(size: 6, weight: .black, design: .monospaced))
+                    .foregroundStyle(Color.mutedText)
+                Spacer(minLength: 0)
             }
             Text("DRAG THE TIMELINE TO AUDITION A BAR  ·  ACTIVE PATTERN COLOR MATCHES BELOW")
                 .font(.system(size: 6, weight: .black, design: .monospaced))
