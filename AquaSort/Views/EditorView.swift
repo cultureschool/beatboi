@@ -193,21 +193,58 @@ struct EditorView: View {
     }
 
     private var restoredSongPage: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 10) {
             restoredHeader
-            restoredTransport
-            HardwareSection(title: "ARRANGEMENT", detail: "TAP ASSIGN / SWIPE TO CYCLE") {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("SONG MODE")
-                        .font(.system(size: 9, weight: .black, design: .monospaced))
-                        .foregroundStyle(Color.gbLight)
-                    Text("TAP: ASSIGN / CLEAR  •  SWIPE ↑↓: CHANGE PATTERN")
-                        .font(.system(size: 7, weight: .black, design: .monospaced))
-                        .foregroundStyle(Color.gbGlow)
+            HardwareSection(title: "SONG MACHINE", detail: "16 BARS / LOOP-BOUNDARY SAFE") {
+                VStack(spacing: 9) {
+                    restoredTransport
+                    songTimelineReadout
                 }
             }
-            LCDPanel(title: "SONG ORDER / 16 PATTERN SLOTS") {
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 4), spacing: 6) {
+            songArrangementPanel
+            restoredChannelMixer
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .top)
+    }
+
+    private var songTimelineReadout: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(store.isPlaying ? "ARRANGEMENT PLAYING" : "ARRANGEMENT READY")
+                    .font(.system(size: 9, weight: .black, design: .monospaced))
+                    .foregroundStyle(Color.gbLight)
+                Spacer()
+                Text(currentSongSlot >= 0 ? "BAR \(String(format: "%02d", currentSongSlot + 1)) / 16" : "BAR — / 16")
+                    .font(.system(size: 8, weight: .black, design: .monospaced))
+                    .foregroundStyle(Color.amber)
+            }
+            HStack(spacing: 3) {
+                ForEach(0..<16, id: \.self) { index in
+                    SongTimelineTick(index: index, current: index == currentSongSlot)
+                }
+            }
+            .animation(.easeOut(duration: 0.12), value: currentSongSlot)
+            .accessibilityHidden(true)
+        }
+        .padding(10)
+        .background(Color.hardwareBlack.opacity(0.72))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.plasticHighlight.opacity(0.6), lineWidth: 1))
+    }
+
+    private var songArrangementPanel: some View {
+        LCDPanel(title: "ARRANGEMENT TIMELINE / 16 BARS") {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("TAP EMPTY BAR TO ASSIGN CURRENT PATTERN")
+                        .font(.system(size: 7, weight: .black, design: .monospaced))
+                    Spacer()
+                    Text("SWIPE ↑↓ TO CYCLE")
+                        .font(.system(size: 7, weight: .black, design: .monospaced))
+                }
+                .foregroundStyle(Color.screenShadow)
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 5), count: 4), spacing: 7) {
                     ForEach(0..<store.project.songArrangement.count, id: \.self) { index in
                         RestoredSongPad(index: index, slot: store.songSlot(at: index), pattern: restoredSongPattern(at: index), color: restoredSongColor(at: index), current: index == currentSongSlot) {
                             if store.songSlot(at: index).patternID == nil { store.assignSongPattern(at: index, patternID: store.currentPatternID) } else { store.clearSongSlot(at: index) }
@@ -219,10 +256,7 @@ struct EditorView: View {
                     }
                 }
             }
-            restoredChannelMixer
-            Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity, alignment: .top)
     }
 
     private var restoredPageSwitcher: some View {
@@ -796,6 +830,23 @@ private struct RestoredChannelFader: View {
     }
 }
 
+private struct SongTimelineTick: View {
+    let index: Int
+    let current: Bool
+
+    var body: some View {
+        VStack(spacing: 3) {
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(current ? Color.amber : Color.plasticHighlight.opacity(index % 4 == 0 ? 0.75 : 0.38))
+                .frame(maxWidth: .infinity)
+                .frame(height: current ? 10 : 6)
+            Text(String(index + 1))
+                .font(.system(size: 5, weight: .black, design: .monospaced))
+                .foregroundStyle(Color.mutedText)
+        }
+    }
+}
+
 private struct RestoredSongPad: View {
     let index: Int
     let slot: ByteSongSlot
@@ -806,7 +857,50 @@ private struct RestoredSongPad: View {
     let onCycle: (Int) -> Void
     @State private var lastY: CGFloat = 0
     @State private var suppressTap = Date.distantPast
-    var body: some View { GeometryReader { _ in VStack(spacing: 2) { Text(String(format: "%02d", index + 1)).font(.system(size: 9, weight: .black, design: .monospaced)); Text(pattern?.name.replacingOccurrences(of: "PATTERN ", with: "P") ?? "—").font(.system(size: 8, weight: .black, design: .monospaced)).lineLimit(1); if pattern != nil { Text("16 STEP").font(.system(size: 6, weight: .black, design: .monospaced)) } }.foregroundStyle(Color.gbInk).frame(maxWidth: .infinity, maxHeight: .infinity).background(LinearGradient(colors: [color, color.opacity(0.68)], startPoint: .topLeading, endPoint: .bottomTrailing)).clipShape(RoundedRectangle(cornerRadius: 10)).overlay(RoundedRectangle(cornerRadius: 10).stroke(current ? Color.gbLight : Color.gbInk.opacity(0.45), lineWidth: current ? 3 : 1.5)).contentShape(Rectangle()).onTapGesture { if Date() >= suppressTap { onTap() } }.simultaneousGesture(DragGesture(minimumDistance: 10).onChanged { gesture in let move = gesture.translation.height - lastY; if abs(move) >= 14 { suppressTap = Date().addingTimeInterval(0.45); onCycle(move < 0 ? 1 : -1); lastY = gesture.translation.height } }.onEnded { _ in suppressTap = Date().addingTimeInterval(0.45); lastY = 0 }) }.frame(height: 42) }
+
+    var body: some View {
+        GeometryReader { _ in
+            VStack(spacing: 3) {
+                HStack {
+                    Text(String(format: "%02d", index + 1))
+                        .font(.system(size: 9, weight: .black, design: .monospaced))
+                    Spacer()
+                    Circle()
+                        .fill(current ? Color.gbLight : Color.gbInk.opacity(0.22))
+                        .frame(width: 6, height: 6)
+                }
+                Text(pattern?.name.replacingOccurrences(of: "PATTERN ", with: "P") ?? "EMPTY")
+                    .font(.system(size: 8, weight: .black, design: .monospaced))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
+                Text(pattern == nil ? "TAP TO ASSIGN" : "16 STEP BAR")
+                    .font(.system(size: 6, weight: .black, design: .monospaced))
+            }
+            .foregroundStyle(Color.gbInk)
+            .padding(7)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(
+                LinearGradient(colors: pattern == nil ? [Color.gbDeep.opacity(0.3), Color.gbDeep.opacity(0.16)] : [color, color.opacity(0.68)], startPoint: .topLeading, endPoint: .bottomTrailing)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(current ? Color.gbLight : pattern == nil ? Color.plasticHighlight.opacity(0.55) : Color.gbInk.opacity(0.45), lineWidth: current ? 3 : 1.5))
+            .contentShape(Rectangle())
+            .onTapGesture { if Date() >= suppressTap { onTap() } }
+            .simultaneousGesture(DragGesture(minimumDistance: 10).onChanged { gesture in
+                let move = gesture.translation.height - lastY
+                if abs(move) >= 14 {
+                    suppressTap = Date().addingTimeInterval(0.45)
+                    onCycle(move < 0 ? 1 : -1)
+                    lastY = gesture.translation.height
+                }
+            }.onEnded { _ in suppressTap = Date().addingTimeInterval(0.45); lastY = 0 })
+        }
+        .frame(height: 58)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Song bar \\(index + 1)")
+        .accessibilityValue(pattern?.name ?? "Empty")
+        .accessibilityHint("Tap to assign or clear. Swipe up or down to change pattern.")
+    }
 }
 
 private struct RestoredNotePad: View {
