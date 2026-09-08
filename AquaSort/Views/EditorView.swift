@@ -1651,7 +1651,9 @@ private struct RestoredAmountCard: View {
             }
             .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.gbInk.opacity(0.38), lineWidth: 1))
             .contentShape(Rectangle())
-            .gesture(DragGesture(minimumDistance: 7).onChanged { gesture in
+            // Use a simultaneous gesture so the vertical editor ScrollView cannot swallow
+            // horizontal parameter edits. The fader remains horizontal-only by design.
+            .simultaneousGesture(DragGesture(minimumDistance: 2).onChanged { gesture in
                 if start == nil { start = amount }
                 let proposed = min(max((start ?? amount) + Int((gesture.translation.width / 2).rounded()), 0), 100)
                 if proposed != last { last = proposed; onChange(proposed) }

@@ -14,6 +14,8 @@ enum ByteTransportClock {
 private struct ByteMixEffects {
     private var history: [Double]
     private var cursor = 0
+    private var crushedLeft = 0.0
+    private var crushedRight = 0.0
 
     init(sampleRate: Double) {
         history = Array(repeating: 0.0, count: max(256, Int(sampleRate * 0.25) * 2))
@@ -21,22 +23,28 @@ private struct ByteMixEffects {
 
     mutating func process(left: Double, right: Double, effects: ByteEffects, send: Double = 1.0, sampleRate: Double) -> (left: Double, right: Double) {
         guard !history.isEmpty else { return (left, right) }
-        var inputLeft = max(-0.9, min(0.9, left)) * send
-        var inputRight = max(-0.9, min(0.9, right)) * send
-        if effects.bitCrushAmount > 0 {
-            let effectiveAmount = ByteEffects.bitCrushEffectiveAmount(for: effects.bitCrushAmount)
-            let levels = max(1.0, 16.0 - effectiveAmount / 100.0 * 14.0)
-            inputLeft = (inputLeft * levels).rounded() / levels
-            inputRight = (inputRight * levels).rounded() / levels
+        let inputLeft = max(-0.9, min(0.9, left)) * send
+        let inputRight = max(-0.9, min(0.9, right)) * send
+        let amount = min(100, max(0, effects.bitCrushAmount))
+        let crushBlend = Double(amount) / 100.0
+        let effectiveAmount = ByteEffects.bitCrushEffectiveAmount(for: amount)
+        let holdFrames = ByteEffects.bitCrushHoldFrames(for: amount)
+        if amount > 0, (cursor / 2) % holdFrames == 0 {
+            let levels = ByteEffects.bitCrushLevels(for: effectiveAmount)
+            crushedLeft = (inputLeft * levels).rounded() / levels
+            crushedRight = (inputRight * levels).rounded() / levels
         }
+        let crushedInputLeft = amount > 0 ? inputLeft + (crushedLeft - inputLeft) * crushBlend : inputLeft
+        let crushedInputRight = amount > 0 ? inputRight + (crushedRight - inputRight) * crushBlend : inputRight
 
         let frameCount = history.count / 2
         let echoFrames = min(frameCount - 1, max(1, Int(sampleRate * 0.085)))
         let echoIndex = (cursor - echoFrames * 2 + history.count) % history.count
         let echoMix = Double(min(100, max(0, effects.echoAmount))) / 100.0 * 0.48
-        let effectedLeft = inputLeft + history[echoIndex] * echoMix
-        let effectedRight = inputRight + history[(echoIndex + 1) % history.count] * echoMix
+        let effectedLeft = crushedInputLeft + history[echoIndex] * echoMix
+        let effectedRight = crushedInputRight + history[(echoIndex + 1) % history.count] * echoMix
 
+        // Store the dry send so Echo does not recursively build an uncontrolled feedback loop.
         history[cursor] = inputLeft
         history[(cursor + 1) % history.count] = inputRight
         cursor = (cursor + 2) % history.count
@@ -271,8 +279,10 @@ private final class ByteLiveAudioState: @unchecked Sendable {
             }
 
             let effected = effectsProcessor.process(left: effectsLeft, right: effectsRight, effects: project.effects, sampleRate: sampleRate)
-            let leftSample = Float(max(-0.9, min(0.9, left + effected.left - effectsLeft)))
-            let rightSample = Float(max(-0.9, min(0.9, right + effected.right - effectsRight)))
+            let dryLeft = left - effectsLeft
+            let dryRight = right - effectsRight
+            let leftSample = Float(max(-0.9, min(0.9, dryLeft + effected.left)))
+            let rightSample = Float(max(-0.9, min(0.9, dryRight + effected.right)))
             if buffers.count == 1 {
                 if let buffer = channelPointers[0] {
                     buffer[frame * 2] = leftSample
@@ -550,9 +560,11 @@ enum ByteRenderer {
                     }
 
                     if project.effects.bitCrushAmount > 0 {
+                        let blend = Double(min(100, max(0, project.effects.bitCrushAmount))) / 100.0
                         let effectiveAmount = ByteEffects.bitCrushEffectiveAmount(for: project.effects.bitCrushAmount)
-                        let levels = max(1.0, 16.0 - effectiveAmount / 100.0 * 14.0)
-                        value = (value * levels).rounded() / levels
+                        let levels = ByteEffects.bitCrushLevels(for: effectiveAmount)
+                        let crushed = (value * levels).rounded() / levels
+                        value += (crushed - value) * blend
                     }
                     let masterLevel = Double(min(100, max(0, patch.masterVolume))) / 100.0
                     let mixed = gated ? 0.0 : Float(value * baseGain * (Double(effectiveVolume) / 15.0) * envelopeLevel * masterLevel)
@@ -691,9 +703,11 @@ enum ByteRenderer {
                 }
             }
 
-            let effected = effectsProcessor.process(left: left, right: right, effects: project.effects, sampleRate: sampleRate)
-            output[sampleIndex * 2] = Float(max(-0.9, min(0.9, effected.left)))
-            output[sampleIndex * 2 + 1] = Float(max(-0.9, min(0.9, effected.right)))
+            let effected = effectsProcessor.process(left: effectsLeft, right: effectsRight, effects: project.effects, sampleRate: sampleRate)
+            let dryLeft = left - effectsLeft
+            let dryRight = right - effectsRight
+            output[sampleIndex * 2] = Float(max(-0.9, min(0.9, dryLeft + effected.left)))
+            output[sampleIndex * 2 + 1] = Float(max(-0.9, min(0.9, dryRight + effected.right)))
 
             stepElapsed += 1.0 / sampleRate
             if stepElapsed >= secondsPerStep {

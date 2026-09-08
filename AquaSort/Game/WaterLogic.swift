@@ -639,6 +639,17 @@ struct ByteEffects: Codable, Hashable, Sendable {
         Double(min(100, max(0, amount))) * 0.25
     }
 
+    /// Converts the softened Bit Crush response into a stable quantizer resolution.
+    static func bitCrushLevels(for effectiveAmount: Double) -> Double {
+        max(1.0, 16.0 - min(25.0, max(0.0, effectiveAmount)) / 100.0 * 14.0)
+    }
+
+    /// Holds crushed samples slightly longer as the control rises for audible downsampling.
+    static func bitCrushHoldFrames(for amount: Int) -> Int {
+        let clamped = min(100, max(0, amount))
+        return max(1, 18 - (clamped * 17 / 100))
+    }
+
     /// Maps the fader to musical divisions. The fader remains continuous to touch,
     /// while each fifth selects a stable tempo-synced rate from whole notes to 1/16ths.
     static func octaveFlutterDivision(for amount: Int) -> Int {

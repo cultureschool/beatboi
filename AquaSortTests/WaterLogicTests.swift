@@ -497,10 +497,25 @@ final class BeatboiTests: XCTestCase {
     }
 
     func testBitCrushResponseUsesFullControlForFormerZeroToTwentyFiveRange() {
+        XCTAssertEqual(ByteEffects.bitCrushLevels(for: 0), 16)
+        XCTAssertEqual(ByteEffects.bitCrushHoldFrames(for: 0), 18)
+        XCTAssertEqual(ByteEffects.bitCrushHoldFrames(for: 100), 1)
         XCTAssertEqual(ByteEffects.bitCrushEffectiveAmount(for: 0), 0)
         XCTAssertEqual(ByteEffects.bitCrushEffectiveAmount(for: 25), 6.25)
         XCTAssertEqual(ByteEffects.bitCrushEffectiveAmount(for: 100), 25)
         XCTAssertEqual(ByteEffects.bitCrushEffectiveAmount(for: 140), 25)
+    }
+
+    func testEffectRenderPathsChangeAudioWhenEnabled() {
+        let baseline = ByteRenderer.render(project: ByteProject(), sampleRate: 8_000)
+        var effectedProject = ByteProject()
+        effectedProject.effects.echoAmount = 100
+        effectedProject.effects.bitCrushAmount = 100
+        effectedProject.effects.vibratoAmount = 70
+        effectedProject.effects.octaveFlutterPattern = ByteOctaveFlutterPattern.baseUpTwoUp.rawValue
+        let effected = ByteRenderer.render(project: effectedProject, sampleRate: 8_000)
+        XCTAssertEqual(baseline.count, effected.count)
+        XCTAssertTrue(zip(baseline, effected).contains { abs($0 - $1) > 0.0001 })
     }
 
     func testOctaveFlutterMapsFaderToDiscreteNESStyleJumps() {
@@ -514,6 +529,8 @@ final class BeatboiTests: XCTestCase {
         XCTAssertEqual(ByteEffects.octaveFlutterMultiplier(at: 0.0, bpm: 120, amount: 70), 1)
         XCTAssertEqual(ByteEffects.octaveFlutterMultiplier(at: 0.25, bpm: 120, amount: 70), 2)
         XCTAssertEqual(ByteEffects.octaveFlutterMultiplier(at: 0.0, bpm: 120, amount: 0), 1)
+        XCTAssertEqual(ByteEffects.octaveFlutterMultiplier(at: 0.0, bpm: 120, amount: 70, pattern: .baseUpTwoUp), 1)
+        XCTAssertEqual(ByteEffects.octaveFlutterMultiplier(at: 0.5, bpm: 120, amount: 70, pattern: .baseUpTwoUp), 4)
     }
 
     func testSharedBeginnerPatchControlsAndDMGEffectsPersist() {
