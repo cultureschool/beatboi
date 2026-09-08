@@ -14,7 +14,6 @@ enum ByteTransportClock {
 private struct ByteMixEffects {
     private var history: [Double]
     private var cursor = 0
-    private var modulationPhase = 0.0
 
     init(sampleRate: Double) {
         history = Array(repeating: 0.0, count: max(256, Int(sampleRate * 0.25) * 2))
@@ -30,35 +29,18 @@ private struct ByteMixEffects {
             inputLeft = (inputLeft * levels).rounded() / levels
             inputRight = (inputRight * levels).rounded() / levels
         }
+
         let frameCount = history.count / 2
         let echoFrames = min(frameCount - 1, max(1, Int(sampleRate * 0.085)))
-        let delayFrames = min(frameCount - 1, max(1, Int(sampleRate * 0.17)))
         let echoIndex = (cursor - echoFrames * 2 + history.count) % history.count
-        let delayIndex = (cursor - delayFrames * 2 + history.count) % history.count
-
         let echoMix = Double(min(100, max(0, effects.echoAmount))) / 100.0 * 0.48
-        let delayMix = Double(min(100, max(0, effects.delay))) / 100.0 * 0.38
-        let echoLeft = history[echoIndex]
-        let echoRight = history[(echoIndex + 1) % history.count]
-        let delayLeft = history[delayIndex]
-        let delayRight = history[(delayIndex + 1) % history.count]
-
-        modulationPhase += 1.0 / sampleRate
-        if modulationPhase >= 1.0 { modulationPhase -= 1.0 }
-        let vibratoAmount = Double(min(100, max(0, effects.vibratoAmount))) / 100.0
-        let modulation = sin(modulationPhase * 2.0 * .pi * 5.0) * vibratoAmount
-        let modulatedLeft = inputLeft * (1.0 + modulation * 0.045)
-        let modulatedRight = inputRight * (1.0 - modulation * 0.045)
-        let mixedLeft = modulatedLeft + echoLeft * echoMix + delayLeft * delayMix
-        let mixedRight = modulatedRight + echoRight * echoMix + delayRight * delayMix
-        let width = 1.0 + Double(min(100, max(0, effects.widePulseAmount))) / 100.0 * 0.65
-        let midValue: Double = (mixedLeft + mixedRight) * 0.5
-        let sideValue: Double = (mixedLeft - mixedRight) * 0.5 * width
+        let effectedLeft = inputLeft + history[echoIndex] * echoMix
+        let effectedRight = inputRight + history[(echoIndex + 1) % history.count] * echoMix
 
         history[cursor] = inputLeft
         history[(cursor + 1) % history.count] = inputRight
         cursor = (cursor + 2) % history.count
-        return (midValue + sideValue, midValue - sideValue)
+        return (effectedLeft, effectedRight)
     }
 }
 
@@ -235,7 +217,11 @@ private final class ByteLiveAudioState: @unchecked Sendable {
                 let vibrato = vibratoDepth > 0 && vibratoTime >= vibratoDelay
                     ? sin((vibratoTime - vibratoDelay) * secondsPerStep * 2.0 * .pi / vibratoCycle) * vibratoDepth * 0.018
                     : 0.0
-                let frequency = max(1.0, baseFrequency * pow(2.0, portamentoSemitones / 12.0) * (1.0 + vibrato + sweep))
+                let flutterMultiplier = channel == .drum ? 1.0 : ByteEffects.octaveFlutterMultiplier(
+                    at: Double(step) * secondsPerStep + stepElapsed,
+                    amount: project.effects.vibratoAmount
+                )
+                let frequency = max(1.0, baseFrequency * pow(2.0, portamentoSemitones / 12.0) * flutterMultiplier * (1.0 + vibrato + sweep))
                 // Supplied drum one-shots own their duration and level. Do not apply the
                 // former synthesized-noise length gate or envelope to them.
                 let effectiveLength = channel == .drum ? 63 : patch.length
@@ -525,7 +511,11 @@ enum ByteRenderer {
                     let vibrato = vibratoDepth > 0
                         ? sin(t * Double(patch.vibratoRate) * 2.0 * .pi) * vibratoDepth * 0.018
                         : 0.0
-                    let frequency = baseFrequency * (1.0 + vibrato + sweep)
+                    let flutterMultiplier = channel == .drum ? 1.0 : ByteEffects.octaveFlutterMultiplier(
+                        at: Double(sampleIndex) / sampleRate,
+                        amount: project.effects.vibratoAmount
+                    )
+                    let frequency = baseFrequency * flutterMultiplier * (1.0 + vibrato + sweep)
                     // Drum samples are complete one-shots; let their own WAV tails play.
                     let effectiveLength = channel == .drum ? 63 : patch.length
                     let drumVolume = channel == .drum && patch.drumVolumes.indices.contains(ByteDrumVoice.voice(for: note).rawValue)
@@ -639,7 +629,11 @@ enum ByteRenderer {
                 let vibrato = vibratoDepth > 0 && vibratoTime >= vibratoDelay
                     ? sin((vibratoTime - vibratoDelay) * secondsPerStep * 2.0 * .pi / vibratoCycle) * vibratoDepth * 0.018
                     : 0.0
-                let frequency = max(1.0, baseFrequency * pow(2.0, portamentoSemitones / 12.0) * (1.0 + vibrato + sweep))
+                let flutterMultiplier = channel == .drum ? 1.0 : ByteEffects.octaveFlutterMultiplier(
+                    at: Double(step) * secondsPerStep + stepElapsed,
+                    amount: project.effects.vibratoAmount
+                )
+                let frequency = max(1.0, baseFrequency * pow(2.0, portamentoSemitones / 12.0) * flutterMultiplier * (1.0 + vibrato + sweep))
                 let effectiveLength = channel == .drum ? 63 : patch.length
                 let drumVolume = channel == .drum && patch.drumVolumes.indices.contains(ByteDrumVoice.voice(for: note).rawValue)
                     ? patch.drumVolumes[ByteDrumVoice.voice(for: note).rawValue]

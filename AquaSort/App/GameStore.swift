@@ -477,24 +477,15 @@ final class GameStore {
         case .vibrato:
             project.effects.vibratoAmount = value
             project.effects.vibrato = value > 0
-        case .widePulse:
-            project.effects.widePulseAmount = value
-            project.effects.widePulse = value > 0
-        case .delay:
-            // Retained only for decoding older project files; the active short-repeat
-            // control is ECHO so legacy delay data remains inert.
-            project.effects.delay = 0
         }
         touch()
     }
 
     func effectAmount(_ effect: ByteEffect) -> Int {
         switch effect {
-        case .delay: return project.effects.delay
         case .echo: return project.effects.echoAmount
         case .bitCrush: return project.effects.bitCrushAmount
         case .vibrato: return project.effects.vibratoAmount
-        case .widePulse: return project.effects.widePulseAmount
         }
     }
 

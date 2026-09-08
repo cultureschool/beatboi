@@ -703,7 +703,7 @@ struct EditorView: View {
                         Text(store.isPlaying ? "EFFECT BUS LIVE" : "EFFECT BUS READY")
                             .font(.system(size: 8, weight: .black, design: .monospaced))
                             .foregroundStyle(Color.gbInk)
-                        Text("GLOBAL PROCESSING / LIVE HARDWARE PATH")
+                        Text("GLOBAL BUS / ECHO + OCTAVE FLUTTER")
                             .font(.system(size: 6, weight: .bold, design: .monospaced))
                             .foregroundStyle(Color.screenShadow)
                     }
@@ -1517,7 +1517,7 @@ private struct RestoredFXModule: View {
             }
             RestoredFXMeter(level: amount, accent: accent, active: active, phase: phase)
                 .frame(height: 16)
-            RestoredAmountCard(title: "AMOUNT", amount: amount, onChange: onChange)
+            RestoredAmountCard(title: title == "OCTAVE FLUTTER" ? "SPEED" : "AMOUNT", amount: amount, onChange: onChange)
         }
         .padding(7)
         .background(
@@ -1856,7 +1856,7 @@ struct LegacyEditorView: View {
     private var effectsPanel: some View {
         LCDPanel(title: "FX STATION") {
             VStack(alignment: .leading, spacing: 8) {
-                Text("GAME BOY-STYLE TRACKER EFFECTS")
+                Text("NES-STYLE TRACKER EFFECTS")
                     .font(.system(size: 9, weight: .black, design: .monospaced))
                     .foregroundStyle(Color.gbInk)
                 ForEach(ByteEffect.allCases) { effect in
@@ -2110,8 +2110,7 @@ struct UnlockView: View {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("ECHO").font(.system(size: 11, weight: .black, design: .monospaced)).foregroundStyle(Color.gbGlow)
                         Text("BIT CRUSH").font(.system(size: 11, weight: .black, design: .monospaced)).foregroundStyle(Color.gbGlow)
-                        Text("VIBRATO").font(.system(size: 11, weight: .black, design: .monospaced)).foregroundStyle(Color.gbGlow)
-                        Text("WIDE PULSE").font(.system(size: 11, weight: .black, design: .monospaced)).foregroundStyle(Color.gbGlow)
+                        Text("OCTAVE FLUTTER").font(.system(size: 11, weight: .black, design: .monospaced)).foregroundStyle(Color.gbGlow)
                     }
                     .padding(16)
                     .background(Color.gbDeep)

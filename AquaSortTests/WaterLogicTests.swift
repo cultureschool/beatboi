@@ -503,6 +503,17 @@ final class BeatboiTests: XCTestCase {
         XCTAssertEqual(ByteEffects.bitCrushEffectiveAmount(for: 140), 25)
     }
 
+    func testOctaveFlutterMapsFaderToDiscreteNESStyleJumps() {
+        XCTAssertEqual(ByteEffect.allCases, [.echo, .bitCrush, .vibrato])
+        XCTAssertEqual(ByteEffect.vibrato.title, "OCTAVE FLUTTER")
+        XCTAssertEqual(ByteEffects.octaveFlutterRate(for: 0), 0)
+        XCTAssertEqual(ByteEffects.octaveFlutterRate(for: 1), 1)
+        XCTAssertEqual(ByteEffects.octaveFlutterRate(for: 100), 16)
+        XCTAssertEqual(ByteEffects.octaveFlutterMultiplier(at: 0.0, amount: 70), 1)
+        XCTAssertEqual(ByteEffects.octaveFlutterMultiplier(at: 0.5, amount: 70), 2)
+        XCTAssertEqual(ByteEffects.octaveFlutterMultiplier(at: 0.0, amount: 0), 1)
+    }
+
     func testSharedBeginnerPatchControlsAndDMGEffectsPersist() {
         let suite = "BeatboiSoundControlsTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -521,11 +532,11 @@ final class BeatboiTests: XCTestCase {
             XCTAssertEqual(store.patch(for: channel).envelope, 30)
             XCTAssertEqual(store.patch(for: channel).vibratoDepth, 40)
         }
-        store.setEffectAmount(.delay, amount: 65)
-        XCTAssertEqual(store.project.effects.delay, 0)
+        store.setEffectAmount(.vibrato, amount: 65)
+        XCTAssertEqual(store.project.effects.vibratoAmount, 65)
         let data = try! JSONEncoder.bytePocketEncoder.encode(store.project)
         let decoded = try! JSONDecoder.bytePocketDecoder.decode(ByteProject.self, from: data)
-        XCTAssertEqual(decoded.projectEffectsForTests.delay, 0)
+        XCTAssertEqual(decoded.projectEffectsForTests.vibratoAmount, 65)
         defaults.removePersistentDomain(forName: suite)
     }
 

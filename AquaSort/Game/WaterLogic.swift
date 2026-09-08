@@ -186,18 +186,15 @@ enum ByteChannel: String, CaseIterable, Codable, Identifiable, Sendable {
 enum ByteEffect: String, CaseIterable, Codable, Identifiable, Hashable, Sendable {
     case echo
     case bitCrush
+    /// NES-style octave flutter: the fader controls the speed of the octave jumps.
     case vibrato
-    case widePulse
-    case delay
 
     var id: String { rawValue }
     var title: String {
         switch self {
         case .echo: return "ECHO"
         case .bitCrush: return "BIT CRUSH"
-        case .vibrato: return "VIBRATO"
-        case .widePulse: return "WIDE PULSE"
-        case .delay: return "DELAY"
+        case .vibrato: return "OCTAVE FLUTTER"
         }
     }
 }
@@ -619,14 +616,31 @@ struct ByteEffects: Codable, Hashable, Sendable {
         Double(min(100, max(0, amount))) * 0.25
     }
 
+    /// Converts the Octave Flutter fader into a discrete NES-style jump rate.
+    /// Zero is off; the top of the fader reaches a fast but still audible 16 Hz toggle.
+    static func octaveFlutterRate(for amount: Int) -> Double {
+        let clamped = min(100, max(0, amount))
+        guard clamped > 0 else { return 0 }
+        return 1.0 + Double(clamped - 1) / 99.0 * 15.0
+    }
+
+    /// Returns the current pitch multiplier for a hard base/octave-up arpeggio.
+    static func octaveFlutterMultiplier(at time: Double, amount: Int) -> Double {
+        let rate = octaveFlutterRate(for: amount)
+        guard rate > 0 else { return 1.0 }
+        let phase = (max(0, time) * rate).truncatingRemainder(dividingBy: 1.0)
+        return phase < 0.5 ? 1.0 : 2.0
+    }
+
     // Amounts are percentages so the FX Station can behave like compact hardware knobs.
-    // The booleans remain for project-file compatibility with older builds.
+    // The booleans and retired fields remain for project-file compatibility with older builds.
     var echo = false
     var echoAmount = 0
     var bitCrush = false
     var bitCrushAmount = 0
     var vibrato = false
     var vibratoAmount = 0
+    // Legacy fields remain Codable so older projects still open, but they are no longer active.
     var widePulse = false
     var widePulseAmount = 0
     /// Per-channel effect sends: Pulse, Square, Triangle, Drum.
@@ -679,8 +693,6 @@ struct ByteEffects: Codable, Hashable, Sendable {
         case .echo: return echoAmount > 0
         case .bitCrush: return bitCrushAmount > 0
         case .vibrato: return vibratoAmount > 0
-        case .widePulse: return widePulseAmount > 0
-        case .delay: return delay > 0
         }
     }
 
@@ -689,8 +701,6 @@ struct ByteEffects: Codable, Hashable, Sendable {
         case .echo: echoAmount = echoAmount > 0 ? 0 : 100; echo = echoAmount > 0
         case .bitCrush: bitCrushAmount = bitCrushAmount > 0 ? 0 : 100; bitCrush = bitCrushAmount > 0
         case .vibrato: vibratoAmount = vibratoAmount > 0 ? 0 : 100; vibrato = vibratoAmount > 0
-        case .widePulse: widePulseAmount = widePulseAmount > 0 ? 0 : 100; widePulse = widePulseAmount > 0
-        case .delay: delay = 0
         }
     }
 }
