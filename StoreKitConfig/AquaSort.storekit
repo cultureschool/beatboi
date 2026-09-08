@@ -1,0 +1,38 @@
+{
+  "identifier" : "BEATBOI-STOREKIT",
+  "nonRenewingSubscriptions" : [
+
+  ],
+  "products" : [
+    {
+      "displayPrice" : "2.99",
+      "familyShareable" : false,
+      "internalID" : "A1B2C3D4",
+      "localizations" : [
+        {
+          "description" : "Optional FX cartridge with echo, bit crush, vibrato, wide pulse, and bonus presets. One-time purchase — no ads, no subscription.",
+          "displayName" : "FX Cartridge",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "com.bytepocket.studio.unlock",
+      "referenceName" : "FX Cartridge",
+      "type" : "NonConsumable"
+    }
+  ],
+  "settings" : {
+    "_failTransactionsEnabled" : false,
+    "_locale" : "en_US",
+    "_storefront" : "USA",
+    "_storeKitErrors" : [
+
+    ]
+  },
+  "subscriptionGroups" : [
+
+  ],
+  "version" : {
+    "major" : 3,
+    "minor" : 0
+  }
+}

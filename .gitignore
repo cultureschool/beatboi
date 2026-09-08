@@ -1,0 +1,18 @@
+# Xcode generated output
+build/
+DerivedData/
+*.xcresult
+*.xcarchive
+*.xcuserstate
+xcuserdata/
+
+# Swift/Xcode local files
+.swiftpm/
+.build/
+Package.resolved
+
+# macOS
+.DS_Store
+
+# Local assistant/workspace metadata
+.freebuff/
