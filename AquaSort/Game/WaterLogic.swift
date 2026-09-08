@@ -614,6 +614,11 @@ enum BytePatchParameter: String, CaseIterable, Identifiable, Hashable, Sendable 
 }
 
 struct ByteEffects: Codable, Hashable, Sendable {
+    /// Bit Crush is intentionally softened: UI 0–100 maps to the former effective 0–25 range.
+    static func bitCrushEffectiveAmount(for amount: Int) -> Double {
+        Double(min(100, max(0, amount))) * 0.25
+    }
+
     // Amounts are percentages so the FX Station can behave like compact hardware knobs.
     // The booleans remain for project-file compatibility with older builds.
     var echo = false

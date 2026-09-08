@@ -25,7 +25,8 @@ private struct ByteMixEffects {
         var inputLeft = max(-0.9, min(0.9, left)) * send
         var inputRight = max(-0.9, min(0.9, right)) * send
         if effects.bitCrushAmount > 0 {
-            let levels = max(1.0, 16.0 - Double(effects.bitCrushAmount) / 100.0 * 14.0)
+            let effectiveAmount = ByteEffects.bitCrushEffectiveAmount(for: effects.bitCrushAmount)
+            let levels = max(1.0, 16.0 - effectiveAmount / 100.0 * 14.0)
             inputLeft = (inputLeft * levels).rounded() / levels
             inputRight = (inputRight * levels).rounded() / levels
         }
@@ -555,7 +556,8 @@ enum ByteRenderer {
                     }
 
                     if project.effects.bitCrushAmount > 0 {
-                        let levels = max(1.0, 16.0 - Double(project.effects.bitCrushAmount) / 100.0 * 14.0)
+                        let effectiveAmount = ByteEffects.bitCrushEffectiveAmount(for: project.effects.bitCrushAmount)
+                        let levels = max(1.0, 16.0 - effectiveAmount / 100.0 * 14.0)
                         value = (value * levels).rounded() / levels
                     }
                     let masterLevel = Double(min(100, max(0, patch.masterVolume))) / 100.0

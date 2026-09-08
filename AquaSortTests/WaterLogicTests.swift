@@ -496,6 +496,13 @@ final class BeatboiTests: XCTestCase {
         defaults.removePersistentDomain(forName: suite)
     }
 
+    func testBitCrushResponseUsesFullControlForFormerZeroToTwentyFiveRange() {
+        XCTAssertEqual(ByteEffects.bitCrushEffectiveAmount(for: 0), 0)
+        XCTAssertEqual(ByteEffects.bitCrushEffectiveAmount(for: 25), 6.25)
+        XCTAssertEqual(ByteEffects.bitCrushEffectiveAmount(for: 100), 25)
+        XCTAssertEqual(ByteEffects.bitCrushEffectiveAmount(for: 140), 25)
+    }
+
     func testSharedBeginnerPatchControlsAndDMGEffectsPersist() {
         let suite = "BeatboiSoundControlsTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
