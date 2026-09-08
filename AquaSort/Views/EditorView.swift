@@ -103,50 +103,68 @@ struct EditorView: View {
     }
 
     private var restoredHeader: some View {
-        VStack(alignment: .leading, spacing: 9) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center, spacing: 10) {
-                Image("beatboi")
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: 132, height: 32, alignment: .leading)
-                    .accessibilityLabel("BEATBOI")
+                VStack(alignment: .leading, spacing: 4) {
+                    Image("beatboi")
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 132, height: 32, alignment: .leading)
+                        .accessibilityLabel("BEATBOI")
+                    HStack(spacing: 5) {
+                        Circle()
+                            .fill(store.isPlaying ? Color.arcadeRed : Color.gbGlow)
+                            .frame(width: 6, height: 6)
+                        Text(store.isPlaying ? "SEQUENCER LIVE" : "SEQUENCER READY")
+                            .font(.system(size: 7, weight: .black, design: .monospaced))
+                            .foregroundStyle(Color.mutedText)
+                    }
+                }
                 Spacer(minLength: 4)
                 HStack(spacing: 6) {
-                    Circle()
-                        .fill(store.isPlaying ? Color.arcadeRed : Color.gbGlow)
-                        .frame(width: 9, height: 9)
-                        .shadow(color: (store.isPlaying ? Color.arcadeRed : Color.gbGlow).opacity(0.7), radius: 5)
-                    Text(store.isPlaying ? "LIVE" : "IDLE")
+                    Image(systemName: "waveform")
+                        .font(.system(size: 11, weight: .black))
+                    Text(pageTitle)
                         .font(.system(size: 8, weight: .black, design: .monospaced))
-                        .foregroundStyle(Color.gbLight)
+                        .tracking(0.7)
                 }
+                .foregroundStyle(Color.gbLight)
                 .padding(.horizontal, 9)
                 .frame(minHeight: 32)
-                .background(Color.plasticRaised)
+                .background(Color.hardwareBlack)
                 .clipShape(Capsule())
                 .overlay(Capsule().stroke(Color.plasticHighlight, lineWidth: 1))
             }
             HStack(spacing: 8) {
-                Text(pageTitle)
-                    .font(.system(size: 11, weight: .black, design: .monospaced))
-                    .tracking(1.2)
-                    .foregroundStyle(Color.gbLight)
-                Text(page == 0 ? "4 CHANNELS" : page == 1 ? "PATCH + FX" : "16 SLOTS")
-                    .font(.system(size: 8, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color.mutedText)
+                Text(page == 0 ? "PERFORMANCE / 4 PARTS" : page == 1 ? "SOUND DESIGN / PATCH + FX" : "ARRANGEMENT / 16 SLOTS")
+                    .font(.system(size: 8, weight: .black, design: .monospaced))
+                    .tracking(0.6)
+                    .foregroundStyle(Color.amber)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.65)
                 Spacer()
                 RestoredHeaderIcon(systemImage: "folder.fill") { showLibrary = true }
                 RestoredHeaderIcon(systemImage: "square.and.arrow.up") { showExport = true }
             }
         }
-        .padding(.bottom, 2)
+        .padding(10)
+        .background(
+            LinearGradient(colors: [Color.plasticRaised.opacity(0.92), Color.hardwareBlack.opacity(0.96)], startPoint: .topLeading, endPoint: .bottomTrailing)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 15, style: .continuous).stroke(Color.plasticHighlight.opacity(0.8), lineWidth: 1))
+        .overlay(alignment: .bottom) { Rectangle().fill(Color.amber.opacity(0.72)).frame(height: 2).padding(.horizontal, 10) }
     }
 
     private var restoredBeatpadPage: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 10) {
             restoredHeader
-            restoredTransport
-            restoredPatternActions
+            HardwareSection(title: "PERFORMANCE", detail: "16 STEP / LIVE") {
+                VStack(spacing: 9) {
+                    restoredTransport
+                    restoredPatternActions
+                }
+            }
             restoredVoicing
             // The mixer cards are the Beatpad channel selectors. Tapping a card selects
             // its pad row; swiping horizontally on that same card changes its volume.
@@ -158,18 +176,35 @@ struct EditorView: View {
     }
 
     private var restoredSoundLabPage: some View {
-        VStack(spacing: 8) { restoredHeader; restoredTransport; restoredPatternActions; restoredChannelTabs; restoredChannelMixer; restoredVoicing; restoredSoundLab }
-            .frame(maxWidth: .infinity, alignment: .top)
+        VStack(spacing: 10) {
+            restoredHeader
+            HardwareSection(title: "SOUND LAB", detail: "SELECT A PART TO EDIT") {
+                VStack(spacing: 9) {
+                    restoredTransport
+                    restoredPatternActions
+                    restoredChannelTabs
+                }
+            }
+            restoredChannelMixer
+            restoredVoicing
+            restoredSoundLab
+        }
+        .frame(maxWidth: .infinity, alignment: .top)
     }
 
     private var restoredSongPage: some View {
         VStack(spacing: 8) {
             restoredHeader
             restoredTransport
-            VStack(alignment: .leading, spacing: 2) {
-                Text("SONG MODE").font(.system(size: 9, weight: .black, design: .monospaced)).foregroundStyle(Color.gbLight)
-                Text("TAP: ASSIGN / CLEAR  •  SWIPE ↑↓: CHANGE PATTERN")
-                    .font(.system(size: 7, weight: .black, design: .monospaced)).foregroundStyle(Color.gbGlow)
+            HardwareSection(title: "ARRANGEMENT", detail: "TAP ASSIGN / SWIPE TO CYCLE") {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("SONG MODE")
+                        .font(.system(size: 9, weight: .black, design: .monospaced))
+                        .foregroundStyle(Color.gbLight)
+                    Text("TAP: ASSIGN / CLEAR  •  SWIPE ↑↓: CHANGE PATTERN")
+                        .font(.system(size: 7, weight: .black, design: .monospaced))
+                        .foregroundStyle(Color.gbGlow)
+                }
             }
             LCDPanel(title: "SONG ORDER / 16 PATTERN SLOTS") {
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 4), spacing: 6) {
@@ -197,10 +232,13 @@ struct EditorView: View {
             RestoredPageButton(title: "SONG", systemImage: "list.number", selected: page == 2) { setPage(2) }
         }
         .padding(5)
-        .frame(height: 52)
-        .background(Color.plasticRaised.opacity(0.8))
+        .frame(height: 54)
+        .background(
+            LinearGradient(colors: [Color.plasticRaised.opacity(0.98), Color.hardwareBlack.opacity(0.98)], startPoint: .top, endPoint: .bottom)
+        )
         .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.plasticHighlight.opacity(0.7), lineWidth: 1))
+        .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.plasticHighlight.opacity(0.78), lineWidth: 1))
+        .overlay(alignment: .top) { Rectangle().fill(Color.plasticHighlight.opacity(0.42)).frame(height: 1).padding(.horizontal, 14) }
         .accessibilityElement(children: .contain)
     }
 
@@ -231,9 +269,9 @@ struct EditorView: View {
         VStack(alignment: .leading, spacing: 7) {
             HStack {
                 Text("PATTERN BANK")
-                    .font(.system(size: 8, weight: .black, design: .monospaced))
-                    .tracking(1)
-                    .foregroundStyle(Color.mutedText)
+                    .font(.system(size: 9, weight: .black, design: .monospaced))
+                    .tracking(1.1)
+                    .foregroundStyle(Color.gbLight)
                 Spacer()
                 Text("\(store.project.patterns.count) / 16")
                     .font(.system(size: 8, weight: .black, design: .monospaced))
@@ -250,60 +288,135 @@ struct EditorView: View {
                     .foregroundStyle(Color.mutedText)
             }
         }
-        .padding(9)
-        .background(Color.plasticRaised.opacity(0.62))
+        .padding(11)
+        .background(LinearGradient(colors: [Color.plasticRaised.opacity(0.82), Color.hardwareBlack.opacity(0.72)], startPoint: .topLeading, endPoint: .bottomTrailing))
         .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.plasticHighlight.opacity(0.7), lineWidth: 1))
     }
 
     private var restoredPatternSelector: some View {
-        Menu {
-            ForEach(store.project.patterns) { pattern in
-                Button { requestPatternSelection(pattern.id) } label: { Label(pattern.name, systemImage: pattern.id == store.currentPatternID ? "checkmark" : "music.note") }
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
+                Image(systemName: "square.grid.3x3.fill")
+                    .font(.system(size: 11, weight: .black))
+                    .foregroundStyle(Color.amber)
+                Text(selectedPattern.name)
+                    .font(.system(size: 10, weight: .black, design: .monospaced))
+                    .foregroundStyle(Color.gbLight)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Text("HOLD TO RENAME")
+                    .font(.system(size: 6, weight: .black, design: .monospaced))
+                    .foregroundStyle(Color.mutedText)
             }
-            Divider()
-            Button { beginPatternRename(selectedPattern) } label: { Label("RENAME PATTERN", systemImage: "pencil") }
-        } label: {
-            HStack(spacing: 5) { Image(systemName: "square.grid.3x3.fill"); Text(selectedPattern.name).font(.system(size: 10, weight: .black, design: .monospaced)).lineLimit(1); Spacer(); Image(systemName: "pencil") }
-                .foregroundStyle(Color.gbInk).padding(.horizontal, 9)        .frame(maxWidth: .infinity, minHeight: 44)
-                .background(LinearGradient(colors: [Color.amber, Color.linkedOrange.opacity(0.8)], startPoint: .topLeading, endPoint: .bottomTrailing))
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous)).overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.gbInk, lineWidth: 2))
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(Array(store.project.patterns.enumerated()), id: \.element.id) { index, pattern in
+                        Button {
+                            requestPatternSelection(pattern.id)
+                        } label: {
+                            VStack(spacing: 2) {
+                                Text(String(format: "%02d", index + 1))
+                                    .font(.system(size: 8, weight: .black, design: .monospaced))
+                                Text(pattern.name.replacingOccurrences(of: "PATTERN ", with: "P"))
+                                    .font(.system(size: 7, weight: .bold, design: .monospaced))
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.6)
+                            }
+                            .foregroundStyle(pattern.id == store.currentPatternID ? Color.gbInk : Color.gbLight)
+                            .frame(width: 54, height: 42)
+                            .background(restoredPatternColor(index: index, selected: pattern.id == store.currentPatternID))
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(pattern.id == store.currentPatternID ? Color.gbLight : Color.plasticHighlight, lineWidth: pattern.id == store.currentPatternID ? 2 : 1))
+                        }
+                        .buttonStyle(ArcadePressStyle(scale: 0.94))
+                        .simultaneousGesture(LongPressGesture(minimumDuration: 0.55).onEnded { _ in beginPatternRename(pattern) })
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+            .contentShape(Rectangle())
+            .simultaneousGesture(DragGesture(minimumDistance: 10).onChanged { gesture in
+                if patternDragStartIndex == nil { patternDragStartIndex = store.project.patterns.firstIndex(where: { $0.id == store.currentPatternID }) ?? 0 }
+                let start = patternDragStartIndex ?? 0
+                let offset = Int((-gesture.translation.height / 24).rounded())
+                guard offset != 0, !store.project.patterns.isEmpty else { return }
+                let target = restoredClamp(start + offset, 0, store.project.patterns.count - 1)
+                if target != lastPatternDragIndex { lastPatternDragIndex = target; requestPatternSelection(store.project.patterns[target].id) }
+            }.onEnded { _ in patternDragStartIndex = nil; lastPatternDragIndex = nil })
         }
-        .simultaneousGesture(LongPressGesture(minimumDuration: 0.55).onEnded { _ in beginPatternRename(selectedPattern) })
-        .simultaneousGesture(DragGesture(minimumDistance: 10).onChanged { gesture in
-            if patternDragStartIndex == nil { patternDragStartIndex = store.project.patterns.firstIndex(where: { $0.id == store.currentPatternID }) ?? 0 }
-            let start = patternDragStartIndex ?? 0
-            let offset = Int((-gesture.translation.height / 24).rounded())
-            guard offset != 0, !store.project.patterns.isEmpty else { return }
-            let target = restoredClamp(start + offset, 0, store.project.patterns.count - 1)
-            if target != lastPatternDragIndex { lastPatternDragIndex = target; requestPatternSelection(store.project.patterns[target].id) }
-        }.onEnded { _ in patternDragStartIndex = nil; lastPatternDragIndex = nil })
+        .padding(9)
+        .background(Color.hardwareBlack.opacity(0.62))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.plasticHighlight.opacity(0.72), lineWidth: 1))
+    }
+
+    private func restoredPatternColor(index: Int, selected: Bool) -> Color {
+        if selected { return Color.amber }
+        return Color(hue: Double(index) / 16.0, saturation: 0.68, brightness: 0.72)
     }
 
     private var restoredVoicing: some View {
-        HStack(spacing: 5) {
-            RestoredChoiceBox(title: "KEY", value: restoredKeyNames[store.project.key], values: restoredKeyNames, index: store.project.key) { updateVoicing(key: $0) }
-            RestoredChoiceBox(title: "MODE", value: store.project.mode.title, values: ByteScaleMode.allCases.map(\.title), index: ByteScaleMode.allCases.firstIndex(of: store.project.mode) ?? 0) { index in updateVoicing(mode: ByteScaleMode.allCases[index]) }
+        VStack(alignment: .leading, spacing: 6) {
+            Text("VOICING")
+                .font(.system(size: 8, weight: .black, design: .monospaced))
+                .tracking(1)
+                .foregroundStyle(Color.mutedText)
+            HStack(spacing: 6) {
+                RestoredChoiceBox(title: "KEY", value: restoredKeyNames[store.project.key], values: restoredKeyNames, index: store.project.key) { updateVoicing(key: $0) }
+                RestoredChoiceBox(title: "MODE", value: store.project.mode.title, values: ByteScaleMode.allCases.map(\.title), index: ByteScaleMode.allCases.firstIndex(of: store.project.mode) ?? 0) { index in updateVoicing(mode: ByteScaleMode.allCases[index]) }
+            }
         }
+        .padding(10)
+        .background(
+            LinearGradient(colors: [Color.plasticRaised.opacity(0.72), Color.hardwareBlack.opacity(0.74)], startPoint: .topLeading, endPoint: .bottomTrailing)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.plasticHighlight.opacity(0.55), lineWidth: 1))
     }
 
     private var restoredChannelTabs: some View {
-        HStack(spacing: 4) {
-            ForEach(ByteChannel.allCases) { channel in
-                Button { store.selectedChannel = channel; store.selectedStep = nil } label: {
-                    Text(channel.title).font(.system(size: 8, weight: .black, design: .monospaced)).foregroundStyle(store.selectedChannel == channel ? Color.gbInk : Color.gbLight.opacity(0.82))        .frame(maxWidth: .infinity, minHeight: 44).background(store.selectedChannel == channel ? Color.amber : Color.plasticRaised).clipShape(RoundedRectangle(cornerRadius: 9)).overlay(RoundedRectangle(cornerRadius: 9).stroke(store.selectedChannel == channel ? Color.gbInk : Color.plasticHighlight, lineWidth: 1))
-                }.buttonStyle(.plain)
+        VStack(alignment: .leading, spacing: 6) {
+            Text("EDIT CHANNEL")
+                .font(.system(size: 8, weight: .black, design: .monospaced))
+                .tracking(1)
+                .foregroundStyle(Color.mutedText)
+            HStack(spacing: 4) {
+                ForEach(ByteChannel.allCases) { channel in
+                    Button { store.selectedChannel = channel; store.selectedStep = nil } label: {
+                        VStack(spacing: 3) {
+                            Circle()
+                                .fill(store.selectedChannel == channel ? Color.gbInk : restoredChannelAccent(channel))
+                                .frame(width: 7, height: 7)
+                                .shadow(color: restoredChannelAccent(channel).opacity(0.75), radius: 3)
+                            Text(channel.title)
+                                .font(.system(size: 7, weight: .black, design: .monospaced))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.65)
+                        }
+                        .foregroundStyle(store.selectedChannel == channel ? Color.gbInk : Color.gbLight.opacity(0.82))
+                        .frame(maxWidth: .infinity, minHeight: 46)
+                        .background(store.selectedChannel == channel ? Color.amber : restoredChannelAccent(channel).opacity(0.18))
+                        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(store.selectedChannel == channel ? Color.gbInk : Color.plasticHighlight, lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                }
             }
         }
+        .padding(9)
+        .background(Color.plasticRaised.opacity(0.42))
+        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.plasticHighlight.opacity(0.55), lineWidth: 1))
     }
 
     private var restoredChannelMixer: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("CHANNEL MIXER")
-                        .font(.system(size: 9, weight: .black, design: .monospaced))
-                        .tracking(0.8)
+                        .font(.system(size: 10, weight: .black, design: .monospaced))
+                        .tracking(1.0)
                         .foregroundStyle(Color.gbLight)
                     Text("TAP TO EDIT  ·  SWIPE ↔ TO MIX")
                         .font(.system(size: 7, weight: .bold, design: .monospaced))
@@ -316,14 +429,16 @@ struct EditorView: View {
             }
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 6), GridItem(.flexible(), spacing: 6)], spacing: 6) {
                 ForEach(ByteChannel.allCases) { channel in
-                    RestoredChannelFader(channel: channel, volume: store.channelVolumePercent(channel), selected: store.selectedChannel == channel) { store.selectedChannel = channel; store.selectedStep = nil } onChange: { value in store.setChannelVolume(channel: channel, percent: value); requestPlaybackRefresh() }
+                    RestoredChannelFader(channel: channel, accent: restoredChannelAccent(channel), volume: store.channelVolumePercent(channel), selected: store.selectedChannel == channel) { store.selectedChannel = channel; store.selectedStep = nil } onChange: { value in store.setChannelVolume(channel: channel, percent: value); requestPlaybackRefresh() }
                 }
             }
         }
         .padding(9)
-        .background(Color.plasticRaised.opacity(0.46))
+        .background(
+            LinearGradient(colors: [Color.plasticRaised.opacity(0.74), Color.hardwareBlack.opacity(0.78)], startPoint: .topLeading, endPoint: .bottomTrailing)
+        )
         .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.plasticHighlight.opacity(0.6), lineWidth: 1))
+        .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.plasticHighlight.opacity(0.68), lineWidth: 1))
     }
 
     private var restoredPadEditor: some View {
@@ -331,7 +446,7 @@ struct EditorView: View {
             VStack(spacing: 6) {
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 4), spacing: 6) {
                     ForEach(0..<16, id: \.self) { step in
-                        RestoredNotePad(step: step, note: selectedChannelNotes[step], length: store.noteLength(channel: store.selectedChannel, step: step), covered: store.isStepCovered(channel: store.selectedChannel, step: step), channel: store.selectedChannel, current: step == currentStep, linkSource: noteLinkSourceStep == step, linkArmed: noteLinkSourceStep != nil && noteLinkSourceStep != step, noteName: noteName, drumName: drumName) {
+                        RestoredNotePad(step: step, note: selectedChannelNotes[step], length: store.noteLength(channel: store.selectedChannel, step: step), covered: store.isStepCovered(channel: store.selectedChannel, step: step), channel: store.selectedChannel, accent: restoredChannelAccent(store.selectedChannel), current: step == currentStep, linkSource: noteLinkSourceStep == step, linkArmed: noteLinkSourceStep != nil && noteLinkSourceStep != step, noteName: noteName, drumName: drumName) {
                             if let source = noteLinkSourceStep, source != step, step > source {
                                 store.setNoteLength(channel: store.selectedChannel, step: source, length: step - source)
                                 noteLinkSourceStep = nil
@@ -404,6 +519,14 @@ struct EditorView: View {
         return Color(hue: Double(patternIndex) / 16.0, saturation: 0.82, brightness: 0.95)
     }
     private func restoredClamp(_ value: Int, _ low: Int, _ high: Int) -> Int { min(max(value, low), high) }
+    private func restoredChannelAccent(_ channel: ByteChannel) -> Color {
+        switch channel {
+        case .pulseA: return .pulseAccent
+        case .pulseB: return .squareAccent
+        case .wave: return .triangleAccent
+        case .drum: return .drumAccent
+        }
+    }
     private func noteName(_ midi: Int) -> String { let names = restoredKeyNames; return "\(names[(midi % 12 + 12) % 12])\(midi / 12 - 1)" }
     private func drumName(_ midi: Int) -> String { ByteDrumVoice.label(for: midi) }
     private func updateVoicing(key: Int? = nil, mode: ByteScaleMode? = nil) { store.updateVoicing(key: key, mode: mode); requestPlaybackRefresh() }
@@ -530,6 +653,7 @@ private struct RestoredChoiceBox: View {
 
 private struct RestoredChannelFader: View {
     let channel: ByteChannel
+    let accent: Color
     let volume: Int
     let selected: Bool
     let onSelect: () -> Void
@@ -541,18 +665,22 @@ private struct RestoredChannelFader: View {
         GeometryReader { proxy in
             ZStack(alignment: .leading) {
                 LinearGradient(
-                    colors: selected ? [Color.amber, Color.linkedOrange.opacity(0.72)] : [Color.gbLight, Color.screen.opacity(0.86)],
+                    colors: selected ? [Color.amber, Color.linkedOrange.opacity(0.72)] : [accent.opacity(0.86), accent.opacity(0.42)],
                     startPoint: .top,
                     endPoint: .bottom
                 )
-                Color.gbGlow.opacity(selected ? 0.52 : 0.28)
+                accent.opacity(selected ? 0.64 : 0.28)
                     .frame(width: proxy.size.width * CGFloat(volume) / 100.0)
-                HStack(spacing: 2) {
+                    .animation(.easeOut(duration: 0.12), value: volume)
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(selected ? Color.gbInk : Color.screenShadow)
+                        .frame(width: 5, height: 5)
                     Text(channel.title)
-                        .font(.system(size: 7, weight: .black, design: .monospaced))
+                        .font(.system(size: 8, weight: .black, design: .monospaced))
                     Spacer()
                     Text("\(volume)%")
-                        .font(.system(size: 7, weight: .black, design: .monospaced))
+                        .font(.system(size: 8, weight: .black, design: .monospaced))
                 }
                 .foregroundStyle(Color.gbInk)
                 .padding(.horizontal, 4)
@@ -610,6 +738,7 @@ private struct RestoredNotePad: View {
     let length: Int
     let covered: Bool
     let channel: ByteChannel
+    let accent: Color
     let current: Bool
     let linkSource: Bool
     let linkArmed: Bool
@@ -643,17 +772,18 @@ private struct RestoredNotePad: View {
             else if note != nil && length > 1 { Text("HOLD \(length)").font(.system(size: 6, weight: .black, design: .monospaced)) }
         }
         .foregroundStyle(Color.gbInk)
-        .frame(maxWidth: .infinity, minHeight: 49)
+        .frame(maxWidth: .infinity, minHeight: 54)
         .background(
             LinearGradient(
                 colors: channel == .drum
                     ? [padColor.opacity(0.96), padColor.opacity(0.68)]
-                    : [linkSource ? Color.linkedOrange : covered || (note != nil && length > 1) ? Color.linkedOrange.opacity(0.96) : padColor.opacity(0.96), linkSource ? Color.linkedOrange.opacity(0.68) : covered || (note != nil && length > 1) ? Color.linkedOrange.opacity(0.68) : padColor.opacity(0.68)],
+                    : [linkSource ? Color.linkedOrange : covered || (note != nil && length > 1) ? Color.linkedOrange.opacity(0.96) : (note == nil ? Color.gbDeep.opacity(0.30) : accent.opacity(0.96)), linkSource ? Color.linkedOrange.opacity(0.68) : covered || (note != nil && length > 1) ? Color.linkedOrange.opacity(0.68) : (note == nil ? Color.gbDeep.opacity(0.18) : accent.opacity(0.68))],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
         )
-        .overlay(Rectangle().stroke(linkSource || linkArmed ? Color.arcadeRed : current ? Color.gbLight : Color.gbInk.opacity(0.34), lineWidth: linkSource || current ? 3 : 1))
+        .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(linkSource || linkArmed ? Color.arcadeRed : current ? Color.gbLight : Color.gbInk.opacity(0.34), lineWidth: linkSource || current ? 3 : 1))
+        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
         .contentShape(Rectangle())
         .onTapGesture {
             guard !didDrag else { return }
@@ -787,7 +917,31 @@ private struct RestoredPatchCard: View {
     let onSelect: () -> Void
     let onChange: (Int) -> Void
     @State private var lastX: CGFloat = 0
-    var body: some View { HStack { Text(parameter.title).font(.system(size: 8, weight: .black, design: .monospaced)).foregroundStyle(Color.gbInk); Spacer(); Text(restoredPatchValue).font(.system(size: 8, weight: .black, design: .monospaced)).foregroundStyle(Color.gbInk); Image(systemName: "arrow.left.and.right").font(.system(size: 8, weight: .black)).foregroundStyle(Color.gbInk.opacity(0.5)) }.padding(.horizontal, 7).frame(height: 32).background(selected ? Color.amber : Color.gbDeep.opacity(0.14)).overlay(Rectangle().stroke(selected ? Color.gbInk : Color.gbInk.opacity(0.3), lineWidth: selected ? 2 : 1)).contentShape(Rectangle()).onTapGesture { onSelect() }.gesture(DragGesture(minimumDistance: 8).onChanged { gesture in onSelect(); let move = gesture.translation.width - lastX; if abs(move) >= 8 { onChange(Int((move / 8).rounded())); lastX = gesture.translation.width } }.onEnded { _ in lastX = 0 }) }
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(selected ? Color.gbInk : Color.screenShadow.opacity(0.55))
+                .frame(width: 5, height: 5)
+            Text(parameter.title)
+                .font(.system(size: 8, weight: .black, design: .monospaced))
+                .foregroundStyle(Color.gbInk)
+            Spacer(minLength: 2)
+            Text(restoredPatchValue)
+                .font(.system(size: 8, weight: .black, design: .monospaced))
+                .foregroundStyle(Color.gbInk)
+            Image(systemName: "arrow.left.and.right")
+                .font(.system(size: 8, weight: .black))
+                .foregroundStyle(Color.gbInk.opacity(0.5))
+        }
+        .padding(.horizontal, 8)
+        .frame(minHeight: 42)
+        .background(selected ? Color.amber : Color.gbDeep.opacity(0.14))
+        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(selected ? Color.gbInk : Color.gbInk.opacity(0.3), lineWidth: selected ? 2 : 1))
+        .contentShape(Rectangle())
+        .onTapGesture { onSelect() }
+        .gesture(DragGesture(minimumDistance: 8).onChanged { gesture in onSelect(); let move = gesture.translation.width - lastX; if abs(move) >= 8 { onChange(Int((move / 8).rounded())); lastX = gesture.translation.width } }.onEnded { _ in lastX = 0 })
+    }
     private var restoredPatchValue: String { switch parameter { case .duty: return ["12.5%", "25%", "50%", "75%"][min(3, max(0, patch.duty))]; case .octave: return patch.octave >= 0 ? "+\(patch.octave)" : "\(patch.octave)"; case .volume: return "\(patch.initialVolume)/15"; case .waveShape: return "\(patch.waveShape)"; case .waveVolume: return "\(patch.waveVolume)"; case .envelopeDirection: return patch.envelopeIncrease ? "UP" : "DOWN"; case .sweepDirection: return patch.sweepIncrease ? "UP" : "DOWN"; case .panLeft: return patch.panLeft ? "ON" : "OFF"; case .panRight: return patch.panRight ? "ON" : "OFF"; case .lengthCounter: return patch.lengthCounter ? "ON" : "OFF"; default: return "—" } }
 }
 
@@ -797,7 +951,7 @@ private struct RestoredAmountCard: View {
     let onChange: (Int) -> Void
     @State private var start: Int?
     @State private var last: Int?
-    var body: some View { GeometryReader { proxy in ZStack(alignment: .leading) { Color.gbDeep.opacity(0.14); Color.gbGlow.opacity(0.55).frame(width: proxy.size.width * CGFloat(min(100, max(0, amount))) / 100); HStack { Text(title).font(.system(size: 8, weight: .black, design: .monospaced)); Spacer(); Text("\(amount)%").font(.system(size: 8, weight: .black, design: .monospaced)) }.foregroundStyle(Color.gbInk).padding(.horizontal, 7) }.overlay(Rectangle().stroke(Color.gbInk.opacity(0.35), lineWidth: 1)).contentShape(Rectangle()).gesture(DragGesture(minimumDistance: 7).onChanged { gesture in if start == nil { start = amount }; let proposed = min(max((start ?? amount) + Int((gesture.translation.width / 2).rounded()), 0), 100); if proposed != last { last = proposed; onChange(proposed) } }.onEnded { _ in start = nil; last = nil }) }.frame(height: 32) }
+    var body: some View { GeometryReader { proxy in ZStack(alignment: .leading) { Color.gbDeep.opacity(0.14); Color.gbGlow.opacity(0.55).frame(width: proxy.size.width * CGFloat(min(100, max(0, amount))) / 100); HStack { Text(title).font(.system(size: 8, weight: .black, design: .monospaced)); Spacer(); Text("\(amount)%").font(.system(size: 8, weight: .black, design: .monospaced)) }.foregroundStyle(Color.gbInk).padding(.horizontal, 7) }.overlay(Rectangle().stroke(Color.gbInk.opacity(0.35), lineWidth: 1)).contentShape(Rectangle()).gesture(DragGesture(minimumDistance: 7).onChanged { gesture in if start == nil { start = amount }; let proposed = min(max((start ?? amount) + Int((gesture.translation.width / 2).rounded()), 0), 100); if proposed != last { last = proposed; onChange(proposed) } }.onEnded { _ in start = nil; last = nil }) }.frame(minHeight: 40) }
 }
 
 
