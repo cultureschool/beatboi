@@ -44,7 +44,7 @@ struct EditorView: View {
             GeometryReader { proxy in
                 ArcadeShell {
                     VStack(spacing: 0) {
-                        FittedEditorContent {
+                        ScrollView(.vertical, showsIndicators: false) {
                             restoredPageContent
                                 .frame(maxWidth: .infinity, alignment: .top)
                                 .padding(.horizontal, 10)
@@ -52,6 +52,8 @@ struct EditorView: View {
                                 .padding(.bottom, 18)
                         }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .scrollBounceBehavior(.basedOnSize)
+                        .scrollIndicators(.hidden)
 
                         restoredPageSwitcher
                             .padding(.horizontal, 5)
@@ -759,46 +761,6 @@ struct EditorView: View {
         if url.pathExtension.lowercased() == "mid", let imported = ByteMIDI.importIntoProject(data, project: store.project) { store.importProject(imported); store.presentToast("MIDI IMPORTED") }
         else if let imported = try? JSONDecoder.bytePocketDecoder.decode(ByteProject.self, from: data) { store.importProject(imported); store.presentToast("PROJECT OPENED") }
         else { store.presentToast("UNKNOWN FILE") }
-    }
-}
-
-/// Fits each complete editor page into the phone viewport instead of introducing a
-/// competing vertical scroll surface. The page keeps its natural layout and is scaled
-/// only when its full height exceeds the available space, preserving all hit targets.
-private struct FittedEditorContent<Content: View>: View {
-    @ViewBuilder let content: () -> Content
-    @State private var contentHeight: CGFloat = 1
-
-    var body: some View {
-        GeometryReader { proxy in
-            content()
-                .frame(width: proxy.size.width)
-                .fixedSize(horizontal: false, vertical: true)
-                .background(
-                    GeometryReader { measured in
-                        Color.clear.preference(key: FittedContentHeightKey.self, value: measured.size.height)
-                    }
-                )
-                .scaleEffect(scale(for: proxy.size.height), anchor: .top)
-                .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
-                .clipped()
-        }
-        .onPreferenceChange(FittedContentHeightKey.self) { height in
-            if height > 1 { contentHeight = height }
-        }
-    }
-
-    private func scale(for availableHeight: CGFloat) -> CGFloat {
-        guard contentHeight > 1, availableHeight > 1 else { return 1 }
-        return min(1, availableHeight / contentHeight)
-    }
-}
-
-private struct FittedContentHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 1
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
     }
 }
 
