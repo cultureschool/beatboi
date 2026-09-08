@@ -20,6 +20,14 @@ struct EditorView: View {
     @State private var patternRenameID: UUID?
     @State private var playbackRefreshTask: Task<Void, Never>?
 
+    private var pageTitle: String {
+        switch page {
+        case 0: return "BEATPAD"
+        case 1: return "SOUND LAB"
+        default: return "SONG MODE"
+        }
+    }
+
     private var selectedPattern: BytePattern {
         store.project.patterns.first(where: { $0.id == store.currentPatternID }) ?? store.project.patterns[0]
     }
@@ -33,10 +41,14 @@ struct EditorView: View {
         ZStack {
             PocketBackdrop()
             ArcadeShell {
-                VStack(spacing: 0) {
-                    if page == 0 { restoredBeatpadPage }
-                    else if page == 1 { restoredSoundLabPage }
-                    else { restoredSongPage }
+                VStack(spacing: 8) {
+                    ScrollView(.vertical, showsIndicators: false) {
+                        restoredPageContent
+                            .frame(maxWidth: .infinity, alignment: .top)
+                            .padding(.bottom, 4)
+                    }
+                    .scrollBounceBehavior(.basedOnSize)
+                    .scrollIndicators(.hidden)
                     restoredPageSwitcher
                 }
                 .padding(.horizontal, 10)
@@ -46,6 +58,7 @@ struct EditorView: View {
             }
             .padding(.horizontal, 7)
             .padding(.vertical, 6)
+            .safeAreaPadding(.bottom, 4)
 
             if let toast = store.toast {
                 VStack {
@@ -76,8 +89,15 @@ struct EditorView: View {
         .onDisappear { playbackRefreshTask?.cancel(); audio.stop() }
     }
 
+    @ViewBuilder
+    private var restoredPageContent: some View {
+        if page == 0 { restoredBeatpadPage }
+        else if page == 1 { restoredSoundLabPage }
+        else { restoredSongPage }
+    }
+
     private var restoredHeader: some View {
-        HStack(alignment: .bottom) {
+        HStack(alignment: .center, spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
                 Image("beatboi")
                     .resizable()
@@ -87,6 +107,8 @@ struct EditorView: View {
                 Text(page == 0 ? "BEATPAD / 4-CHANNEL DMG" : page == 1 ? "SOUND LAB / REGISTER PATCH" : "SONG MODE / ARRANGEMENT")
                     .font(.system(size: 8, weight: .black, design: .monospaced))
                     .foregroundStyle(Color.mutedText)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
             }
             Spacer()
             HStack(spacing: 6) {
@@ -97,7 +119,7 @@ struct EditorView: View {
     }
 
     private var restoredBeatpadPage: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 8) {
             restoredHeader
             restoredTransport
             restoredPatternActions
@@ -108,16 +130,16 @@ struct EditorView: View {
             restoredPadEditor
             Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .frame(maxWidth: .infinity, alignment: .top)
     }
 
     private var restoredSoundLabPage: some View {
-        VStack(spacing: 6) { restoredHeader; restoredTransport; restoredPatternActions; restoredChannelTabs; restoredChannelMixer; restoredVoicing; restoredSoundLab; Spacer(minLength: 0) }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        VStack(spacing: 8) { restoredHeader; restoredTransport; restoredPatternActions; restoredChannelTabs; restoredChannelMixer; restoredVoicing; restoredSoundLab }
+            .frame(maxWidth: .infinity, alignment: .top)
     }
 
     private var restoredSongPage: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 8) {
             restoredHeader
             restoredTransport
             VStack(alignment: .leading, spacing: 2) {
@@ -141,17 +163,17 @@ struct EditorView: View {
             restoredChannelMixer
             Spacer(minLength: 0)
         }
-        .frame(maxHeight: .infinity, alignment: .top)
+        .frame(maxWidth: .infinity, alignment: .top)
     }
 
     private var restoredPageSwitcher: some View {
-        HStack(spacing: 5) {
+        HStack(spacing: 6) {
             RestoredPageButton(title: "BEATPAD", systemImage: "square.grid.2x2.fill", selected: page == 0) { setPage(0) }
             RestoredPageButton(title: "SOUND LAB", systemImage: "slider.horizontal.3", selected: page == 1) { setPage(1) }
             RestoredPageButton(title: "SONG", systemImage: "list.number", selected: page == 2) { setPage(2) }
         }
         .padding(5)
-        .frame(height: 48)
+        .frame(minHeight: 52)
         .background(Color.plastic.opacity(0.7))
         .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.plasticHighlight.opacity(0.7), lineWidth: 1))
@@ -201,7 +223,7 @@ struct EditorView: View {
             Button { beginPatternRename(selectedPattern) } label: { Label("RENAME PATTERN", systemImage: "pencil") }
         } label: {
             HStack(spacing: 5) { Image(systemName: "square.grid.3x3.fill"); Text(selectedPattern.name).font(.system(size: 10, weight: .black, design: .monospaced)).lineLimit(1); Spacer(); Image(systemName: "pencil") }
-                .foregroundStyle(Color.gbInk).padding(.horizontal, 9).frame(maxWidth: .infinity, minHeight: 34)
+                .foregroundStyle(Color.gbInk).padding(.horizontal, 9)        .frame(maxWidth: .infinity, minHeight: 44)
                 .background(LinearGradient(colors: [Color.amber, Color.linkedOrange.opacity(0.8)], startPoint: .topLeading, endPoint: .bottomTrailing))
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous)).overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.gbInk, lineWidth: 2))
         }
@@ -227,7 +249,7 @@ struct EditorView: View {
         HStack(spacing: 4) {
             ForEach(ByteChannel.allCases) { channel in
                 Button { store.selectedChannel = channel; store.selectedStep = nil } label: {
-                    Text(channel.title).font(.system(size: 8, weight: .black, design: .monospaced)).foregroundStyle(store.selectedChannel == channel ? Color.gbInk : Color.gbLight.opacity(0.82)).frame(maxWidth: .infinity, minHeight: 34).background(store.selectedChannel == channel ? Color.amber : Color.plasticRaised).clipShape(RoundedRectangle(cornerRadius: 9)).overlay(RoundedRectangle(cornerRadius: 9).stroke(store.selectedChannel == channel ? Color.gbInk : Color.plasticHighlight, lineWidth: 1))
+                    Text(channel.title).font(.system(size: 8, weight: .black, design: .monospaced)).foregroundStyle(store.selectedChannel == channel ? Color.gbInk : Color.gbLight.opacity(0.82))        .frame(maxWidth: .infinity, minHeight: 44).background(store.selectedChannel == channel ? Color.amber : Color.plasticRaised).clipShape(RoundedRectangle(cornerRadius: 9)).overlay(RoundedRectangle(cornerRadius: 9).stroke(store.selectedChannel == channel ? Color.gbInk : Color.plasticHighlight, lineWidth: 1))
                 }.buttonStyle(.plain)
             }
         }
@@ -238,7 +260,7 @@ struct EditorView: View {
             HStack { Text("CHANNEL MIXER / TAP TO EDIT").font(.system(size: 9, weight: .black, design: .monospaced)).foregroundStyle(Color.gbLight); Spacer(); Text("SWIPE ↔ TO MIX").font(.system(size: 7, weight: .black, design: .monospaced)).foregroundStyle(Color.gbGlow) }
             HStack(spacing: 4) {
                 ForEach(ByteChannel.allCases) { channel in
-                    RestoredChannelFader(channel: channel, volume: store.channelVolumePercent(channel), selected: store.selectedChannel == channel) { store.selectedChannel = channel } onChange: { value in store.setChannelVolume(channel: channel, percent: value); requestPlaybackRefresh() }
+                    RestoredChannelFader(channel: channel, volume: store.channelVolumePercent(channel), selected: store.selectedChannel == channel) { store.selectedChannel = channel; store.selectedStep = nil } onChange: { value in store.setChannelVolume(channel: channel, percent: value); requestPlaybackRefresh() }
                 }
             }
             .frame(height: 40)
@@ -270,8 +292,7 @@ struct EditorView: View {
     }
 
     private var restoredSoundLab: some View {
-        ScrollView(.vertical, showsIndicators: false) {
-            VStack(spacing: 7) {
+            VStack(spacing: 9) {
                 if store.selectedChannel == .drum {
                     RestoredDrumEditor(
                         patch: store.patch(for: .drum),
@@ -307,7 +328,6 @@ struct EditorView: View {
                 }
             }
             .padding(.bottom, 4)
-        }
     }
 
     private func restoredParameters(for channel: ByteChannel) -> [BytePatchParameter] {
@@ -379,7 +399,8 @@ struct EditorView: View {
 private struct RestoredHeaderIcon: View {
     let systemImage: String
     let action: () -> Void
-    var body: some View { Button(action: action) { Image(systemName: systemImage).font(.system(size: 14, weight: .black)).foregroundStyle(Color.gbLight).frame(width: 36, height: 34).background(Color.plasticRaised).clipShape(RoundedRectangle(cornerRadius: 9)).overlay(RoundedRectangle(cornerRadius: 9).stroke(Color.plasticHighlight, lineWidth: 1)) }.buttonStyle(ArcadePressStyle()) }
+    var body: some View { Button(action: action) { Image(systemName: systemImage).font(.system(size: 14, weight: .black)).foregroundStyle(Color.gbLight)                .frame(width: 44, height: 44).background(Color.plasticRaised)
+.clipShape(RoundedRectangle(cornerRadius: 9)).overlay(RoundedRectangle(cornerRadius: 9).stroke(Color.plasticHighlight, lineWidth: 1)) }.buttonStyle(ArcadePressStyle()) }
 }
 
 private struct RestoredPageButton: View {
@@ -393,7 +414,7 @@ private struct RestoredPageButton: View {
 private struct RestoredDiceButton: View {
     let label: String
     let action: () -> Void
-    var body: some View { Button(action: action) { Image(systemName: "dice.fill").font(.system(size: 20, weight: .black)).foregroundStyle(Color.gbInk).frame(width: 48, height: 46).background(LinearGradient(colors: [Color.amber, Color.linkedOrange.opacity(0.8)], startPoint: .top, endPoint: .bottom)).clipShape(RoundedRectangle(cornerRadius: 10)).overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.gbInk, lineWidth: 2)) }.buttonStyle(ArcadePressStyle(scale: 0.88)).accessibilityLabel(label) }
+    var body: some View { Button(action: action) { Image(systemName: "dice.fill").font(.system(size: 20, weight: .black)).foregroundStyle(Color.gbInk).frame(width: 52, height: 48).background(LinearGradient(colors: [Color.amber, Color.linkedOrange.opacity(0.8)], startPoint: .top, endPoint: .bottom)).clipShape(RoundedRectangle(cornerRadius: 10)).overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.gbInk, lineWidth: 2)) }.buttonStyle(ArcadePressStyle(scale: 0.88)).accessibilityLabel(label) }
 }
 
 private struct RestoredActionButton: View {
@@ -402,7 +423,7 @@ private struct RestoredActionButton: View {
     var destructive = false
     var disabled = false
     let action: () -> Void
-    var body: some View { Button(action: action) { Image(systemName: systemImage).font(.system(size: 13, weight: .black)).foregroundStyle(disabled ? Color.mutedText.opacity(0.45) : (destructive ? Color.linkedOrange : Color.gbLight)).frame(width: 32, height: 34).background(Color.plasticRaised).clipShape(RoundedRectangle(cornerRadius: 8)).overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.plasticHighlight, lineWidth: 1)) }.buttonStyle(ArcadePressStyle(scale: 0.88)).disabled(disabled).accessibilityLabel(label) }
+    var body: some View { Button(action: action) { Image(systemName: systemImage).font(.system(size: 15, weight: .black)).foregroundStyle(disabled ? Color.mutedText.opacity(0.45) : (destructive ? Color.linkedOrange : Color.gbLight)).frame(width: 44, height: 44).background(Color.plasticRaised).clipShape(RoundedRectangle(cornerRadius: 8)).overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.plasticHighlight, lineWidth: 1)) }.buttonStyle(ArcadePressStyle(scale: 0.88)).disabled(disabled).accessibilityLabel(label) }
 }
 
 private struct RestoredTempoBox: View {
@@ -422,7 +443,7 @@ private struct RestoredChoiceBox: View {
     let onSelect: (Int) -> Void
     @State private var start: Int?
     @State private var last: Int?
-    var body: some View { HStack(spacing: 4) { VStack(alignment: .leading, spacing: 1) { Text(title).font(.system(size: 7, weight: .black, design: .monospaced)); Text(value).font(.system(size: 8, weight: .black, design: .monospaced)).lineLimit(1) }; Spacer(); Image(systemName: "arrow.left.and.right").font(.system(size: 8, weight: .black)) }.foregroundStyle(Color.gbInk).padding(.horizontal, 7).frame(maxWidth: .infinity, minHeight: 36).background(title == "KEY" ? Color.amber : Color.gbGlow).overlay(Rectangle().stroke(Color.gbInk, lineWidth: 2)).gesture(DragGesture(minimumDistance: 0).onChanged { gesture in if start == nil { start = index }; guard !values.isEmpty else { return }; let offset = Int((gesture.translation.width / 20).rounded()); let selected = min(max((start ?? index) + offset, 0), values.count - 1); if selected != last { last = selected; onSelect(selected) } }.onEnded { _ in start = nil; last = nil }) }
+    var body: some View { HStack(spacing: 4) { VStack(alignment: .leading, spacing: 1) { Text(title).font(.system(size: 8, weight: .black, design: .monospaced)); Text(value).font(.system(size: 9, weight: .black, design: .monospaced)).lineLimit(1) }; Spacer(); Image(systemName: "arrow.left.and.right").font(.system(size: 9, weight: .black)) }.foregroundStyle(Color.gbInk).padding(.horizontal, 9).frame(maxWidth: .infinity, minHeight: 44).background(title == "KEY" ? Color.amber : Color.gbGlow).overlay(Rectangle().stroke(Color.gbInk, lineWidth: 2)).gesture(DragGesture(minimumDistance: 0).onChanged { gesture in if start == nil { start = index }; guard !values.isEmpty else { return }; let offset = Int((gesture.translation.width / 20).rounded()); let selected = min(max((start ?? index) + offset, 0), values.count - 1); if selected != last { last = selected; onSelect(selected) } }.onEnded { _ in start = nil; last = nil }) }
 }
 
 private struct RestoredChannelFader: View {
