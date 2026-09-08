@@ -219,7 +219,9 @@ private final class ByteLiveAudioState: @unchecked Sendable {
                     : 0.0
                 let flutterMultiplier = channel == .drum ? 1.0 : ByteEffects.octaveFlutterMultiplier(
                     at: Double(step) * secondsPerStep + stepElapsed,
-                    amount: project.effects.vibratoAmount
+                    bpm: project.tempo,
+                    amount: project.effects.vibratoAmount,
+                    pattern: ByteOctaveFlutterPattern(rawValue: project.effects.octaveFlutterPattern) ?? .baseUp
                 )
                 let frequency = max(1.0, baseFrequency * pow(2.0, portamentoSemitones / 12.0) * flutterMultiplier * (1.0 + vibrato + sweep))
                 // Supplied drum one-shots own their duration and level. Do not apply the
@@ -513,7 +515,9 @@ enum ByteRenderer {
                         : 0.0
                     let flutterMultiplier = channel == .drum ? 1.0 : ByteEffects.octaveFlutterMultiplier(
                         at: Double(sampleIndex) / sampleRate,
-                        amount: project.effects.vibratoAmount
+                        bpm: project.tempo,
+                        amount: project.effects.vibratoAmount,
+                        pattern: ByteOctaveFlutterPattern(rawValue: project.effects.octaveFlutterPattern) ?? .baseUp
                     )
                     let frequency = baseFrequency * flutterMultiplier * (1.0 + vibrato + sweep)
                     // Drum samples are complete one-shots; let their own WAV tails play.
@@ -631,7 +635,9 @@ enum ByteRenderer {
                     : 0.0
                 let flutterMultiplier = channel == .drum ? 1.0 : ByteEffects.octaveFlutterMultiplier(
                     at: Double(step) * secondsPerStep + stepElapsed,
-                    amount: project.effects.vibratoAmount
+                    bpm: project.tempo,
+                    amount: project.effects.vibratoAmount,
+                    pattern: ByteOctaveFlutterPattern(rawValue: project.effects.octaveFlutterPattern) ?? .baseUp
                 )
                 let frequency = max(1.0, baseFrequency * pow(2.0, portamentoSemitones / 12.0) * flutterMultiplier * (1.0 + vibrato + sweep))
                 let effectiveLength = channel == .drum ? 63 : patch.length

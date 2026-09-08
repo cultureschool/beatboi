@@ -731,7 +731,9 @@ struct EditorView: View {
                             amount: store.effectAmount(effect),
                             accent: Color.gbGlow,
                             active: store.isPlaying,
-                            phase: currentStep + (ByteEffect.allCases.firstIndex(of: effect) ?? 0)
+                            phase: currentStep + (ByteEffect.allCases.firstIndex(of: effect) ?? 0),
+                            flutterPattern: effect == .vibrato ? store.octaveFlutterPattern : nil,
+                            onPatternChange: effect == .vibrato ? { pattern in store.setOctaveFlutterPattern(pattern); requestPlaybackRefresh() } : nil
                         ) { amount in
                             store.setEffectAmount(effect, amount: amount)
                             requestPlaybackRefresh()
@@ -1499,6 +1501,8 @@ private struct RestoredFXModule: View {
     let accent: Color
     let active: Bool
     let phase: Int
+    let flutterPattern: ByteOctaveFlutterPattern?
+    let onPatternChange: ((ByteOctaveFlutterPattern) -> Void)?
     let onChange: (Int) -> Void
 
     var body: some View {
@@ -1518,6 +1522,20 @@ private struct RestoredFXModule: View {
             RestoredFXMeter(level: amount, accent: accent, active: active, phase: phase)
                 .frame(height: 16)
             RestoredAmountCard(title: title == "OCTAVE FLUTTER" ? "SPEED" : "AMOUNT", amount: amount, onChange: onChange)
+            if let flutterPattern, let onPatternChange {
+                Picker("OCTAVE PATH", selection: Binding(
+                    get: { flutterPattern },
+                    set: { onPatternChange($0) }
+                )) {
+                    ForEach(ByteOctaveFlutterPattern.allCases) { pattern in
+                        Text(pattern.title).tag(pattern)
+                    }
+                }
+                .pickerStyle(.menu)
+                .font(.system(size: 7, weight: .black, design: .monospaced))
+                .tint(Color.gbGlow)
+                .accessibilityLabel("Octave flutter pattern")
+            }
         }
         .padding(7)
         .background(

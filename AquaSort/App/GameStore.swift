@@ -489,6 +489,16 @@ final class GameStore {
         }
     }
 
+    var octaveFlutterPattern: ByteOctaveFlutterPattern {
+        ByteOctaveFlutterPattern(rawValue: project.effects.octaveFlutterPattern) ?? .baseUp
+    }
+
+    func setOctaveFlutterPattern(_ pattern: ByteOctaveFlutterPattern) {
+        guard project.effects.octaveFlutterPattern != pattern.rawValue else { return }
+        project.effects.octaveFlutterPattern = pattern.rawValue
+        touch()
+    }
+
     func effectSendPercent(_ channel: ByteChannel) -> Int {
         let index = ByteChannel.allCases.firstIndex(of: channel) ?? 0
         return project.effects.channelSends.indices.contains(index) ? project.effects.channelSends[index].clamped(to: 0...100) : 100

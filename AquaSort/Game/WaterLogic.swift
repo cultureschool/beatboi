@@ -199,6 +199,29 @@ enum ByteEffect: String, CaseIterable, Codable, Identifiable, Hashable, Sendable
     }
 }
 
+enum ByteOctaveFlutterPattern: Int, CaseIterable, Codable, Identifiable, Sendable {
+    case baseUp = 0
+    case upBase = 1
+    case baseUpTwoUp = 2
+
+    var id: Int { rawValue }
+    var title: String {
+        switch self {
+        case .baseUp: return "BASE / +1"
+        case .upBase: return "+1 / BASE"
+        case .baseUpTwoUp: return "BASE / +1 / +2 / +1"
+        }
+    }
+
+    var octaveSteps: [Int] {
+        switch self {
+        case .baseUp: return [0, 1]
+        case .upBase: return [1, 0]
+        case .baseUpTwoUp: return [0, 1, 2, 1]
+        }
+    }
+}
+
 enum ByteWaveShape: Int, CaseIterable, Identifiable, Sendable {
     case waveBass
     case triangle
@@ -616,20 +639,30 @@ struct ByteEffects: Codable, Hashable, Sendable {
         Double(min(100, max(0, amount))) * 0.25
     }
 
-    /// Converts the Octave Flutter fader into a discrete NES-style jump rate.
-    /// Zero is off; the top of the fader reaches a fast but still audible 16 Hz toggle.
-    static func octaveFlutterRate(for amount: Int) -> Double {
+    /// Maps the fader to musical divisions. The fader remains continuous to touch,
+    /// while each fifth selects a stable tempo-synced rate from whole notes to 1/16ths.
+    static func octaveFlutterDivision(for amount: Int) -> Int {
         let clamped = min(100, max(0, amount))
         guard clamped > 0 else { return 0 }
-        return 1.0 + Double(clamped - 1) / 99.0 * 15.0
+        return min(4, (clamped - 1) / 20)
     }
 
-    /// Returns the current pitch multiplier for a hard base/octave-up arpeggio.
-    static func octaveFlutterMultiplier(at time: Double, amount: Int) -> Double {
-        let rate = octaveFlutterRate(for: amount)
-        guard rate > 0 else { return 1.0 }
-        let phase = (max(0, time) * rate).truncatingRemainder(dividingBy: 1.0)
-        return phase < 0.5 ? 1.0 : 2.0
+    static func octaveFlutterDivisionTitle(for amount: Int) -> String {
+        ["OFF", "1/1", "1/2", "1/4", "1/8", "1/16"][octaveFlutterDivision(for: amount) + (amount > 0 ? 1 : 0)]
+    }
+
+    /// Returns a hard, tempo-synced octave arpeggio multiplier.
+    static func octaveFlutterMultiplier(
+        at time: Double,
+        bpm: Int,
+        amount: Int,
+        pattern: ByteOctaveFlutterPattern = .baseUp
+    ) -> Double {
+        guard amount > 0 else { return 1.0 }
+        let divisionBeats = [4.0, 2.0, 1.0, 0.5, 0.25][octaveFlutterDivision(for: amount)]
+        let divisionDuration = 60.0 / Double(max(1, bpm)) * divisionBeats
+        let index = Int(max(0, time) / max(0.001, divisionDuration)) % pattern.octaveSteps.count
+        return pow(2.0, Double(pattern.octaveSteps[index]))
     }
 
     // Amounts are percentages so the FX Station can behave like compact hardware knobs.
@@ -640,6 +673,7 @@ struct ByteEffects: Codable, Hashable, Sendable {
     var bitCrushAmount = 0
     var vibrato = false
     var vibratoAmount = 0
+    var octaveFlutterPattern = ByteOctaveFlutterPattern.baseUp.rawValue
     // Legacy fields remain Codable so older projects still open, but they are no longer active.
     var widePulse = false
     var widePulseAmount = 0
@@ -650,7 +684,7 @@ struct ByteEffects: Codable, Hashable, Sendable {
     var delay = 0
 
     private enum CodingKeys: String, CodingKey {
-        case echo, echoAmount, bitCrush, bitCrushAmount, vibrato, vibratoAmount, widePulse, widePulseAmount, channelSends, delay
+        case echo, echoAmount, bitCrush, bitCrushAmount, vibrato, vibratoAmount, octaveFlutterPattern, widePulse, widePulseAmount, channelSends, delay
     }
 
     init() {}
@@ -663,6 +697,7 @@ struct ByteEffects: Codable, Hashable, Sendable {
         bitCrushAmount = min(100, max(0, try container.decodeIfPresent(Int.self, forKey: .bitCrushAmount) ?? (bitCrush ? 100 : 0)))
         vibrato = try container.decodeIfPresent(Bool.self, forKey: .vibrato) ?? false
         vibratoAmount = min(100, max(0, try container.decodeIfPresent(Int.self, forKey: .vibratoAmount) ?? (vibrato ? 100 : 0)))
+        octaveFlutterPattern = min(ByteOctaveFlutterPattern.allCases.count - 1, max(0, try container.decodeIfPresent(Int.self, forKey: .octaveFlutterPattern) ?? ByteOctaveFlutterPattern.baseUp.rawValue))
         widePulse = try container.decodeIfPresent(Bool.self, forKey: .widePulse) ?? false
         widePulseAmount = min(100, max(0, try container.decodeIfPresent(Int.self, forKey: .widePulseAmount) ?? (widePulse ? 100 : 0)))
         if let sends = try container.decodeIfPresent([Int].self, forKey: .channelSends), sends.count == ByteChannel.allCases.count {
@@ -681,6 +716,7 @@ struct ByteEffects: Codable, Hashable, Sendable {
         try container.encode(bitCrushAmount, forKey: .bitCrushAmount)
         try container.encode(vibratoAmount > 0, forKey: .vibrato)
         try container.encode(vibratoAmount, forKey: .vibratoAmount)
+        try container.encode(octaveFlutterPattern, forKey: .octaveFlutterPattern)
         try container.encode(widePulseAmount > 0, forKey: .widePulse)
         try container.encode(widePulseAmount, forKey: .widePulseAmount)
         try container.encode(channelSends.map { min(100, max(0, $0)) }, forKey: .channelSends)
