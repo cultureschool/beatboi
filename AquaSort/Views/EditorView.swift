@@ -466,42 +466,119 @@ struct EditorView: View {
     }
 
     private var restoredSoundLab: some View {
-            VStack(spacing: 9) {
-                if store.selectedChannel == .drum {
-                    RestoredDrumEditor(
-                        patch: store.patch(for: .drum),
-                        volume: { store.drumVoiceVolumePercent($0) },
-                        onSelectSample: { voice, variant in
-                            store.setDrumSample(voice: voice, variant: variant)
-                            requestPlaybackRefresh()
-                        },
-                        onVolumeChange: { voice, percent in
-                            store.setDrumVoiceVolume(voice: voice, percent: percent)
-                            requestPlaybackRefresh()
+        VStack(spacing: 10) {
+            soundLabReadout
+            if store.selectedChannel == .drum {
+                RestoredDrumEditor(
+                    accent: restoredChannelAccent(.drum),
+                    patch: store.patch(for: .drum),
+                    volume: { store.drumVoiceVolumePercent($0) },
+                    onSelectSample: { voice, variant in
+                        store.setDrumSample(voice: voice, variant: variant)
+                        requestPlaybackRefresh()
+                    },
+                    onVolumeChange: { voice, percent in
+                        store.setDrumVoiceVolume(voice: voice, percent: percent)
+                        requestPlaybackRefresh()
+                    }
+                )
+            } else {
+                LCDPanel(title: "\(store.selectedChannel.title) / SYNTH PATCH") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("TOUCH PARAMETERS")
+                                .font(.system(size: 8, weight: .black, design: .monospaced))
+                                .foregroundStyle(Color.gbInk)
+                            Spacer()
+                            Text("SELECT + DRAG ↔")
+                                .font(.system(size: 7, weight: .black, design: .monospaced))
+                                .foregroundStyle(Color.screenShadow)
                         }
-                    )
-                } else {
-                    LCDPanel(title: "\(store.selectedChannel.title) / SOUND LAB CONTROLS") {
-                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 5), GridItem(.flexible(), spacing: 5)], spacing: 5) {
+                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 6), GridItem(.flexible(), spacing: 6)], spacing: 6) {
                             ForEach(restoredParameters(for: store.selectedChannel)) { parameter in
-                                RestoredPatchCard(parameter: parameter, patch: store.patch(for: store.selectedChannel), selected: store.selectedPatchParameter[store.selectedChannel] == parameter) { store.selectedPatchParameter[store.selectedChannel] = parameter } onChange: { delta in store.adjustSelectedPatch(channel: store.selectedChannel, parameter: parameter, delta: delta); requestPlaybackRefresh() }
+                                RestoredPatchCard(parameter: parameter, patch: store.patch(for: store.selectedChannel), selected: store.selectedPatchParameter[store.selectedChannel] == parameter) {
+                                    store.selectedPatchParameter[store.selectedChannel] = parameter
+                                } onChange: { delta in
+                                    store.adjustSelectedPatch(channel: store.selectedChannel, parameter: parameter, delta: delta)
+                                    requestPlaybackRefresh()
+                                }
                             }
                         }
                     }
                 }
-                LCDPanel(title: "FX STATION / HARDWARE-INSPIRED") {
-                    VStack(spacing: 5) {
-                        ForEach(ByteEffect.allCases) { effect in
-                            RestoredAmountCard(title: effect.title, amount: store.effectAmount(effect)) { store.setEffectAmount(effect, amount: $0); requestPlaybackRefresh() }
-                        }
-                        Text("FX SENDS / 0% DRY · 100% FULL EFFECT BUS").font(.system(size: 7, weight: .black, design: .monospaced)).foregroundStyle(Color.gbInk.opacity(0.65))
-                        ForEach(ByteChannel.allCases) { channel in
-                            RestoredAmountCard(title: "SEND \(channel.title)", amount: store.effectSendPercent(channel)) { store.setEffectSend(channel: channel, percent: $0); requestPlaybackRefresh() }
-                        }
-                    }
+            }
+            fxStation
+        }
+        .padding(.bottom, 4)
+    }
+
+    private var soundLabReadout: some View {
+        HStack(spacing: 10) {
+            ZStack {
+                Circle()
+                    .fill(restoredChannelAccent(store.selectedChannel).opacity(0.18))
+                    .frame(width: 52, height: 52)
+                Circle()
+                    .stroke(restoredChannelAccent(store.selectedChannel), lineWidth: 2)
+                    .frame(width: 42, height: 42)
+                Image(systemName: store.selectedChannel == .drum ? "waveform.path.ecg" : "waveform")
+                    .font(.system(size: 18, weight: .black))
+                    .foregroundStyle(restoredChannelAccent(store.selectedChannel))
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text(store.selectedChannel.title)
+                    .font(.system(size: 15, weight: .black, design: .monospaced))
+                    .foregroundStyle(Color.gbLight)
+                Text(store.selectedChannel == .drum ? "RHYTHM VOICES / SAMPLE + MIX" : "SYNTH PATCH / TOUCH TO SELECT")
+                    .font(.system(size: 7, weight: .bold, design: .monospaced))
+                    .foregroundStyle(Color.mutedText)
+                Text("DRAG HORIZONTAL TO CHANGE THE SELECTED CONTROL")
+                    .font(.system(size: 7, weight: .black, design: .monospaced))
+                    .foregroundStyle(Color.gbGlow)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.65)
+            }
+            Spacer(minLength: 4)
+        }
+        .padding(10)
+        .background(LinearGradient(colors: [Color.plasticRaised.opacity(0.88), Color.hardwareBlack.opacity(0.86)], startPoint: .topLeading, endPoint: .bottomTrailing))
+        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous).stroke(restoredChannelAccent(store.selectedChannel).opacity(0.72), lineWidth: 1))
+    }
+
+    private var fxStation: some View {
+        LCDPanel(title: "FX STATION / HARDWARE-INSPIRED") {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("EFFECT BUS")
+                        .font(.system(size: 8, weight: .black, design: .monospaced))
+                        .foregroundStyle(Color.gbInk)
+                    Spacer()
+                    Text("GLOBAL")
+                        .font(.system(size: 7, weight: .black, design: .monospaced))
+                        .foregroundStyle(Color.screenShadow)
+                }
+                ForEach(ByteEffect.allCases) { effect in
+                    RestoredAmountCard(title: effect.title, amount: store.effectAmount(effect)) { store.setEffectAmount(effect, amount: $0); requestPlaybackRefresh() }
+                }
+                Rectangle()
+                    .fill(Color.screenShadow.opacity(0.32))
+                    .frame(height: 1)
+                    .padding(.vertical, 2)
+                HStack {
+                    Text("CHANNEL SENDS")
+                        .font(.system(size: 8, weight: .black, design: .monospaced))
+                        .foregroundStyle(Color.gbInk)
+                    Spacer()
+                    Text("0% DRY / 100% WET")
+                        .font(.system(size: 7, weight: .black, design: .monospaced))
+                        .foregroundStyle(Color.screenShadow)
+                }
+                ForEach(ByteChannel.allCases) { channel in
+                    RestoredAmountCard(title: "SEND \\(channel.title)", amount: store.effectSendPercent(channel)) { store.setEffectSend(channel: channel, percent: $0); requestPlaybackRefresh() }
                 }
             }
-            .padding(.bottom, 4)
+        }
     }
 
     private func restoredParameters(for channel: ByteChannel) -> [BytePatchParameter] {
@@ -819,6 +896,7 @@ private struct RestoredNotePad: View {
 }
 
 private struct RestoredDrumEditor: View {
+    let accent: Color
     let patch: ByteChannelPatch
     let volume: (ByteDrumVoice) -> Int
     let onSelectSample: (ByteDrumVoice, Int) -> Void
@@ -826,10 +904,19 @@ private struct RestoredDrumEditor: View {
 
     var body: some View {
         LCDPanel(title: "DRUM KIT / VOICE MIX · DRUM FADER = MASTER") {
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    Text("VOICE")
+                        .font(.system(size: 7, weight: .black, design: .monospaced))
+                    Spacer()
+                    Text("SAMPLE")
+                        .font(.system(size: 7, weight: .black, design: .monospaced))
+                }
+                .foregroundStyle(Color.gbInk.opacity(0.62))
                 ForEach(ByteDrumVoice.allCases) { voice in
                     RestoredDrumVoiceRow(
                         voice: voice,
+                        accent: accent,
                         sample: patch.drumSamples.indices.contains(voice.rawValue) ? patch.drumSamples[voice.rawValue] : 1,
                         volume: volume(voice),
                         onSelectSample: { onSelectSample(voice, $0) },
@@ -846,6 +933,7 @@ private struct RestoredDrumEditor: View {
 
 private struct RestoredDrumVoiceRow: View {
     let voice: ByteDrumVoice
+    let accent: Color
     let sample: Int
     let volume: Int
     let onSelectSample: (Int) -> Void
@@ -856,8 +944,9 @@ private struct RestoredDrumVoiceRow: View {
     var body: some View {
         GeometryReader { proxy in
             ZStack(alignment: .leading) {
-                voiceColor.opacity(0.25)
+                voiceColor.opacity(0.16)
                 voiceColor.opacity(0.72)
+                    .animation(.easeOut(duration: 0.12), value: volume)
                     .frame(width: proxy.size.width * CGFloat(volume) / 100.0)
                 HStack(spacing: 5) {
                     Text(voice.title)
@@ -896,7 +985,8 @@ private struct RestoredDrumVoiceRow: View {
                     .onEnded { _ in startVolume = nil; lastVolume = nil }
             )
         }
-        .frame(height: 36)
+        .frame(height: 42)
+        .accessibilityElement(children: .contain)
     }
 
     private var voiceColor: Color {
@@ -917,32 +1007,89 @@ private struct RestoredPatchCard: View {
     let onSelect: () -> Void
     let onChange: (Int) -> Void
     @State private var lastX: CGFloat = 0
+
     var body: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(selected ? Color.gbInk : Color.screenShadow.opacity(0.55))
-                .frame(width: 5, height: 5)
-            Text(parameter.title)
-                .font(.system(size: 8, weight: .black, design: .monospaced))
-                .foregroundStyle(Color.gbInk)
-            Spacer(minLength: 2)
-            Text(restoredPatchValue)
-                .font(.system(size: 8, weight: .black, design: .monospaced))
-                .foregroundStyle(Color.gbInk)
-            Image(systemName: "arrow.left.and.right")
-                .font(.system(size: 8, weight: .black))
-                .foregroundStyle(Color.gbInk.opacity(0.5))
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(selected ? Color.gbInk : Color.screenShadow.opacity(0.55))
+                    .frame(width: 6, height: 6)
+                Text(parameter.title)
+                    .font(.system(size: 8, weight: .black, design: .monospaced))
+                    .foregroundStyle(Color.gbInk)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.65)
+                Spacer(minLength: 2)
+                Text(restoredPatchValue)
+                    .font(.system(size: 9, weight: .black, design: .monospaced))
+                    .foregroundStyle(Color.gbInk)
+            }
+            GeometryReader { proxy in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.gbDeep.opacity(0.18))
+                    Capsule()
+                        .fill(selected ? Color.gbInk : Color.screenShadow.opacity(0.58))
+                        .frame(width: max(8, proxy.size.width * restoredPatchFraction))
+                    HStack(spacing: 2) {
+                        ForEach(0..<5, id: \.self) { _ in
+                            Circle().fill(Color.gbInk.opacity(0.28)).frame(width: 2, height: 2)
+                        }
+                    }
+                    .padding(.horizontal, 5)
+                }
+                .contentShape(Rectangle())
+            }
+            .frame(height: 7)
+            Text("DRAG ↔ TO ADJUST")
+                .font(.system(size: 6, weight: .black, design: .monospaced))
+                .foregroundStyle(Color.screenShadow.opacity(0.78))
         }
-        .padding(.horizontal, 8)
-        .frame(minHeight: 42)
-        .background(selected ? Color.amber : Color.gbDeep.opacity(0.14))
-        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(selected ? Color.gbInk : Color.gbInk.opacity(0.3), lineWidth: selected ? 2 : 1))
+        .padding(9)
+        .frame(minHeight: 68)
+        .background(selected ? Color.amber : Color.gbDeep.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(selected ? Color.gbInk : Color.gbInk.opacity(0.3), lineWidth: selected ? 2 : 1))
         .contentShape(Rectangle())
         .onTapGesture { onSelect() }
-        .gesture(DragGesture(minimumDistance: 8).onChanged { gesture in onSelect(); let move = gesture.translation.width - lastX; if abs(move) >= 8 { onChange(Int((move / 8).rounded())); lastX = gesture.translation.width } }.onEnded { _ in lastX = 0 })
+        .gesture(DragGesture(minimumDistance: 8).onChanged { gesture in
+            onSelect()
+            let move = gesture.translation.width - lastX
+            if abs(move) >= 8 {
+                onChange(Int((move / 8).rounded()))
+                lastX = gesture.translation.width
+            }
+        }.onEnded { _ in lastX = 0 })
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(parameter.title)
+        .accessibilityValue(restoredPatchValue)
+        .accessibilityHint("Tap to select. Swipe left or right to adjust.")
     }
-    private var restoredPatchValue: String { switch parameter { case .duty: return ["12.5%", "25%", "50%", "75%"][min(3, max(0, patch.duty))]; case .octave: return patch.octave >= 0 ? "+\(patch.octave)" : "\(patch.octave)"; case .volume: return "\(patch.initialVolume)/15"; case .waveShape: return "\(patch.waveShape)"; case .waveVolume: return "\(patch.waveVolume)"; case .envelopeDirection: return patch.envelopeIncrease ? "UP" : "DOWN"; case .sweepDirection: return patch.sweepIncrease ? "UP" : "DOWN"; case .panLeft: return patch.panLeft ? "ON" : "OFF"; case .panRight: return patch.panRight ? "ON" : "OFF"; case .lengthCounter: return patch.lengthCounter ? "ON" : "OFF"; default: return "—" } }
+
+    private var restoredPatchValue: String {
+        switch parameter {
+        case .duty: return ["12.5%", "25%", "50%", "75%"][min(3, max(0, patch.duty))]
+        case .octave: return patch.octave >= 0 ? "+\(patch.octave)" : "\(patch.octave)"
+        case .volume: return "\(patch.initialVolume)/15"
+        case .waveShape: return "\(patch.waveShape)"
+        case .waveVolume: return "\(patch.waveVolume)"
+        case .envelopeDirection: return patch.envelopeIncrease ? "UP" : "DOWN"
+        case .sweepDirection: return patch.sweepIncrease ? "UP" : "DOWN"
+        case .panLeft: return patch.panLeft ? "ON" : "OFF"
+        case .panRight: return patch.panRight ? "ON" : "OFF"
+        case .lengthCounter: return patch.lengthCounter ? "ON" : "OFF"
+        default: return "—"
+        }
+    }
+
+    private var restoredPatchFraction: CGFloat {
+        switch parameter {
+        case .duty: return CGFloat(min(3, max(0, patch.duty)) + 1) / 4
+        case .octave: return CGFloat(min(4, max(0, patch.octave + 2))) / 4
+        case .volume: return CGFloat(patch.initialVolume) / 15
+        case .waveVolume: return CGFloat(patch.waveVolume) / 3
+        default: return selected ? 0.72 : 0.42
+        }
+    }
 }
 
 private struct RestoredAmountCard: View {
@@ -951,7 +1098,42 @@ private struct RestoredAmountCard: View {
     let onChange: (Int) -> Void
     @State private var start: Int?
     @State private var last: Int?
-    var body: some View { GeometryReader { proxy in ZStack(alignment: .leading) { Color.gbDeep.opacity(0.14); Color.gbGlow.opacity(0.55).frame(width: proxy.size.width * CGFloat(min(100, max(0, amount))) / 100); HStack { Text(title).font(.system(size: 8, weight: .black, design: .monospaced)); Spacer(); Text("\(amount)%").font(.system(size: 8, weight: .black, design: .monospaced)) }.foregroundStyle(Color.gbInk).padding(.horizontal, 7) }.overlay(Rectangle().stroke(Color.gbInk.opacity(0.35), lineWidth: 1)).contentShape(Rectangle()).gesture(DragGesture(minimumDistance: 7).onChanged { gesture in if start == nil { start = amount }; let proposed = min(max((start ?? amount) + Int((gesture.translation.width / 2).rounded()), 0), 100); if proposed != last { last = proposed; onChange(proposed) } }.onEnded { _ in start = nil; last = nil }) }.frame(minHeight: 40) }
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.gbDeep.opacity(0.16))
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(LinearGradient(colors: [Color.gbGlow.opacity(0.72), Color.gbGlow.opacity(0.28)], startPoint: .leading, endPoint: .trailing))
+                    .frame(width: max(10, proxy.size.width * CGFloat(min(100, max(0, amount))) / 100))
+                HStack(spacing: 6) {
+                    Circle().fill(Color.gbInk.opacity(0.62)).frame(width: 5, height: 5)
+                    Text(title)
+                        .font(.system(size: 8, weight: .black, design: .monospaced))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                    Spacer(minLength: 2)
+                    Text("\(amount)%")
+                        .font(.system(size: 8, weight: .black, design: .monospaced))
+                }
+                .foregroundStyle(Color.gbInk)
+                .padding(.horizontal, 8)
+            }
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.gbInk.opacity(0.38), lineWidth: 1))
+            .contentShape(Rectangle())
+            .gesture(DragGesture(minimumDistance: 7).onChanged { gesture in
+                if start == nil { start = amount }
+                let proposed = min(max((start ?? amount) + Int((gesture.translation.width / 2).rounded()), 0), 100)
+                if proposed != last { last = proposed; onChange(proposed) }
+            }.onEnded { _ in start = nil; last = nil })
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(title)
+            .accessibilityValue("\(amount) percent")
+            .accessibilityHint("Swipe left or right to adjust.")
+        }
+        .frame(height: 44)
+    }
 }
 
 
