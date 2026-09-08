@@ -688,36 +688,92 @@ struct EditorView: View {
 
     private var fxStation: some View {
         LCDPanel(title: "FX STATION / HARDWARE-INSPIRED") {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("EFFECT BUS")
-                        .font(.system(size: 8, weight: .black, design: .monospaced))
-                        .foregroundStyle(Color.gbInk)
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    ZStack {
+                        Circle()
+                            .fill(store.isPlaying ? Color.gbGlow : Color.screenShadow.opacity(0.28))
+                            .frame(width: 9, height: 9)
+                            .shadow(color: store.isPlaying ? Color.gbGlow : .clear, radius: 5)
+                        Circle()
+                            .stroke(Color.gbInk.opacity(0.7), lineWidth: 1)
+                            .frame(width: 13, height: 13)
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(store.isPlaying ? "EFFECT BUS LIVE" : "EFFECT BUS READY")
+                            .font(.system(size: 8, weight: .black, design: .monospaced))
+                            .foregroundStyle(Color.gbInk)
+                        Text("GLOBAL PROCESSING / LIVE HARDWARE PATH")
+                            .font(.system(size: 6, weight: .bold, design: .monospaced))
+                            .foregroundStyle(Color.screenShadow)
+                    }
                     Spacer()
-                    Text("GLOBAL")
+                    Text("STEP \(String(format: "%02d", max(0, currentStep + 1)))")
                         .font(.system(size: 7, weight: .black, design: .monospaced))
                         .foregroundStyle(Color.screenShadow)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 4)
+                        .background(Color.screenShadow.opacity(0.10))
+                        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
                 }
-                ForEach(ByteEffect.allCases) { effect in
-                    RestoredAmountCard(title: effect.title, amount: store.effectAmount(effect)) { store.setEffectAmount(effect, amount: $0); requestPlaybackRefresh() }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(store.isPlaying ? "Effect bus live" : "Effect bus ready")
+                .accessibilityValue("Step \(max(0, currentStep + 1))")
+
+                Text("EFFECT MODULES")
+                    .font(.system(size: 7, weight: .black, design: .monospaced))
+                    .tracking(0.8)
+                    .foregroundStyle(Color.gbInk.opacity(0.72))
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 7), GridItem(.flexible(), spacing: 7)], spacing: 7) {
+                    ForEach(ByteEffect.allCases) { effect in
+                        RestoredFXModule(
+                            title: effect.title,
+                            amount: store.effectAmount(effect),
+                            accent: Color.gbGlow,
+                            active: store.isPlaying,
+                            phase: currentStep + (ByteEffect.allCases.firstIndex(of: effect) ?? 0)
+                        ) { amount in
+                            store.setEffectAmount(effect, amount: amount)
+                            requestPlaybackRefresh()
+                        }
+                    }
                 }
-                Rectangle()
-                    .fill(Color.screenShadow.opacity(0.32))
-                    .frame(height: 1)
-                    .padding(.vertical, 2)
-                HStack {
-                    Text("CHANNEL SENDS / PULSE 1 · PULSE 2 · TRIANGLE · DRUM")
-                        .font(.system(size: 8, weight: .black, design: .monospaced))
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.55)
-                        .foregroundStyle(Color.gbInk)
-                    Spacer()
-                    Text("0% DRY / 100% WET")
+
+                HStack(spacing: 7) {
+                    Rectangle()
+                        .fill(Color.screenShadow.opacity(0.42))
+                        .frame(height: 1)
+                    Text("SEND MATRIX")
                         .font(.system(size: 7, weight: .black, design: .monospaced))
+                        .foregroundStyle(Color.gbInk)
+                    Rectangle()
+                        .fill(Color.screenShadow.opacity(0.42))
+                        .frame(height: 1)
+                }
+                HStack {
+                    Text("CHANNEL ROUTING / DRY SIGNAL + FX RETURN")
+                        .font(.system(size: 6, weight: .black, design: .monospaced))
+                        .foregroundStyle(Color.screenShadow)
+                    Spacer()
+                    Text("0% — 100%")
+                        .font(.system(size: 6, weight: .black, design: .monospaced))
                         .foregroundStyle(Color.screenShadow)
                 }
-                ForEach(ByteChannel.allCases) { channel in
-                    RestoredAmountCard(title: "FX SEND / \(channel == .pulseA ? "PULSE 1" : channel == .pulseB ? "PULSE 2" : channel.title)", amount: store.effectSendPercent(channel)) { store.setEffectSend(channel: channel, percent: $0); requestPlaybackRefresh() }
+                VStack(spacing: 6) {
+                    ForEach(ByteChannel.allCases) { channel in
+                        RestoredFXSendStrip(
+                            title: channel == .pulseA ? "PULSE 1" : channel == .pulseB ? "PULSE 2" : channel.title,
+                            amount: store.effectSendPercent(channel),
+                            accent: restoredChannelAccent(channel),
+                            muted: store.isChannelMuted(channel),
+                            soloed: store.isChannelSoloed(channel),
+                            active: store.isPlaying,
+                            phase: currentStep + (ByteChannel.allCases.firstIndex(of: channel) ?? 0)
+                        ) { amount in
+                            store.setEffectSend(channel: channel, percent: amount)
+                            requestPlaybackRefresh()
+                        }
+                    }
                 }
             }
         }
@@ -1433,6 +1489,116 @@ private struct RestoredPatchCard: View {
         case .volume: return CGFloat(patch.initialVolume) / 15
         case .waveVolume: return CGFloat(patch.waveVolume) / 3
         default: return selected ? 0.72 : 0.42
+        }
+    }
+}
+
+private struct RestoredFXModule: View {
+    let title: String
+    let amount: Int
+    let accent: Color
+    let active: Bool
+    let phase: Int
+    let onChange: (Int) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 5) {
+                Text(title)
+                    .font(.system(size: 7, weight: .black, design: .monospaced))
+                    .foregroundStyle(Color.gbLight)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.65)
+                Spacer(minLength: 2)
+                Circle()
+                    .fill(amount > 0 ? accent : Color.plasticHighlight)
+                    .frame(width: 5, height: 5)
+                    .shadow(color: amount > 0 ? accent.opacity(0.8) : .clear, radius: 3)
+            }
+            RestoredFXMeter(level: amount, accent: accent, active: active, phase: phase)
+                .frame(height: 16)
+            RestoredAmountCard(title: "AMOUNT", amount: amount, onChange: onChange)
+        }
+        .padding(7)
+        .background(
+            LinearGradient(
+                colors: [Color.plasticRaised.opacity(0.92), Color.hardwareBlack.opacity(0.86)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(accent.opacity(amount > 0 ? 0.72 : 0.28), lineWidth: amount > 0 ? 1.5 : 1))
+        .accessibilityElement(children: .contain)
+    }
+}
+
+private struct RestoredFXSendStrip: View {
+    let title: String
+    let amount: Int
+    let accent: Color
+    let muted: Bool
+    let soloed: Bool
+    let active: Bool
+    let phase: Int
+    let onChange: (Int) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                RoundedRectangle(cornerRadius: 2, style: .continuous)
+                    .fill(accent)
+                    .frame(width: 4, height: 22)
+                    .shadow(color: accent.opacity(0.65), radius: 3)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(.system(size: 8, weight: .black, design: .monospaced))
+                        .foregroundStyle(Color.gbLight)
+                    Text(muted ? "MUTED" : soloed ? "SOLO MONITOR" : "ROUTED TO BUS")
+                        .font(.system(size: 6, weight: .black, design: .monospaced))
+                        .foregroundStyle(muted ? Color.arcadeRed : soloed ? Color.amber : Color.mutedText)
+                }
+                Spacer(minLength: 2)
+                Text("\(amount)%")
+                    .font(.system(size: 9, weight: .black, design: .monospaced))
+                    .foregroundStyle(accent)
+            }
+            RestoredFXMeter(level: amount, accent: accent, active: active && !muted, phase: phase)
+                .frame(height: 13)
+            RestoredAmountCard(title: "SEND LEVEL", amount: amount, onChange: onChange)
+        }
+        .padding(7)
+        .background(Color.hardwareBlack.opacity(0.74))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(accent.opacity(0.48), lineWidth: 1))
+        .opacity(muted ? 0.62 : 1)
+        .accessibilityElement(children: .contain)
+    }
+}
+
+private struct RestoredFXMeter: View {
+    let level: Int
+    let accent: Color
+    let active: Bool
+    let phase: Int
+
+    var body: some View {
+        GeometryReader { proxy in
+            HStack(spacing: 2) {
+                ForEach(0..<12, id: \.self) { index in
+                    let threshold = Double(index + 1) / 12.0
+                    let animatedBoost = active ? CGFloat((abs(phase + index * 3) % 4)) / 16.0 : 0
+                    let fill = min(1, CGFloat(level) / 100.0 + animatedBoost)
+                    RoundedRectangle(cornerRadius: 1, style: .continuous)
+                        .fill(fill >= threshold ? (index > 9 ? Color.arcadeRed : accent) : Color.gbDeep.opacity(0.32))
+                        .frame(maxWidth: .infinity)
+                        .shadow(color: fill >= threshold && active ? accent.opacity(0.55) : .clear, radius: 2)
+                }
+            }
+            .animation(.linear(duration: 0.08), value: phase)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("FX level")
+            .accessibilityValue("\(level) percent")
         }
     }
 }
