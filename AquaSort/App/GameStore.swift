@@ -18,6 +18,16 @@ final class GameStore {
     private let defaults: UserDefaults
     private let projectsKey = "bytePocket.projects"
     private let selectedProjectKey = "bytePocket.selectedProject"
+    private static let historyLimit = 80
+
+    private struct HistoryEntry {
+        let project: ByteProject
+        let currentPatternID: UUID
+    }
+
+    private var undoStack: [HistoryEntry] = []
+    private var redoStack: [HistoryEntry] = []
+    private var historyCurrent: HistoryEntry
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -35,7 +45,9 @@ final class GameStore {
         let selected = savedProjects.first(where: { $0.id == selectedID }) ?? savedProjects[0]
         self.projects = savedProjects
         self.project = selected
-        self.currentPatternID = selected.arrangedPatterns.first?.id ?? selected.patterns[0].id
+        let initialPatternID = selected.arrangedPatterns.first?.id ?? selected.patterns[0].id
+        self.currentPatternID = initialPatternID
+        self.historyCurrent = HistoryEntry(project: selected, currentPatternID: initialPatternID)
     }
 
     /// Every pattern is one classic 16-step bar. Song Mode supplies variation by chaining patterns.
@@ -47,6 +59,9 @@ final class GameStore {
     }
 
     var songPlaybackPatterns: [BytePattern] { project.songPatterns }
+
+    var canUndo: Bool { !undoStack.isEmpty }
+    var canRedo: Bool { !redoStack.isEmpty }
 
     /// All four classic channels are available without a purchase.
     var visibleChannels: [ByteChannel] { ByteChannel.allCases }
@@ -72,6 +87,7 @@ final class GameStore {
         }
         selectedStep = nil
         currentPatternID = selected.arrangedPatterns.first?.id ?? selected.patterns[0].id
+        resetHistory()
         persistSelection()
     }
 
@@ -79,6 +95,23 @@ final class GameStore {
         guard project.patterns.contains(where: { $0.id == id }) else { return }
         currentPatternID = id
         selectedStep = nil
+        // Pattern selection is navigation, not an edit, but the next edit should undo
+        // back to the pattern the user actually had selected.
+        historyCurrent = HistoryEntry(project: project, currentPatternID: id)
+    }
+
+    func undo() {
+        guard let previous = undoStack.popLast() else { return }
+        redoStack.append(historyCurrent)
+        restoreHistoryEntry(previous)
+        presentToast("UNDO")
+    }
+
+    func redo() {
+        guard let next = redoStack.popLast() else { return }
+        undoStack.append(historyCurrent)
+        restoreHistoryEntry(next)
+        presentToast("REDO")
     }
 
     func renamePattern(_ id: UUID, name: String) {
@@ -98,6 +131,7 @@ final class GameStore {
         project = imported
         currentPatternID = imported.arrangedPatterns.first?.id ?? imported.patterns[0].id
         selectedStep = nil
+        resetHistory()
         persist()
     }
 
@@ -106,6 +140,7 @@ final class GameStore {
         projects.removeAll { $0.id == project.id }
         if self.project.id == project.id { self.project = projects[0] }
         currentPatternID = self.project.arrangedPatterns.first?.id ?? self.project.patterns[0].id
+        resetHistory()
         persist()
     }
 
@@ -153,7 +188,6 @@ final class GameStore {
     @discardableResult
     func assignSongPattern(at index: Int, patternID: UUID) -> Bool {
         guard project.songArrangement.indices.contains(index), index < project.songArrangementLength, project.pattern(with: patternID) != nil else { return false }
-        clearSongSlot(at: index)
         project.songArrangement[index] = ByteSongSlot(patternID: patternID, isContinuation: false)
         touch()
         return true
@@ -571,9 +605,38 @@ final class GameStore {
     }
 
     private func touch() {
+        // Compare content without the autosave timestamp so a no-op does not create an
+        // undo entry. The snapshot is captured after the previous edit and before this
+        // edit, which keeps every store mutation covered without duplicating UI logic.
+        var comparableProject = project
+        comparableProject.modifiedAt = historyCurrent.project.modifiedAt
+        if comparableProject != historyCurrent.project {
+            undoStack.append(historyCurrent)
+            if undoStack.count > Self.historyLimit { undoStack.removeFirst() }
+            redoStack.removeAll()
+        }
+
         project.modifiedAt = .now
+        historyCurrent = HistoryEntry(project: project, currentPatternID: currentPatternID)
         if let index = projects.firstIndex(where: { $0.id == project.id }) { projects[index] = project }
         persist()
+    }
+
+    private func restoreHistoryEntry(_ entry: HistoryEntry) {
+        project = entry.project
+        currentPatternID = project.patterns.contains(where: { $0.id == entry.currentPatternID })
+            ? entry.currentPatternID
+            : (project.arrangedPatterns.first?.id ?? project.patterns[0].id)
+        selectedStep = nil
+        historyCurrent = HistoryEntry(project: project, currentPatternID: currentPatternID)
+        if let index = projects.firstIndex(where: { $0.id == project.id }) { projects[index] = project }
+        persist()
+    }
+
+    private func resetHistory() {
+        undoStack.removeAll()
+        redoStack.removeAll()
+        historyCurrent = HistoryEntry(project: project, currentPatternID: currentPatternID)
     }
 
     private func persistSelection() {

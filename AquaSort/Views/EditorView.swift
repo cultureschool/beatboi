@@ -147,8 +147,18 @@ struct EditorView: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.65)
                 Spacer()
-                RestoredHeaderIcon(systemImage: "folder.fill") { showLibrary = true }
-                RestoredHeaderIcon(systemImage: "square.and.arrow.up") { showExport = true }
+                HStack(spacing: 5) {
+                    RestoredHistoryButton(systemImage: "arrow.uturn.backward", label: "Undo", disabled: !store.canUndo) {
+                        store.undo()
+                        requestPlaybackRefresh()
+                    }
+                    RestoredHistoryButton(systemImage: "arrow.uturn.forward", label: "Redo", disabled: !store.canRedo) {
+                        store.redo()
+                        requestPlaybackRefresh()
+                    }
+                    RestoredHeaderIcon(systemImage: "folder.fill") { showLibrary = true }
+                    RestoredHeaderIcon(systemImage: "square.and.arrow.up") { showExport = true }
+                }
             }
         }
         .padding(10)
@@ -881,6 +891,29 @@ private struct RestoredHeaderIcon: View {
                 .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.plasticHighlight, lineWidth: 1))
         }
         .buttonStyle(ArcadePressStyle())
+    }
+}
+
+private struct RestoredHistoryButton: View {
+    let systemImage: String
+    let label: String
+    let disabled: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 12, weight: .black))
+                .foregroundStyle(disabled ? Color.mutedText.opacity(0.42) : Color.gbLight)
+                .frame(width: 30, height: 30)
+                .background(disabled ? Color.hardwareBlack.opacity(0.34) : Color.plasticRaised)
+                .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(Color.plasticHighlight.opacity(disabled ? 0.28 : 0.8), lineWidth: 1))
+        }
+        .buttonStyle(ArcadePressStyle(scale: 0.88))
+        .disabled(disabled)
+        .accessibilityLabel(label)
+        .accessibilityHint(disabled ? "Unavailable" : "Tap to apply")
     }
 }
 

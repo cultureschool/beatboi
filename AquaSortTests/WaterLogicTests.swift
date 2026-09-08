@@ -156,6 +156,48 @@ final class BeatboiTests: XCTestCase {
         defaults.removePersistentDomain(forName: suite)
     }
 
+    func testProjectUndoRedoCoversPatternSoundFXAndSongEdits() {
+        let suite = "BeatboiUndoRedoTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+        let patternID = store.project.patterns[0].id
+
+        store.toggleStep(channel: .pulseA, step: 1)
+        XCTAssertTrue(store.canUndo)
+        XCTAssertNotNil(store.project.patterns[0].steps[0][1])
+        store.undo()
+        XCTAssertNil(store.project.patterns[0].steps[0][1])
+        XCTAssertTrue(store.canRedo)
+        store.redo()
+        XCTAssertNotNil(store.project.patterns[0].steps[0][1])
+
+        store.adjustPatch(channel: .pulseA, parameter: .octave, delta: 1)
+        XCTAssertEqual(store.patch(for: .pulseA).octave, 1)
+        store.undo()
+        XCTAssertEqual(store.patch(for: .pulseA).octave, 0)
+
+        store.setEffectSend(channel: .pulseA, percent: 35)
+        XCTAssertEqual(store.effectSendPercent(.pulseA), 35)
+        store.undo()
+        XCTAssertEqual(store.effectSendPercent(.pulseA), 100)
+
+        XCTAssertTrue(store.assignSongPattern(at: 2, patternID: patternID))
+        XCTAssertEqual(store.songSlot(at: 2).patternID, patternID)
+        store.undo()
+        XCTAssertNil(store.songSlot(at: 2).patternID)
+        store.redo()
+        XCTAssertEqual(store.songSlot(at: 2).patternID, patternID)
+
+        store.toggleStep(channel: .pulseA, step: 1)
+        XCTAssertTrue(store.canUndo)
+        store.undo()
+        XCTAssertTrue(store.canRedo)
+        store.toggleStep(channel: .pulseA, step: 2)
+        XCTAssertFalse(store.canRedo)
+
+        defaults.removePersistentDomain(forName: suite)
+    }
+
     func testNoteLengthSpansStepsAndTrimsWhenEditingInsideHold() {
         let suite = "BeatboiTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
