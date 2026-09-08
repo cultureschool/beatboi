@@ -26,6 +26,7 @@ struct EditorView: View {
         switch page {
         case 0: return "BEATPAD"
         case 1: return "SOUND LAB"
+        case 2: return "FX STATION"
         default: return "SONG MODE"
         }
     }
@@ -85,7 +86,7 @@ struct EditorView: View {
             }
         }
         .sheet(isPresented: $showLibrary) { ProjectLibraryView() }
-        .sheet(isPresented: $showExport) { ExportView(useSongArrangement: page == 2) }
+        .sheet(isPresented: $showExport) { ExportView(useSongArrangement: page == 3) }
         .fileImporter(isPresented: $showImport, allowedContentTypes: [.bytePocketProject, .json, .bytePocketMIDI]) { importFile($0) }
         .alert("RENAME PATTERN", isPresented: $showPatternRename) {
             TextField("PATTERN NAME", text: $patternRenameText)
@@ -101,6 +102,7 @@ struct EditorView: View {
     private var restoredPageContent: some View {
         if page == 0 { restoredBeatpadPage }
         else if page == 1 { restoredSoundLabPage }
+        else if page == 2 { restoredFXPage }
         else { restoredSongPage }
     }
 
@@ -138,7 +140,7 @@ struct EditorView: View {
                 .overlay(Capsule().stroke(Color.plasticHighlight, lineWidth: 1))
             }
             HStack(spacing: 8) {
-                Text(page == 0 ? "PERFORMANCE / 4 PARTS" : page == 1 ? "SOUND DESIGN / PATCH + FX" : "ARRANGEMENT / \(store.songArrangementLength) SLOTS")
+                Text(page == 0 ? "PERFORMANCE / 4 PARTS" : page == 1 ? "SOUND DESIGN / PATCH" : page == 2 ? "EFFECTS / BUS + SENDS" : "ARRANGEMENT / \(store.songArrangementLength) SLOTS")
                     .font(.system(size: 8, weight: .black, design: .monospaced))
                     .tracking(0.6)
                     .foregroundStyle(Color.amber)
@@ -190,6 +192,22 @@ struct EditorView: View {
             restoredChannelMixer
             restoredVoicing
             restoredSoundLab
+        }
+        .frame(maxWidth: .infinity, alignment: .top)
+    }
+
+    private var restoredFXPage: some View {
+        VStack(spacing: 10) {
+            restoredHeader
+            HardwareSection(title: "FX STATION", detail: "GLOBAL BUS / CHANNEL ROUTING") {
+                VStack(spacing: 9) {
+                    restoredTransport
+                    restoredPatternActions
+                }
+            }
+            fxStation
+            restoredChannelMixer
+            Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, alignment: .top)
     }
@@ -341,7 +359,8 @@ struct EditorView: View {
         HStack(spacing: 6) {
             RestoredPageButton(title: "BEATPAD", systemImage: "square.grid.2x2.fill", selected: page == 0) { setPage(0) }
             RestoredPageButton(title: "SOUND LAB", systemImage: "slider.horizontal.3", selected: page == 1) { setPage(1) }
-            RestoredPageButton(title: "SONG", systemImage: "list.number", selected: page == 2) { setPage(2) }
+            RestoredPageButton(title: "FX", systemImage: "dot.radiowaves.left.and.right", selected: page == 2) { setPage(2) }
+            RestoredPageButton(title: "SONG", systemImage: "list.number", selected: page == 3) { setPage(3) }
         }
         .padding(5)
         .frame(height: 54)
@@ -367,7 +386,7 @@ struct EditorView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(store.isPlaying ? "PLAYING" : "READY").font(.system(size: 10, weight: .black, design: .monospaced)).foregroundStyle(Color.gbInk)
                     Text("STEP \(String(format: "%02d", max(0, currentStep + 1))) / 16").font(.system(size: 9, weight: .bold, design: .monospaced)).foregroundStyle(Color.gbInk.opacity(0.62))
-                    if page == 2, currentSongSlot >= 0 { Text("SLOT \(String(format: "%02d", currentSongSlot + 1))").font(.system(size: 8, weight: .black, design: .monospaced)).foregroundStyle(Color.gbInk.opacity(0.68)) }
+                    if page == 3, currentSongSlot >= 0 { Text("BAR \(String(format: "%02d", currentSongSlot + 1))").font(.system(size: 8, weight: .black, design: .monospaced)).foregroundStyle(Color.gbInk.opacity(0.68)) }
                 }
                 Spacer(minLength: 2)
                 RestoredTempoBox(value: store.project.tempo) { value in store.updateTempo(value); requestPlaybackRefresh() }
@@ -619,7 +638,6 @@ struct EditorView: View {
                     }
                 }
             }
-            fxStation
         }
         .padding(.bottom, 4)
     }
@@ -817,18 +835,18 @@ struct EditorView: View {
     }
     private func applyPageNow(_ newPage: Int) {
         page = newPage
-        if store.isPlaying { audio.update(project: store.project, patterns: newPage == 2 ? store.songPlaybackPatterns : [selectedPattern], useSongArrangement: newPage == 2) }
-        if newPage != 2 { currentSongSlot = -1 }
+        if store.isPlaying { audio.update(project: store.project, patterns: newPage == 3 ? store.songPlaybackPatterns : [selectedPattern], useSongArrangement: newPage == 3) }
+        if newPage != 3 { currentSongSlot = -1 }
     }
     private func requestPlaybackRefresh() {
         guard store.isPlaying else { return }
-        audio.update(project: store.project, patterns: page == 2 ? store.songPlaybackPatterns : [selectedPattern], useSongArrangement: page == 2)
+        audio.update(project: store.project, patterns: page == 3 ? store.songPlaybackPatterns : [selectedPattern], useSongArrangement: page == 3)
     }
     private func togglePlayback() {
         playbackRefreshTask?.cancel()
         if store.isPlaying { pendingPatternID = nil; pendingPage = nil; store.stopPlayback(); audio.stop(); return }
         store.isPlaying = true
-        audio.play(project: store.project, patterns: page == 2 ? store.songPlaybackPatterns : [selectedPattern], useSongArrangement: page == 2, startSongSlot: page == 2 ? scrubbedSongSlot : nil) { step, slot in
+        audio.play(project: store.project, patterns: page == 3 ? store.songPlaybackPatterns : [selectedPattern], useSongArrangement: page == 3, startSongSlot: page == 3 ? scrubbedSongSlot : nil) { step, slot in
             Task { @MainActor in
                 if step == 0 && currentStep == 15 {
                     if let pendingPatternID { store.selectPattern(pendingPatternID); self.pendingPatternID = nil }
@@ -837,7 +855,7 @@ struct EditorView: View {
                 }
                 currentStep = step
                 currentSongSlot = slot
-                if page == 2, slot >= 0 { songArrangementPage = min(3, slot / 16) }
+                if page == 3, slot >= 0 { songArrangementPage = min(3, slot / 16) }
             }
         }
     }
