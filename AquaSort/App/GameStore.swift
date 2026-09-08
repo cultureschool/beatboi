@@ -436,6 +436,35 @@ final class GameStore {
         touch()
     }
 
+    func isChannelMuted(_ channel: ByteChannel) -> Bool {
+        patch(for: channel).muted
+    }
+
+    func isChannelSoloed(_ channel: ByteChannel) -> Bool {
+        patch(for: channel).soloed
+    }
+
+    func toggleChannelMute(_ channel: ByteChannel) {
+        guard let index = project.channelPatches.firstIndex(where: { $0.channel == channel }) else { return }
+        project.channelPatches[index].muted.toggle()
+        touch()
+    }
+
+    func toggleChannelSolo(_ channel: ByteChannel) {
+        guard let index = project.channelPatches.firstIndex(where: { $0.channel == channel }) else { return }
+        project.channelPatches[index].soloed.toggle()
+        touch()
+    }
+
+    func clearChannelSolos() {
+        var changed = false
+        for index in project.channelPatches.indices where project.channelPatches[index].soloed {
+            project.channelPatches[index].soloed = false
+            changed = true
+        }
+        if changed { touch() }
+    }
+
     func setEffectAmount(_ effect: ByteEffect, amount: Int) {
         let value = amount.clamped(to: 0...100)
         switch effect {

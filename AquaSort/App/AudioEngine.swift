@@ -219,6 +219,8 @@ private final class ByteLiveAudioState: @unchecked Sendable {
                 let noteProgress = Double(step - activeNote.start) + normalized
                 let noteNormalized = min(1.0, max(0.0, noteProgress / Double(max(1, activeNote.length))))
                 let patch = project.channelPatches.first(where: { $0.channel == channel }) ?? ByteChannelPatch(channel: channel)
+                let hasSoloChannel = project.channelPatches.contains(where: { $0.soloed })
+                guard !patch.muted, !hasSoloChannel || patch.soloed else { continue }
                 let baseFrequency = 440.0 * pow(2.0, Double(note - 69 + patch.octave * 12) / 12.0)
                 let sweep = channel == .pulseA ? liveSweep(noteNormalized, patch: patch) : 0.0
                 let portamentoAmount = Double(min(100, max(0, patch.portamento))) / 100.0
@@ -505,6 +507,8 @@ enum ByteRenderer {
                 guard let activeNote = noteAt(row: channelIndex, step: step, pattern: pattern) else { continue }
                 let note = activeNote.note
                 let patch = project.channelPatches.first(where: { $0.channel == channel }) ?? ByteChannelPatch(channel: channel)
+                let hasSoloChannel = project.channelPatches.contains(where: { $0.soloed })
+                guard !patch.muted, !hasSoloChannel || patch.soloed else { continue }
                 let baseFrequency = 440.0 * pow(2.0, Double(note - 69 + patch.octave * 12) / 12.0)
                 let baseGain = channel == .drum ? 0.16 : (channel == .pulseA || channel == .pulseB ? 0.06 : 0.12)
                 var drumSamplePosition = 0
@@ -618,6 +622,8 @@ enum ByteRenderer {
                 let noteProgress = Double(step - activeNote.start) + normalized
                 let noteNormalized = min(1.0, max(0.0, noteProgress / Double(max(1, activeNote.length))))
                 let patch = project.channelPatches.first(where: { $0.channel == channel }) ?? ByteChannelPatch(channel: channel)
+                let hasSoloChannel = project.channelPatches.contains(where: { $0.soloed })
+                guard !patch.muted, !hasSoloChannel || patch.soloed else { continue }
                 let baseFrequency = 440.0 * pow(2.0, Double(note - 69 + patch.octave * 12) / 12.0)
                 let sweep = channel == .pulseA ? dmgSweep(noteNormalized, patch: patch) : 0.0
                 let portamentoAmount = Double(min(100, max(0, patch.portamento))) / 100.0

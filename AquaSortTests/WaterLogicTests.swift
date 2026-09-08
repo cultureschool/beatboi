@@ -223,6 +223,29 @@ final class BeatboiTests: XCTestCase {
         defaults.removePersistentDomain(forName: suite)
     }
 
+    func testChannelMuteSoloStatesPersistAndSoloIsIndependent() {
+        let suite = "BeatboiMuteSoloTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+
+        XCTAssertFalse(store.isChannelMuted(.pulseA))
+        XCTAssertFalse(store.isChannelSoloed(.pulseA))
+        store.toggleChannelMute(.pulseA)
+        store.toggleChannelSolo(.drum)
+        XCTAssertTrue(store.isChannelMuted(.pulseA))
+        XCTAssertTrue(store.isChannelSoloed(.drum))
+        XCTAssertFalse(store.isChannelSoloed(.pulseA))
+
+        let data = try! JSONEncoder.bytePocketEncoder.encode(store.project)
+        let decoded = try! JSONDecoder.bytePocketDecoder.decode(ByteProject.self, from: data)
+        XCTAssertTrue(decoded.channelPatches.first(where: { $0.channel == .pulseA })?.muted == true)
+        XCTAssertTrue(decoded.channelPatches.first(where: { $0.channel == .drum })?.soloed == true)
+
+        store.clearChannelSolos()
+        XCTAssertFalse(store.isChannelSoloed(.drum))
+        defaults.removePersistentDomain(forName: suite)
+    }
+
     func testChannelVolumeFaderStoresIndependentZeroToHundredPercentValues() {
         let suite = "BeatboiVolumeTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!

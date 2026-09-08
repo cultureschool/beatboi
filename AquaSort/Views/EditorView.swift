@@ -570,7 +570,7 @@ struct EditorView: View {
             }
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 6), GridItem(.flexible(), spacing: 6)], spacing: 6) {
                 ForEach(ByteChannel.allCases) { channel in
-                    RestoredChannelFader(channel: channel, accent: restoredChannelAccent(channel), volume: store.channelVolumePercent(channel), selected: store.selectedChannel == channel) { store.selectedChannel = channel; store.selectedStep = nil } onChange: { value in store.setChannelVolume(channel: channel, percent: value); requestPlaybackRefresh() }
+                    RestoredChannelFader(channel: channel, accent: restoredChannelAccent(channel), volume: store.channelVolumePercent(channel), selected: store.selectedChannel == channel, muted: store.isChannelMuted(channel), soloed: store.isChannelSoloed(channel), onSelect: { store.selectedChannel = channel; store.selectedStep = nil }, onChange: { value in store.setChannelVolume(channel: channel, percent: value); requestPlaybackRefresh() }, onToggleMute: { store.toggleChannelMute(channel); requestPlaybackRefresh() }, onToggleSolo: { store.toggleChannelSolo(channel); requestPlaybackRefresh() })
                 }
             }
         }
@@ -978,8 +978,12 @@ private struct RestoredChannelFader: View {
     let accent: Color
     let volume: Int
     let selected: Bool
+    let muted: Bool
+    let soloed: Bool
     let onSelect: () -> Void
     let onChange: (Int) -> Void
+    let onToggleMute: () -> Void
+    let onToggleSolo: () -> Void
     @State private var start: Int?
     @State private var last: Int?
 
@@ -1000,7 +1004,10 @@ private struct RestoredChannelFader: View {
                         .frame(width: 5, height: 5)
                     Text(channel.title)
                         .font(.system(size: 8, weight: .black, design: .monospaced))
-                    Spacer()
+                        .opacity(muted ? 0.46 : 1)
+                    Spacer(minLength: 2)
+                    RestoredMiniMixerButton(title: "M", active: muted, accent: Color.arcadeRed, action: onToggleMute)
+                    RestoredMiniMixerButton(title: "S", active: soloed, accent: Color.amber, action: onToggleSolo)
                     Text("\(volume)%")
                         .font(.system(size: 8, weight: .black, design: .monospaced))
                 }
@@ -1032,12 +1039,41 @@ private struct RestoredChannelFader: View {
                         last = nil
                     }
             )
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Select \(channel.title) channel and adjust volume")
-            .accessibilityValue("\(volume) percent")
-            .accessibilityHint("Tap to edit this channel. Swipe left or right to change volume.")
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("\(channel.title) channel")
+            .accessibilityValue(accessibilityValue)
+            .accessibilityHint("Tap the channel to edit. Swipe left or right to change volume. Use M to mute or S to solo.")
         }
         .frame(minHeight: 48)
+    }
+
+    private var accessibilityValue: String {
+        var parts = ["\(volume) percent"]
+        if muted { parts.append("muted") }
+        if soloed { parts.append("soloed") }
+        return parts.joined(separator: ", ")
+    }
+}
+
+private struct RestoredMiniMixerButton: View {
+    let title: String
+    let active: Bool
+    let accent: Color
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 7, weight: .black, design: .monospaced))
+                .foregroundStyle(active ? Color.gbInk : Color.gbInk.opacity(0.58))
+                .frame(width: 22, height: 22)
+                .background(active ? accent : Color.gbLight.opacity(0.38))
+                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 4, style: .continuous).stroke(Color.gbInk.opacity(active ? 0.9 : 0.34), lineWidth: active ? 1.5 : 1))
+        }
+        .buttonStyle(ArcadePressStyle(scale: 0.88))
+        .accessibilityLabel(title == "M" ? "Mute channel" : "Solo channel")
+        .accessibilityValue(active ? "On" : "Off")
     }
 }
 

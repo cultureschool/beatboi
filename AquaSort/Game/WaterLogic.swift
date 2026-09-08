@@ -284,6 +284,9 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
     var panRight: Bool
     var lengthCounter: Bool
     var length: Int
+    /// Mixer state is project data so mute/solo survives autosave and export.
+    var muted: Bool
+    var soloed: Bool
     /// Drum voice used by the Sound Lab selector: 0 kick, 1 snare, 2 hi-hat, 3 crash.
     var drumVoice: Int
     /// Selected supplied sample (1 or 2) for kick, snare, hi-hat, and perc.
@@ -294,7 +297,7 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case channel, duty, initialVolume, masterVolume, octave, tremolo, portamento, portamentoTime, envelopeAttack, envelopeDecay, envelopeSustain, envelopeRelease, filter, envelope, vibratoDepth, vibratoCycleLength, vibratoDelay, bendRange, vibratoRate, envelopeIncrease, envelopePace, sweepPace, sweepIncrease, sweepShift
-        case waveVolume, waveShape, waveFilter, waveEnvelope, noiseWidth7Bit, noiseClockShift, noiseDivider, panLeft, panRight, lengthCounter, length
+        case waveVolume, waveShape, waveFilter, waveEnvelope, noiseWidth7Bit, noiseClockShift, noiseDivider, panLeft, panRight, lengthCounter, length, muted, soloed
         case drumVoice, drumSamples, drumVolumes, drumLengths
     }
 
@@ -332,6 +335,8 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
         self.panLeft = true
         self.panRight = true
         self.lengthCounter = channel == .drum
+        self.muted = false
+        self.soloed = false
         self.length = 63
         self.drumVoice = 0
         self.drumSamples = [1, 1, 1, 1]
@@ -375,6 +380,8 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
         panLeft = try container.decodeIfPresent(Bool.self, forKey: .panLeft) ?? panLeft
         panRight = try container.decodeIfPresent(Bool.self, forKey: .panRight) ?? panRight
         lengthCounter = try container.decodeIfPresent(Bool.self, forKey: .lengthCounter) ?? lengthCounter
+        muted = try container.decodeIfPresent(Bool.self, forKey: .muted) ?? muted
+        soloed = try container.decodeIfPresent(Bool.self, forKey: .soloed) ?? soloed
         length = try container.decodeIfPresent(Int.self, forKey: .length) ?? length
         drumVoice = min(3, max(0, try container.decodeIfPresent(Int.self, forKey: .drumVoice) ?? drumVoice))
         if let samples = try container.decodeIfPresent([Int].self, forKey: .drumSamples), samples.count == 4 {
@@ -423,6 +430,8 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
         try container.encode(panLeft, forKey: .panLeft)
         try container.encode(panRight, forKey: .panRight)
         try container.encode(lengthCounter, forKey: .lengthCounter)
+        try container.encode(muted, forKey: .muted)
+        try container.encode(soloed, forKey: .soloed)
         try container.encode(length, forKey: .length)
         try container.encode(drumVoice, forKey: .drumVoice)
         try container.encode(drumSamples, forKey: .drumSamples)
