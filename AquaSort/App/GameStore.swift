@@ -474,9 +474,6 @@ final class GameStore {
         case .bitCrush:
             project.effects.bitCrushAmount = value
             project.effects.bitCrush = value > 0
-        case .vibrato:
-            project.effects.vibratoAmount = value
-            project.effects.vibrato = value > 0
         }
         touch()
     }
@@ -485,18 +482,7 @@ final class GameStore {
         switch effect {
         case .echo: return project.effects.echoAmount
         case .bitCrush: return project.effects.bitCrushAmount
-        case .vibrato: return project.effects.vibratoAmount
         }
-    }
-
-    var octaveFlutterPattern: ByteOctaveFlutterPattern {
-        ByteOctaveFlutterPattern(rawValue: project.effects.octaveFlutterPattern) ?? .baseUp
-    }
-
-    func setOctaveFlutterPattern(_ pattern: ByteOctaveFlutterPattern) {
-        guard project.effects.octaveFlutterPattern != pattern.rawValue else { return }
-        project.effects.octaveFlutterPattern = pattern.rawValue
-        touch()
     }
 
     func effectSendPercent(_ channel: ByteChannel) -> Int {
@@ -528,6 +514,8 @@ final class GameStore {
         case .envelopeRelease: patch.envelopeRelease = (patch.envelopeRelease + delta).clamped(to: 0...100)
         case .portamento: patch.portamento = (patch.portamento + delta).clamped(to: 0...100)
         case .portamentoTime: patch.portamentoTime = (patch.portamentoTime + delta).clamped(to: 0...100)
+        case .octaveFlutterSpeed: patch.octaveFlutterAmount = (patch.octaveFlutterAmount + delta).clamped(to: 0...100)
+        case .octaveFlutterPattern: patch.octaveFlutterPattern = (patch.octaveFlutterPattern + delta.signum()).clamped(to: 0...(ByteOctaveFlutterPattern.allCases.count - 1))
         case .vibratoCycleLength: patch.vibratoCycleLength = (patch.vibratoCycleLength + delta).clamped(to: 0...100)
         case .vibratoDepth: patch.vibratoDepth = (patch.vibratoDepth + delta).clamped(to: 0...100)
         case .vibratoDelay: patch.vibratoDelay = (patch.vibratoDelay + delta).clamped(to: 0...100)

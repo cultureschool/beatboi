@@ -186,15 +186,12 @@ enum ByteChannel: String, CaseIterable, Codable, Identifiable, Sendable {
 enum ByteEffect: String, CaseIterable, Codable, Identifiable, Hashable, Sendable {
     case echo
     case bitCrush
-    /// NES-style octave flutter: the fader controls the speed of the octave jumps.
-    case vibrato
 
     var id: String { rawValue }
     var title: String {
         switch self {
         case .echo: return "ECHO"
         case .bitCrush: return "BIT CRUSH"
-        case .vibrato: return "OCTAVE FLUTTER"
         }
     }
 }
@@ -286,6 +283,10 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
     var vibratoDelay: Int
     var bendRange: Int
     var vibratoRate: Int
+    /// Per-channel NES-style octave flutter speed. Zero disables it.
+    var octaveFlutterAmount: Int
+    /// Per-channel octave path: 0 base/+1, 1 +1/base, 2 base/+1/+2/+1.
+    var octaveFlutterPattern: Int
     var envelopeIncrease: Bool
     var envelopePace: Int
     var sweepPace: Int
@@ -317,7 +318,7 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case channel, duty, initialVolume, masterVolume, octave, tremolo, portamento, portamentoTime, envelopeAttack, envelopeDecay, envelopeSustain, envelopeRelease, filter, envelope, vibratoDepth, vibratoCycleLength, vibratoDelay, bendRange, vibratoRate, envelopeIncrease, envelopePace, sweepPace, sweepIncrease, sweepShift
-        case waveVolume, waveShape, waveFilter, waveEnvelope, noiseWidth7Bit, noiseClockShift, noiseDivider, panLeft, panRight, lengthCounter, length, muted, soloed
+        case waveVolume, waveShape, waveFilter, waveEnvelope, noiseWidth7Bit, noiseClockShift, noiseDivider, panLeft, panRight, lengthCounter, length, muted, soloed, octaveFlutterAmount, octaveFlutterPattern
         case drumVoice, drumSamples, drumVolumes, drumLengths
     }
 
@@ -340,6 +341,8 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
         self.vibratoDelay = 0
         self.bendRange = 2
         self.vibratoRate = 5
+        self.octaveFlutterAmount = 0
+        self.octaveFlutterPattern = ByteOctaveFlutterPattern.baseUp.rawValue
         self.envelopeIncrease = false
         self.envelopePace = 0
         self.sweepPace = channel == .pulseA ? 2 : 0
@@ -385,6 +388,8 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
         vibratoDelay = min(100, max(0, try container.decodeIfPresent(Int.self, forKey: .vibratoDelay) ?? vibratoDelay))
         bendRange = min(24, max(0, try container.decodeIfPresent(Int.self, forKey: .bendRange) ?? bendRange))
         vibratoRate = min(12, max(1, try container.decodeIfPresent(Int.self, forKey: .vibratoRate) ?? vibratoRate))
+        octaveFlutterAmount = min(100, max(0, try container.decodeIfPresent(Int.self, forKey: .octaveFlutterAmount) ?? octaveFlutterAmount))
+        octaveFlutterPattern = min(ByteOctaveFlutterPattern.allCases.count - 1, max(0, try container.decodeIfPresent(Int.self, forKey: .octaveFlutterPattern) ?? octaveFlutterPattern))
         envelopeIncrease = try container.decodeIfPresent(Bool.self, forKey: .envelopeIncrease) ?? envelopeIncrease
         envelopePace = try container.decodeIfPresent(Int.self, forKey: .envelopePace) ?? envelopePace
         sweepPace = try container.decodeIfPresent(Int.self, forKey: .sweepPace) ?? sweepPace
@@ -435,6 +440,8 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
         try container.encode(vibratoDelay, forKey: .vibratoDelay)
         try container.encode(bendRange, forKey: .bendRange)
         try container.encode(vibratoRate, forKey: .vibratoRate)
+        try container.encode(octaveFlutterAmount, forKey: .octaveFlutterAmount)
+        try container.encode(octaveFlutterPattern, forKey: .octaveFlutterPattern)
         try container.encode(envelopeIncrease, forKey: .envelopeIncrease)
         try container.encode(envelopePace, forKey: .envelopePace)
         try container.encode(sweepPace, forKey: .sweepPace)
@@ -559,6 +566,8 @@ enum BytePatchParameter: String, CaseIterable, Identifiable, Hashable, Sendable 
     case vibratoCycleLength
     case vibratoDepth
     case vibratoDelay
+    case octaveFlutterSpeed
+    case octaveFlutterPattern
     case bendRange
     case octave
     case tremolo
@@ -593,6 +602,8 @@ enum BytePatchParameter: String, CaseIterable, Identifiable, Hashable, Sendable 
         case .vibratoCycleLength: return "VIB CYCLE"
         case .vibratoDepth: return "VIB DEPTH"
         case .vibratoDelay: return "VIB DELAY"
+        case .octaveFlutterSpeed: return "OCT FLUTTER"
+        case .octaveFlutterPattern: return "FLUTTER PATH"
         case .bendRange: return "BEND RANGE"
         case .octave: return "OCTAVE"
         case .tremolo: return "TREMOLO"
@@ -617,7 +628,8 @@ enum BytePatchParameter: String, CaseIterable, Identifiable, Hashable, Sendable 
 
     var range: ClosedRange<Int> {
         switch self {
-        case .tone, .envelopeAttack, .envelopeDecay, .envelopeSustain, .envelopeRelease, .portamento, .portamentoTime, .vibratoCycleLength, .vibratoDepth, .vibratoDelay, .tremolo, .envelope: return 0...100
+        case .tone, .envelopeAttack, .envelopeDecay, .envelopeSustain, .envelopeRelease, .portamento, .portamentoTime, .vibratoCycleLength, .vibratoDepth, .vibratoDelay, .octaveFlutterSpeed, .tremolo, .envelope: return 0...100
+        case .octaveFlutterPattern: return 0...(ByteOctaveFlutterPattern.allCases.count - 1)
         case .duty: return 0...3
         case .bendRange: return 0...24
         case .octave: return -2...2
@@ -650,8 +662,7 @@ struct ByteEffects: Codable, Hashable, Sendable {
         return max(1, 18 - (clamped * 17 / 100))
     }
 
-    /// Maps the fader to musical divisions. The fader remains continuous to touch,
-    /// while each fifth selects a stable tempo-synced rate from whole notes to 1/16ths.
+    /// Legacy FX helper retained for old projects; channel patches now own flutter settings.
     static func octaveFlutterDivision(for amount: Int) -> Int {
         let clamped = min(100, max(0, amount))
         guard clamped > 0 else { return 0 }
@@ -659,7 +670,7 @@ struct ByteEffects: Codable, Hashable, Sendable {
     }
 
     static func octaveFlutterDivisionTitle(for amount: Int) -> String {
-        ["OFF", "1/1", "1/2", "1/4", "1/8", "1/16"][octaveFlutterDivision(for: amount) + (amount > 0 ? 1 : 0)]
+        ["OFF", "1/16", "1/32", "1/64", "1/128", "1/256"][octaveFlutterDivision(for: amount) + (amount > 0 ? 1 : 0)]
     }
 
     /// Returns a hard, tempo-synced octave arpeggio multiplier.
@@ -670,7 +681,7 @@ struct ByteEffects: Codable, Hashable, Sendable {
         pattern: ByteOctaveFlutterPattern = .baseUp
     ) -> Double {
         guard amount > 0 else { return 1.0 }
-        let divisionBeats = [4.0, 2.0, 1.0, 0.5, 0.25][octaveFlutterDivision(for: amount)]
+        let divisionBeats = [0.25, 0.125, 0.0625, 0.03125, 0.015625][octaveFlutterDivision(for: amount)]
         let divisionDuration = 60.0 / Double(max(1, bpm)) * divisionBeats
         let index = Int(max(0, time) / max(0.001, divisionDuration)) % pattern.octaveSteps.count
         return pow(2.0, Double(pattern.octaveSteps[index]))
@@ -739,7 +750,6 @@ struct ByteEffects: Codable, Hashable, Sendable {
         switch effect {
         case .echo: return echoAmount > 0
         case .bitCrush: return bitCrushAmount > 0
-        case .vibrato: return vibratoAmount > 0
         }
     }
 
@@ -747,7 +757,6 @@ struct ByteEffects: Codable, Hashable, Sendable {
         switch effect {
         case .echo: echoAmount = echoAmount > 0 ? 0 : 100; echo = echoAmount > 0
         case .bitCrush: bitCrushAmount = bitCrushAmount > 0 ? 0 : 100; bitCrush = bitCrushAmount > 0
-        case .vibrato: vibratoAmount = vibratoAmount > 0 ? 0 : 100; vibrato = vibratoAmount > 0
         }
     }
 }

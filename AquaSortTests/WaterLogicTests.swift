@@ -511,26 +511,25 @@ final class BeatboiTests: XCTestCase {
         var effectedProject = ByteProject()
         effectedProject.effects.echoAmount = 100
         effectedProject.effects.bitCrushAmount = 100
-        effectedProject.effects.vibratoAmount = 70
-        effectedProject.effects.octaveFlutterPattern = ByteOctaveFlutterPattern.baseUpTwoUp.rawValue
+        effectedProject.channelPatches[0].octaveFlutterAmount = 70
+        effectedProject.channelPatches[0].octaveFlutterPattern = ByteOctaveFlutterPattern.baseUpTwoUp.rawValue
         let effected = ByteRenderer.render(project: effectedProject, sampleRate: 8_000)
         XCTAssertEqual(baseline.count, effected.count)
         XCTAssertTrue(zip(baseline, effected).contains { abs($0 - $1) > 0.0001 })
     }
 
     func testOctaveFlutterMapsFaderToDiscreteNESStyleJumps() {
-        XCTAssertEqual(ByteEffect.allCases, [.echo, .bitCrush, .vibrato])
-        XCTAssertEqual(ByteEffect.vibrato.title, "OCTAVE FLUTTER")
+        XCTAssertEqual(ByteEffect.allCases, [.echo, .bitCrush])
         XCTAssertEqual(ByteEffects.octaveFlutterDivision(for: 0), 0)
         XCTAssertEqual(ByteEffects.octaveFlutterDivision(for: 1), 0)
         XCTAssertEqual(ByteEffects.octaveFlutterDivision(for: 100), 4)
         XCTAssertEqual(ByteEffects.octaveFlutterDivisionTitle(for: 0), "OFF")
-        XCTAssertEqual(ByteEffects.octaveFlutterDivisionTitle(for: 70), "1/8")
+        XCTAssertEqual(ByteEffects.octaveFlutterDivisionTitle(for: 70), "1/128")
         XCTAssertEqual(ByteEffects.octaveFlutterMultiplier(at: 0.0, bpm: 120, amount: 70), 1)
-        XCTAssertEqual(ByteEffects.octaveFlutterMultiplier(at: 0.25, bpm: 120, amount: 70), 2)
+        XCTAssertEqual(ByteEffects.octaveFlutterMultiplier(at: 0.01562505, bpm: 120, amount: 70), 2)
         XCTAssertEqual(ByteEffects.octaveFlutterMultiplier(at: 0.0, bpm: 120, amount: 0), 1)
         XCTAssertEqual(ByteEffects.octaveFlutterMultiplier(at: 0.0, bpm: 120, amount: 70, pattern: .baseUpTwoUp), 1)
-        XCTAssertEqual(ByteEffects.octaveFlutterMultiplier(at: 0.5, bpm: 120, amount: 70, pattern: .baseUpTwoUp), 4)
+        XCTAssertEqual(ByteEffects.octaveFlutterMultiplier(at: 0.03125005, bpm: 120, amount: 70, pattern: .baseUpTwoUp), 4)
     }
 
     func testSharedBeginnerPatchControlsAndDMGEffectsPersist() {
@@ -551,11 +550,14 @@ final class BeatboiTests: XCTestCase {
             XCTAssertEqual(store.patch(for: channel).envelope, 30)
             XCTAssertEqual(store.patch(for: channel).vibratoDepth, 40)
         }
-        store.setEffectAmount(.vibrato, amount: 65)
-        XCTAssertEqual(store.project.effects.vibratoAmount, 65)
+        store.adjustPatch(channel: .pulseA, parameter: .octaveFlutterSpeed, delta: 65)
+        XCTAssertEqual(store.patch(for: .pulseA).octaveFlutterAmount, 65)
+        store.adjustPatch(channel: .pulseA, parameter: .octaveFlutterPattern, delta: 1)
+        XCTAssertEqual(store.patch(for: .pulseA).octaveFlutterPattern, 1)
         let data = try! JSONEncoder.bytePocketEncoder.encode(store.project)
         let decoded = try! JSONDecoder.bytePocketDecoder.decode(ByteProject.self, from: data)
-        XCTAssertEqual(decoded.projectEffectsForTests.vibratoAmount, 65)
+        XCTAssertEqual(decoded.channelPatches[0].octaveFlutterAmount, 65)
+        XCTAssertEqual(decoded.channelPatches[0].octaveFlutterPattern, 1)
         defaults.removePersistentDomain(forName: suite)
     }
 

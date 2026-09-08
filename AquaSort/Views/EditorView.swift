@@ -703,7 +703,7 @@ struct EditorView: View {
                         Text(store.isPlaying ? "EFFECT BUS LIVE" : "EFFECT BUS READY")
                             .font(.system(size: 8, weight: .black, design: .monospaced))
                             .foregroundStyle(Color.gbInk)
-                        Text("GLOBAL BUS / ECHO + OCTAVE FLUTTER")
+                        Text("GLOBAL BUS / ECHO + BIT CRUSH")
                             .font(.system(size: 6, weight: .bold, design: .monospaced))
                             .foregroundStyle(Color.screenShadow)
                     }
@@ -732,8 +732,8 @@ struct EditorView: View {
                             accent: Color.gbGlow,
                             active: store.isPlaying,
                             phase: currentStep + (ByteEffect.allCases.firstIndex(of: effect) ?? 0),
-                            flutterPattern: effect == .vibrato ? store.octaveFlutterPattern : nil,
-                            onPatternChange: effect == .vibrato ? { pattern in store.setOctaveFlutterPattern(pattern); requestPlaybackRefresh() } : nil
+                            flutterPattern: nil,
+                            onPatternChange: nil
                         ) { amount in
                             store.setEffectAmount(effect, amount: amount)
                             requestPlaybackRefresh()
@@ -783,8 +783,8 @@ struct EditorView: View {
 
     private func restoredParameters(for channel: ByteChannel) -> [BytePatchParameter] {
         switch channel {
-        case .pulseA, .pulseB: return [.duty, .octave, .envelopeAttack, .envelopeDecay, .envelopeSustain, .envelopeRelease, .portamento, .portamentoTime, .vibratoCycleLength, .vibratoDepth, .vibratoDelay, .bendRange]
-        case .wave: return [.waveShape, .waveFilter, .waveEnvelope, .octave, .envelopeAttack, .envelopeDecay, .envelopeSustain, .envelopeRelease, .portamento, .portamentoTime, .vibratoDepth, .bendRange]
+        case .pulseA, .pulseB: return [.duty, .octave, .octaveFlutterSpeed, .octaveFlutterPattern, .envelopeAttack, .envelopeDecay, .envelopeSustain, .envelopeRelease, .portamento, .portamentoTime, .vibratoCycleLength, .vibratoDepth, .vibratoDelay, .bendRange]
+        case .wave: return [.waveShape, .waveFilter, .waveEnvelope, .octave, .octaveFlutterSpeed, .octaveFlutterPattern, .envelopeAttack, .envelopeDecay, .envelopeSustain, .envelopeRelease, .portamento, .portamentoTime, .vibratoDepth, .bendRange]
         case .drum: return [.volume, .envelope, .tremolo, .panLeft, .panRight]
         }
     }
@@ -1472,6 +1472,8 @@ private struct RestoredPatchCard: View {
         switch parameter {
         case .duty: return ["12.5%", "25%", "50%", "75%"][min(3, max(0, patch.duty))]
         case .octave: return patch.octave >= 0 ? "+\(patch.octave)" : "\(patch.octave)"
+        case .octaveFlutterSpeed: return ByteEffects.octaveFlutterDivisionTitle(for: patch.octaveFlutterAmount)
+        case .octaveFlutterPattern: return ByteOctaveFlutterPattern(rawValue: patch.octaveFlutterPattern)?.title ?? "BASE / +1"
         case .volume: return "\(patch.initialVolume)/15"
         case .waveShape: return "\(patch.waveShape)"
         case .waveVolume: return "\(patch.waveVolume)"
@@ -1488,6 +1490,8 @@ private struct RestoredPatchCard: View {
         switch parameter {
         case .duty: return CGFloat(min(3, max(0, patch.duty)) + 1) / 4
         case .octave: return CGFloat(min(4, max(0, patch.octave + 2))) / 4
+        case .octaveFlutterSpeed: return CGFloat(patch.octaveFlutterAmount) / 100
+        case .octaveFlutterPattern: return CGFloat(patch.octaveFlutterPattern + 1) / CGFloat(ByteOctaveFlutterPattern.allCases.count)
         case .volume: return CGFloat(patch.initialVolume) / 15
         case .waveVolume: return CGFloat(patch.waveVolume) / 3
         default: return selected ? 0.72 : 0.42
@@ -1521,21 +1525,7 @@ private struct RestoredFXModule: View {
             }
             RestoredFXMeter(level: amount, accent: accent, active: active, phase: phase)
                 .frame(height: 16)
-            RestoredAmountCard(title: title == "OCTAVE FLUTTER" ? "SPEED" : "AMOUNT", amount: amount, onChange: onChange)
-            if let flutterPattern, let onPatternChange {
-                Picker("OCTAVE PATH", selection: Binding(
-                    get: { flutterPattern },
-                    set: { onPatternChange($0) }
-                )) {
-                    ForEach(ByteOctaveFlutterPattern.allCases) { pattern in
-                        Text(pattern.title).tag(pattern)
-                    }
-                }
-                .pickerStyle(.menu)
-                .font(.system(size: 7, weight: .black, design: .monospaced))
-                .tint(Color.gbGlow)
-                .accessibilityLabel("Octave flutter pattern")
-            }
+            RestoredAmountCard(title: "AMOUNT", amount: amount, onChange: onChange)
         }
         .padding(7)
         .background(
