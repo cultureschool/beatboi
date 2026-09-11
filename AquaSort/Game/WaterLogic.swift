@@ -1372,11 +1372,18 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         return result.isEmpty ? patterns : result
     }
 
-    /// Returns one playback bar for every visible arrangement slot. Empty slots are silent
-    /// bars rather than being compacted away, so playback and scrubbing retain bar numbers.
+    /// Returns one playback bar for every arrangement slot through the last assigned
+    /// pattern. Empty bars between patterns stay silent rather than compacted away, so
+    /// bar numbers hold — but trailing empty slots are excluded, so a short arrangement
+    /// loops on its music instead of playing dead air. Silence is structural only when
+    /// a later slot carries a pattern again.
     var songPatterns: [BytePattern] {
         let lookup = Dictionary(uniqueKeysWithValues: patterns.map { ($0.id, $0) })
-        return songArrangement.prefix(songArrangementLength).map { slot in
+        let slots = songArrangement.prefix(songArrangementLength)
+        guard let lastAssigned = slots.lastIndex(where: { !$0.isContinuation && $0.patternID != nil && lookup[$0.patternID!] != nil }) else {
+            return []
+        }
+        return slots.prefix(through: lastAssigned).map { slot in
             guard !slot.isContinuation, let patternID = slot.patternID, let pattern = lookup[patternID] else {
                 return BytePattern.empty(name: "EMPTY BAR")
             }
@@ -1384,9 +1391,10 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         }
     }
 
-    /// Each playback pattern maps directly to its arrangement bar, including silent bars.
+    /// Each playback pattern maps directly to its arrangement bar, including structural
+    /// silent bars. Mirrors the songPatterns trim so playback always covers real music.
     var songSlotIndices: [Int] {
-        Array(0..<min(songArrangementLength, songArrangement.count))
+        Array(0..<songPatterns.count)
     }
 
     var hasAssignedSongPattern: Bool {

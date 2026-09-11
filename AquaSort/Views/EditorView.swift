@@ -531,18 +531,7 @@ struct EditorView: View {
                                 .accessibilityHidden(true)
                         }
                         if store.isPlaying, currentSongSlot >= 0 {
-                            let totalBars = CGFloat(max(1, store.songArrangementLength))
-                            let stepProgress = CGFloat(max(0, min(15, currentStep))) / 16.0
-                            let playheadX = proxy.size.width * (CGFloat(currentSongSlot) + stepProgress + 0.5) / totalBars
-                            Capsule()
-                                .fill(Color.amber)
-                                .frame(width: 3, height: 27)
-                                .position(x: min(proxy.size.width - 2, max(2, playheadX)), y: 11)
-                                .shadow(color: Color.amber.opacity(0.95), radius: 6)
-                                .beatGlow(active: true, phase: currentStep, color: .amber)
-                                .animation(.linear(duration: 0.08), value: currentStep)
-                                .animation(.easeOut(duration: 0.12), value: currentSongSlot)
-                                .accessibilityHidden(true)
+                            songPlayhead(width: proxy.size.width)
                         }
                     }
                     .contentShape(Rectangle())
@@ -1164,6 +1153,25 @@ struct EditorView: View {
                 scrubbedSongSlot = songSlot >= 0 ? songSlot : scrubbedSongSlot
             }
         }
+    }
+    /// Amber playhead sweeping the arrangement timeline. Positions against the trimmed
+    /// playback loop (songSlotIndices) rather than the full slot grid, so it rides the
+    /// music even when trailing empty bars fall outside the loop.
+    private func songPlayhead(width: CGFloat) -> some View {
+        let totalBars = max(1, store.project.songSlotIndices.count)
+        let clampedStep = max(0, min(15, currentStep))
+        let stepProgress = CGFloat(clampedStep) / 16.0
+        let rawX = width * (CGFloat(currentSongSlot) + stepProgress + 0.5) / CGFloat(totalBars)
+        let playheadX = min(width - 2, max(2, rawX))
+        return Capsule()
+            .fill(Color.amber)
+            .frame(width: 3, height: 27)
+            .position(x: playheadX, y: 11)
+            .shadow(color: Color.amber.opacity(0.95), radius: 6)
+            .beatGlow(active: true, phase: currentStep, color: .amber)
+            .animation(.linear(duration: 0.08), value: currentStep)
+            .animation(.easeOut(duration: 0.12), value: currentSongSlot)
+            .accessibilityHidden(true)
     }
     private func restoredClamp(_ value: Int, _ low: Int, _ high: Int) -> Int { min(max(value, low), high) }
     private func restoredChannelAccent(_ channel: ByteChannel) -> Color {

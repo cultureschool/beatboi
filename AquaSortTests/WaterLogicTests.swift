@@ -429,9 +429,29 @@ final class BeatboiTests: XCTestCase {
         project.songArrangement = Array(repeating: .empty, count: 16)
         project.songArrangement[0] = ByteSongSlot(patternID: first.id, isContinuation: false)
         project.songArrangement[1] = ByteSongSlot(patternID: second.id, isContinuation: false)
+        // Trailing empty bars are trimmed from the loop; the render covers bars 0-1 only.
+        let expectedFrames = Int(Double(project.songPatterns.count * 16) * ByteTransportClock.stepDuration(bpm: project.tempo) * 8_000)
+        XCTAssertEqual(project.songPatterns.count, 2)
+        XCTAssertEqual(project.songSlotIndices, [0, 1])
         let samples = ByteRenderer.render(project: project, patterns: project.songPatterns, sampleRate: 8_000)
-        let expectedFrames = Int(Double(project.songArrangementLength * 16) * ByteTransportClock.stepDuration(bpm: project.tempo) * 8_000)
         XCTAssertEqual(samples.count, expectedFrames * 2)
+    }
+
+    /// A short arrangement must loop on its music: the loop ends at the last assigned
+    /// pattern instead of running through trailing empty bars.
+    func testSongLoopTrimsTrailingEmptyBars() {
+        var project = ByteProject.starter
+        project.songModeEnabled = true
+        project.songArrangement = Array(repeating: .empty, count: 16)
+        project.songArrangement[0] = ByteSongSlot(patternID: project.patterns[0].id, isContinuation: false)
+        project.songArrangement[2] = ByteSongSlot(patternID: project.patterns[1].id, isContinuation: false)
+        // Bars 0-2 play (bar 1 is intentional silence between the two patterns);
+        // trailing empty bars 3-15 are outside the loop.
+        XCTAssertEqual(project.songPatterns.count, 3)
+        XCTAssertEqual(project.songSlotIndices, [0, 1, 2])
+        XCTAssertTrue(project.songPatterns[0].name != "EMPTY BAR")
+        XCTAssertEqual(project.songPatterns[1].name, "EMPTY BAR")
+        XCTAssertTrue(project.songPatterns[2].name != "EMPTY BAR")
     }
 
     func testWAVOutputIsFiniteAndBounded() {
