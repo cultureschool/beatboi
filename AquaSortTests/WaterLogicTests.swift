@@ -112,6 +112,20 @@ final class BeatboiTests: XCTestCase {
         XCTAssertEqual(project.mode, .major)
     }
 
+    /// First launch now opens a blank project on the drum channel: one empty pattern,
+    /// no notes, no demo groove. The starter remains as the demo document for tests.
+    func testFirstLaunchOpensBlankProjectOnDrumChannel() {
+        let suite = "BeatboiFirstLaunchTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+
+        XCTAssertEqual(store.project.name, "FIRST BEAT")
+        XCTAssertEqual(store.project.patterns.count, 1)
+        XCTAssertEqual(store.project.patterns[0].steps.flatMap { $0 }.compactMap { $0 }.count, 0)
+        XCTAssertEqual(store.selectedChannel, .drum)
+        defaults.removePersistentDomain(forName: suite)
+    }
+
     func testProjectCodableRoundTrip() throws {
         let project = ByteProject.starter
         let data = try JSONEncoder.bytePocketEncoder.encode(project)
@@ -410,9 +424,10 @@ final class BeatboiTests: XCTestCase {
         XCTAssertEqual(store.songSlot(at: 1).patternID, firstID)
         store.cycleSongSlot(at: 1, delta: 100)
         XCTAssertEqual(store.songSlot(at: 1).patternID, second.id)
+        // Slot cycling clamps at the ends of the current bank ([P1, P2]):
+        // one step back from P2 lands on P1.
         store.cycleSongSlot(at: 1, delta: -1)
-        // One step back lands on the previous pattern in the three-pattern bank.
-        XCTAssertEqual(store.songSlot(at: 1).patternID, store.project.patterns[1].id)
+        XCTAssertEqual(store.songSlot(at: 1).patternID, store.project.patterns[0].id)
         XCTAssertFalse(store.songSlot(at: 1).isContinuation)
 
         let data = try! JSONEncoder.bytePocketEncoder.encode(store.project)
@@ -472,6 +487,8 @@ final class BeatboiTests: XCTestCase {
         let suite = "BeatboiDeletePatternTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         let store = GameStore(defaults: defaults)
+        // Blank first launch: exactly one empty pattern in the bank.
+        XCTAssertEqual(store.project.patterns.count, 1)
         let firstID = store.project.patterns[0].id
         store.addPattern()
         let deletedID = store.currentPatternID
@@ -481,10 +498,10 @@ final class BeatboiTests: XCTestCase {
         XCTAssertFalse(store.project.arrangement.contains(deletedID))
         XCTAssertNil(store.songSlot(at: 3).patternID)
         XCTAssertTrue(store.project.patterns.contains(where: { $0.id == store.currentPatternID }))
-        // The final remaining pattern is protected from deletion.
-        XCTAssertTrue(store.deletePattern(firstID))
+        // Deleting the added pattern leaves the single original — the final
+        // remaining pattern is protected from deletion.
         XCTAssertEqual(store.project.patterns.count, 1)
-        XCTAssertFalse(store.deletePattern(store.project.patterns[0].id))
+        XCTAssertFalse(store.deletePattern(firstID))
         defaults.removePersistentDomain(forName: suite)
     }
 
@@ -523,7 +540,8 @@ final class BeatboiTests: XCTestCase {
 
         store.addPattern()
 
-        XCTAssertEqual(store.project.patterns.count, 3)
+        // Blank first launch: PATTERN 01 already exists, so addPattern yields PATTERN 02.
+        XCTAssertEqual(store.project.patterns.count, 2)
         XCTAssertNotEqual(store.currentPatternID, originalID)
         let fresh = store.project.patterns.first(where: { $0.id == store.currentPatternID })!
         XCTAssertTrue(fresh.steps.allSatisfy { $0.allSatisfy { $0 == nil } })
@@ -542,12 +560,13 @@ final class BeatboiTests: XCTestCase {
 
         store.duplicateCurrentPattern()
 
-        XCTAssertEqual(store.project.patterns.count, 3)
+        // Blank first launch: PATTERN 01 exists, so the duplicate lands at index 1.
+        XCTAssertEqual(store.project.patterns.count, 2)
         XCTAssertNotEqual(store.currentPatternID, sourceID)
-        XCTAssertEqual(store.project.patterns[2].steps, source.steps)
-        XCTAssertEqual(store.project.patterns[2].noteLengths, source.noteLengths)
-        XCTAssertEqual(store.project.patterns[2].steps.count, 4)
-        XCTAssertEqual(store.project.patterns[2].steps.allSatisfy { $0.count == 16 }, true)
+        XCTAssertEqual(store.project.patterns[1].steps, source.steps)
+        XCTAssertEqual(store.project.patterns[1].noteLengths, source.noteLengths)
+        XCTAssertEqual(store.project.patterns[1].steps.count, 4)
+        XCTAssertEqual(store.project.patterns[1].steps.allSatisfy { $0.count == 16 }, true)
 
         store.toggleStep(channel: .pulseA, step: 3)
         XCTAssertNotEqual(store.project.patterns[1].steps, source.steps)
@@ -814,6 +833,8 @@ final class BeatboiTests: XCTestCase {
         let suite = "BeatboiClearRowTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         let store = GameStore(defaults: defaults)
+        // Blank project: seed a note so the row actually has something to clear.
+        store.toggleStep(channel: .pulseA, step: 3)
         let originalRow = store.project.patterns[0].steps[0]
 
         store.clearChannelRow(.pulseA)
@@ -829,6 +850,8 @@ final class BeatboiTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suite)!
         let store = GameStore(defaults: defaults)
 
+        // Blank project: activity requires a note, so seed the pulse row at step 0.
+        store.toggleStep(channel: .pulseA, step: 0)
         XCTAssertEqual(store.channelActivityLevel(.pulseA, step: 0), 0)
         store.isPlaying = true
         XCTAssertEqual(store.channelActivityLevel(.pulseA, step: 0), 100)

@@ -1289,6 +1289,9 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
     /// Default project: a ready-to-play groove in C major. Two patterns seed a two-bar
     /// song with preset patches and a light echo, so the very first play already sounds
     /// like a track instead of an empty grid.
+    ///
+    /// New installs open `blank` instead; `starter` remains as the demo document used
+    /// by tests, previews, and the fallback waveform seed.
     static let starter: ByteProject = {
         let groove = BytePattern(
             name: "GROOVE",
@@ -1363,6 +1366,14 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
             let patternID: UUID? = index == 0 ? a : (index == 1 ? b : nil)
             return ByteSongSlot(patternID: patternID, isContinuation: false)
         }
+        return project
+    }()
+
+    /// First-launch project: a truly empty single pattern, so a new user opens onto a
+    /// silent drum-pad grid and builds from scratch rather than hearing the demo groove.
+    static let blank: ByteProject = {
+        var project = ByteProject(name: "FIRST BEAT", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        project.channelPatches = ByteChannelPatch.defaults
         return project
     }()
 

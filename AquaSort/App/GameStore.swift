@@ -6,7 +6,7 @@ import Observation
 final class GameStore {
     var project: ByteProject
     var projects: [ByteProject]
-    var selectedChannel: ByteChannel = .pulseA
+    var selectedChannel: ByteChannel = .drum
     var selectedStep: Int?
     var currentPatternID: UUID
     var isPlaying = false
@@ -39,7 +39,9 @@ final class GameStore {
            !saved.isEmpty {
             savedProjects = saved
         } else {
-            savedProjects = [.starter]
+            // First launch opens a blank project — the user starts from silence,
+            // not the demo groove.
+            savedProjects = [.blank]
         }
 
         let selectedID = defaults.string(forKey: selectedProjectKey).flatMap(UUID.init(uuidString:))
