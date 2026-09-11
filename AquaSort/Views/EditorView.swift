@@ -275,6 +275,7 @@ struct EditorView: View {
         }
         .sheet(isPresented: $showLibrary) { ProjectLibraryView() }
         .sheet(isPresented: $showExport) { ExportView(useSongArrangement: page == 3) }
+        .task { configureSongLoopUITestIfNeeded() }
         .fileImporter(isPresented: $showImport, allowedContentTypes: [.bytePocketProject, .json, .bytePocketMIDI]) { importFile($0) }
         .onChange(of: store.project.id) { _, _ in
             // Project-library selection can happen while the sequencer is live. Publish
@@ -519,6 +520,7 @@ struct EditorView: View {
                                 SongTimelineTick(index: index, current: index == currentSongSlot, color: restoredSongColor(at: index), showLabel: store.songArrangementLength <= 32)
                             }
                         }
+                        songLoopMarkers(width: proxy.size.width)
                         if let scrubbedSongSlot {
                             RoundedRectangle(cornerRadius: 8, style: .continuous)
                                 .stroke(restoredSongColor(at: scrubbedSongSlot), lineWidth: 2)
@@ -631,8 +633,9 @@ struct EditorView: View {
         HStack(spacing: 6) {
             RestoredPageButton(title: "BEATPAD", systemImage: "square.grid.2x2.fill", selected: page == 0) { setPage(0) }
             RestoredPageButton(title: "SOUND LAB", systemImage: "slider.horizontal.3", selected: page == 1) { setPage(1) }
-            RestoredPageButton(title: "FX", systemImage: "dot.radiowaves.left.and.right", selected: page == 2) { setPage(2) }
-            RestoredPageButton(title: "SONG", systemImage: "list.number", selected: page == 3) { setPage(3) }
+                RestoredPageButton(title: "FX", systemImage: "dot.radiowaves.left.and.right", selected: page == 2) { setPage(2) }
+                RestoredPageButton(title: "SONG", systemImage: "list.number", selected: page == 3) { setPage(3) }
+                    .accessibilityIdentifier("songPageButton")
         }
         .padding(8)
         .frame(height: 54)
@@ -669,10 +672,11 @@ struct EditorView: View {
             }
             .buttonStyle(ArcadePressStyle(scale: 0.9))
             .accessibilityLabel(store.isPlaying ? "Stop playback" : "Start playback")
+            .accessibilityIdentifier("playStopButton")
             VStack(alignment: .leading, spacing: 2) {
                 Text(store.isPlaying ? "PLAYING" : "READY").font(.custom("Futura-Bold", size: 10)).foregroundStyle(Color.gbInk)
                 Text("STEP \(String(format: "%02d", max(0, currentStep + 1))) / 16").font(.custom("Futura-Medium", size: 8)).foregroundStyle(Color.gbInk.opacity(0.62))
-                if page == 3, currentSongSlot >= 0 { Text("BAR \(String(format: "%02d", currentSongSlot + 1))").font(.custom("Futura-Bold", size: 8)).foregroundStyle(Color.gbInk.opacity(0.68)) }
+                if page == 3, currentSongSlot >= 0 { Text("BAR \(String(format: "%02d", currentSongSlot + 1))").font(.custom("Futura-Bold", size: 8)).foregroundStyle(Color.gbInk.opacity(0.68)).accessibilityIdentifier("currentBarReadout") }
             }
             Spacer(minLength: 2)
             RestoredTempoBox(value: store.project.tempo) { value in store.updateTempo(value); requestPlaybackRefresh() }
@@ -1154,6 +1158,48 @@ struct EditorView: View {
             }
         }
     }
+    /// UI-test hook (launch argument gated, inert in normal use): builds a deterministic
+    /// 3-bar song arrangement — bar 1 assigned, bar 2 an intentional gap, bar 3 assigned —
+    /// so the loop-wrap regression test starts from a known state.
+    private func configureSongLoopUITestIfNeeded() {
+        guard ProcessInfo.processInfo.arguments.contains("--song-loop-ui-test") else { return }
+        // Start from a fresh project: the simulator's persisted library is whatever
+        // state the last manual session left behind, which is not deterministic.
+        store.newProject()
+        if store.project.patterns.count < 2 { _ = store.addPattern() }
+        let patterns = store.project.patterns
+        guard patterns.count >= 2 else { return }
+        _ = store.assignSongPattern(at: 0, patternID: patterns[0].id)
+        store.clearSongSlot(at: 1)
+        _ = store.assignSongPattern(at: 2, patternID: patterns[1].id)
+    }
+
+    /// LOOP END marker for the arrangement timeline: a glow line at the edge of the
+    /// last assigned bar (where playback wraps) plus a subtle dim over the dead zone
+    /// beyond it, so the repeat length reads at a glance while editing.
+    @ViewBuilder
+    private func songLoopMarkers(width: CGFloat) -> some View {
+        if store.project.hasAssignedSongPattern {
+            let totalSlots = max(1, store.songArrangementLength)
+            let loopBars = max(1, store.project.songSlotIndices.count)
+            let loopEndX = width / CGFloat(totalSlots) * CGFloat(loopBars)
+            let deadWidth = max(0, width - loopEndX)
+            if deadWidth > 0.5 {
+                Rectangle()
+                    .fill(Color.hardwareBlack.opacity(0.55))
+                    .frame(width: deadWidth)
+                    .position(x: loopEndX + deadWidth / 2, y: 11)
+                    .accessibilityHidden(true)
+            }
+            Capsule()
+                .fill(Color.gbGlow)
+                .frame(width: 2, height: 20)
+                .position(x: min(width - 1, max(1, loopEndX)), y: 11)
+                .shadow(color: Color.gbGlow.opacity(0.85), radius: 3)
+                .accessibilityLabel("Loop ends after bar \(loopBars)")
+        }
+    }
+
     /// Amber playhead sweeping the arrangement timeline. Positions against the trimmed
     /// playback loop (songSlotIndices) rather than the full slot grid, so it rides the
     /// music even when trailing empty bars fall outside the loop.
