@@ -3,8 +3,12 @@ import UniformTypeIdentifiers
 
 struct EditorView: View {
     @Environment(GameStore.self) private var store
+    @Environment(StoreKitManager.self) private var storeKit
     @State private var audio = ByteAudioEngine()
     @State private var page = 0
+    // The visible station can change immediately during playback while the audio source
+    // remains on its current station until the loop boundary.
+    @State private var audioPage = 0
     @State private var currentStep = -1
     @State private var currentSongSlot = -1
     @State private var pendingPatternID: UUID?
@@ -18,9 +22,22 @@ struct EditorView: View {
     @State private var showPatternRename = false
     @State private var patternRenameText = ""
     @State private var patternRenameID: UUID?
+    @State private var showDeletePatternConfirmation = false
+    @State private var patternIDToDelete: UUID?
+    @State private var showClearRowConfirmation = false
+    @State private var clearRowChannel: ByteChannel?
+    @State private var showClearSongSlotConfirmation = false
+    @State private var songSlotToClear: Int?
     @State private var playbackRefreshTask: Task<Void, Never>?
     @State private var scrubbedSongSlot: Int?
     @State private var songArrangementPage = 0
+    @State private var editorScrollMetrics = EditorScrollMetrics()
+    @State private var editorViewportHeight: CGFloat = 0
+    @State private var logoDragOffset: CGFloat = 0
+    @State private var logoDragStartFraction: CGFloat = 0
+    @State private var logoDragArmed = false
+    @State private var twoFingerScrollProxy: ScrollViewProxy?
+    @State private var twoFingerLastDy: CGFloat?
 
     private var pageTitle: String {
         switch page {
@@ -44,42 +61,213 @@ struct EditorView: View {
         ZStack {
             PocketBackdrop()
             GeometryReader { proxy in
-                ArcadeShell {
+                // A small negative overlap pulls the shell/header region upward toward
+                // the centered logo, removing the empty band visible beneath the branding.
+                ScrollViewReader { scrollProxy in
+                    // The shell sits flush beneath the brand block: the "DRAG LOGO TO
+                    // SCROLL" caption now occupies the band under the logo, so the old
+                    // negative overlap (which reclaimed that band) would cover it.
                     VStack(spacing: 0) {
-                        ScrollView(.vertical, showsIndicators: false) {
-                            restoredPageContent
-                                .frame(maxWidth: .infinity, alignment: .top)
-                                .padding(.horizontal, 10)
-                                .padding(.top, 10)
-                                .padding(.bottom, 18)
+                        // Keep the brand in its own safe-area row. This keeps it centered at
+                        // the physical top of the app instead of making it compete with the
+                        // Sequencer Ready status inside every page header. The logo itself is
+                        // the drag scroller: drag it up or down to glide through the page.
+                        VStack(spacing: 4) {
+                            topBrandMark
+                                .offset(y: logoDragOffset)
+                                .accessibilityHint("Drag up or down to scroll the page")
+                                .accessibilityAdjustableAction { direction in
+                                    switch direction {
+                                    case .increment: seekScroll(proxy: scrollProxy, fraction: min(1, scrollFraction + 0.12))
+                                    case .decrement: seekScroll(proxy: scrollProxy, fraction: max(0, scrollFraction - 0.12))
+                                    @unknown default: break
+                                    }
+                                }
+                            Text("DRAG LOGO TO SCROLL")
+                                .font(.custom("Futura-Bold", size: 7))
+                                .tracking(0.6)
+                                .foregroundStyle(Color.amber.opacity(0.75))
+                                // The caption rides along with the logo's drag
+                                // follow-offset so the whole brand block moves as one.
+                                .offset(y: logoDragOffset)
+                                .accessibilityHidden(true)
                         }
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .scrollBounceBehavior(.basedOnSize)
-                        .scrollIndicators(.hidden)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 72)
+                        // The WHOLE brand row is the drag surface — the row's layout now
+                        // contains the artwork itself, so the gesture can't be missed.
+                        // The logo artwork still follows the finger and springs back on
+                        // release.
+                        .contentShape(Rectangle())
+                        .gesture(
+                            DragGesture(minimumDistance: 0)
+                                .onChanged { gesture in
+                                    let overflow = editorScrollMetrics.contentHeight - editorViewportHeight
+                                    guard overflow > 8 else { return }
+                                    if !logoDragArmed {
+                                        // Arm the scrub at the current position on first touch.
+                                        logoDragArmed = true
+                                        logoDragStartFraction = scrollFraction
+                                    }
+                                    // The logo artwork follows the pull, clamped so it can't
+                                    // fly off the row — it springs back on release.
+                                    logoDragOffset = min(16, max(-16, gesture.translation.height))
+                                    // Pull-gain: the further you pull the logo, the more each
+                                    // point of pull scrolls. The ramp saturates at 34pt so gain
+                                    // stabilizes (~4.75x) instead of surging for the whole pull —
+                                    // a capped ramp keeps tracking speed steady and smooth.
+                                    let pull = gesture.translation.height
+                                    let magnitude = max(0, abs(pull) - 5)
+                                    let gain = 1 + min(37.5, magnitude) / 10
+                                    // Scrollbar-style direction: pull down -> the page scrolls
+                                    // down; pull up -> it scrolls back up. The target is
+                                    // recomputed from the pull start + the FULL translation on
+                                    // every event, so a dropped event can never lose movement.
+                                    let next = min(1, max(0, logoDragStartFraction + pull * gain / max(1, overflow)))
+                                    seekScroll(proxy: scrollProxy, fraction: next)
+                                }
+                                .onEnded { gesture in
+                                    logoDragArmed = false
+                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.72)) {
+                                        logoDragOffset = 0
+                                    }
+                                    // Flick-to-glide: a quick pull keeps coasting with an
+                                    // ease-out, so an immediate swipe travels a good distance
+                                    // instead of stopping when the finger lifts. The glide is
+                                    // capped at ~0.7 of a viewport so a hard flick covers about
+                                    // one screen (drag travel + glide), like native scroll.
+                                    let velocity = gesture.predictedEndTranslation.height - gesture.translation.height
+                                    let overflow = editorScrollMetrics.contentHeight - editorViewportHeight
+                                    guard overflow > 8, abs(velocity) > 150 else { return }
+                                    let glide = (velocity > 0 ? 1.0 : -1.0) * min(0.7, abs(velocity) / 1000 * 0.85)
+                                    let target = min(1, max(0, scrollFraction + glide * editorViewportHeight / max(1, overflow)))
+                                    seekScroll(proxy: scrollProxy, fraction: target, animate: true)
+                                }
+                        )
 
-                        restoredPageSwitcher
-                            .padding(.horizontal, 5)
-                            .padding(.top, 8)
-                            .padding(.bottom, max(6, proxy.safeAreaInsets.bottom))
-                            .background(Color.plastic.opacity(0.98))
+                        ArcadeShell {
+                            VStack(spacing: 0) {
+                                ScrollView(.vertical, showsIndicators: false) {
+                                    restoredPageContent
+                                        .frame(maxWidth: .infinity, alignment: .top)
+                                        .padding(.horizontal, 10)
+                                        .padding(.top, 10)
+                                        .padding(.bottom, 18)
+                                        // Track scroll metrics by reading the content frame directly
+                                        // instead of relying on preference propagation, which does
+                                        // not fire reliably inside this ScrollView hierarchy.
+                                        .background {
+                                            GeometryReader { contentProxy in
+                                                Color.clear
+                                                    .onAppear {
+                                                        editorScrollMetrics = EditorScrollMetrics(
+                                                            contentHeight: contentProxy.size.height,
+                                                            contentMinY: contentProxy.frame(in: .named("beatboi-editor-scroll")).minY
+                                                        )
+                                                    }
+                                                    .onChange(of: contentProxy.frame(in: .named("beatboi-editor-scroll")).minY) { _, newMinY in
+                                                        editorScrollMetrics = EditorScrollMetrics(
+                                                            contentHeight: contentProxy.size.height,
+                                                            contentMinY: newMinY
+                                                        )
+                                                    }
+                                            }
+                                        }
+                                        // Two-finger scroll bridge. Anchored to the scroll
+                                        // CONTENT so its superview chain reaches the backing
+                                        // UIScrollView; it drives the same seek pipeline as the
+                                        // logo drag with native-feel flick momentum.
+                                        .background {
+                                            TwoFingerScrollBridge(
+                                                onStart: { twoFingerLastDy = 0 },
+                                                onChanged: { twoFingerDragChanged($0) },
+                                                onEnd: { twoFingerDragEnded($0) }
+                                            )
+                                            .frame(width: 0, height: 0)
+                                        }
+                                        // The puck's seek targets hidden markers spread across the
+                                        // FULL content height. Overlay means zero layout impact, so
+                                        // it neither changes the measured metrics nor the scrollable
+                                        // area. Markers get REAL layout frames (a VStack of thin
+                                        // slices) so ScrollViewReader can resolve each id to its
+                                        // own position — .position() is only a geometry effect and
+                                        // every marker resolved to the same frame.
+                                        .overlay(alignment: .top) {
+                                            let markerHeight = max(1, editorScrollMetrics.contentHeight)
+                                            VStack(spacing: 0) {
+                                                ForEach(0..<561, id: \.self) { markerIndex in
+                                                    Color.clear
+                                                        .frame(width: 2, height: markerHeight / 561.0)
+                                                        .id("beatboi-scroll-marker-\(markerIndex)")
+                                                }
+                                            }
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .frame(height: markerHeight)
+                                            .allowsHitTesting(false)
+                                        }
+                                }
+                                .coordinateSpace(name: "beatboi-editor-scroll")
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .scrollBounceBehavior(.basedOnSize)
+                                .scrollIndicators(.hidden)
+                                .background {
+                                    GeometryReader { viewportProxy in
+                                        Color.clear
+                                            .onAppear {
+                                                editorViewportHeight = viewportProxy.size.height
+                                            }
+                                    }
+                                }
+                                .overlay(alignment: .trailing) {
+                                    EditorScrollBar(metrics: editorScrollMetrics)
+                                        .padding(.trailing, 3)
+                                        .allowsHitTesting(false)
+                                }
+
+                                restoredPageSwitcher
+                                    .padding(.horizontal, 5)
+                                    .padding(.top, 8)
+                                    .padding(.bottom, max(6, proxy.safeAreaInsets.bottom))
+                                    .background(Color.plastic.opacity(0.98))
+                            }
+                        }
+                        // The shell's compensating padding drops back to 29pt: the brand
+                        // row now uses its full 72pt (the caption lives in the band the
+                        // old -18 overlap reclaimed), so 72 + 29 keeps the shell at the
+                        // same on-screen position as the previous 72 - 18 + 47 layout.
+                        .padding(.top, 29)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
+                    .padding(.horizontal, 8)
+                    // Original brand-band padding, shifted up 47pt: the artwork now sits
+                    // at its ORIGINAL rendered position as REAL LAYOUT (no .offset
+                    // lift), so its hit area covers every visible pixel — the fix for
+                    // the dead-zone touches — while the pixels stay exactly where the
+                    // design put them. The shell padding below compensates by +29.
+                    .padding(.top, max(0, max(4, proxy.safeAreaInsets.top - 12) - 47))
+                    .padding(.bottom, 0)
+                    .onAppear {
+                        twoFingerScrollProxy = scrollProxy
+                        if ProcessInfo.processInfo.arguments.contains("-GBTwoFingerTest") {
+                            simulateTwoFingerSwipeForTesting()
+                        }
+                    }
+
+
                 }
-                .padding(.horizontal, 8)
-                .padding(.top, max(6, proxy.safeAreaInsets.top))
-                .padding(.bottom, 0)
             }
 
             if let toast = store.toast {
                 VStack {
                     Spacer()
                     Text(toast)
-                        .font(.system(size: 11, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 11))
                         .foregroundStyle(Color.gbInk)
                         .padding(.horizontal, 14)
                         .padding(.vertical, 10)
                         .background(Color.amber)
-                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.gbInk, lineWidth: 2))
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.gbInk, lineWidth: 2))
                         .padding(.bottom, 78)
                 }
                 .transition(.scale.combined(with: .opacity))
@@ -88,6 +276,17 @@ struct EditorView: View {
         .sheet(isPresented: $showLibrary) { ProjectLibraryView() }
         .sheet(isPresented: $showExport) { ExportView(useSongArrangement: page == 3) }
         .fileImporter(isPresented: $showImport, allowedContentTypes: [.bytePocketProject, .json, .bytePocketMIDI]) { importFile($0) }
+        .onChange(of: store.project.id) { _, _ in
+            // Project-library selection can happen while the sequencer is live. Publish
+            // the newly selected snapshot without restarting the transport.
+            requestPlaybackRefresh()
+        }
+        .onChange(of: store.project.modifiedAt) { _, _ in
+            // Importing or editing from a sheet may bypass an inline callback. The
+            // modified-date observation keeps the live audio snapshot in sync without
+            // restarting the transport or changing the visible station.
+            requestPlaybackRefresh()
+        }
         .alert("RENAME PATTERN", isPresented: $showPatternRename) {
             TextField("PATTERN NAME", text: $patternRenameText)
             Button("SAVE") {
@@ -95,6 +294,42 @@ struct EditorView: View {
             }
             Button("CANCEL", role: .cancel) {}
         } message: { Text("Name this pattern for Beatpad and Song Mode.") }
+        .alert("DELETE PATTERN?", isPresented: $showDeletePatternConfirmation) {
+            Button("DELETE", role: .destructive) {
+                if let patternIDToDelete {
+                    _ = store.deletePattern(patternIDToDelete)
+                    requestPlaybackRefresh()
+                }
+                self.patternIDToDelete = nil
+            }
+            Button("CANCEL", role: .cancel) { patternIDToDelete = nil }
+        } message: {
+            Text("This removes the pattern from the bank and Song Mode. You can use Undo immediately if you change your mind.")
+        }
+        .alert("CLEAR \(clearRowChannel?.title ?? "CHANNEL")?", isPresented: $showClearRowConfirmation) {
+            Button("CLEAR ROW", role: .destructive) {
+                if let clearRowChannel {
+                    store.clearChannelRow(clearRowChannel)
+                    requestPlaybackRefresh()
+                }
+                self.clearRowChannel = nil
+            }
+            Button("CANCEL", role: .cancel) { clearRowChannel = nil }
+        } message: {
+            Text("This removes every note from the selected channel row. Undo is available.")
+        }
+        .alert("CLEAR SONG BAR?", isPresented: $showClearSongSlotConfirmation) {
+            Button("CLEAR BAR", role: .destructive) {
+                if let songSlotToClear {
+                    store.clearSongSlot(at: songSlotToClear)
+                    requestPlaybackRefresh()
+                }
+                self.songSlotToClear = nil
+            }
+            Button("CANCEL", role: .cancel) { songSlotToClear = nil }
+        } message: {
+            Text("This removes the pattern assignment from this Song Mode bar. Undo is available.")
+        }
         .onDisappear { playbackRefreshTask?.cancel(); audio.stop() }
     }
 
@@ -106,30 +341,59 @@ struct EditorView: View {
         else { restoredSongPage }
     }
 
+    private var topBrandMark: some View {
+        Image("beatboi")
+            .resizable()
+            .scaledToFit()
+            .frame(width: 216, height: 46)
+            // NOTE: no .offset() here. The row's top padding places this artwork
+            // at its original rendered position as genuine layout, so hit-testing
+            // matches the pixels (an .offset lift renders outside the touchable
+            // bounds, which is what made the logo feel untouchable before).
+            .padding(.horizontal, 12)
+            .accessibilityLabel("BEATBOI")
+            .accessibilityValue(String(format: "%.2f", scrollFraction))
+            .accessibilityIdentifier("beatboi-logo")
+            .accessibilityAddTraits(.isHeader)
+    }
+
     private var restoredHeader: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center, spacing: 10) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Image("beatboi")
-                        .resizable()
-                        .scaledToFit()
-                        .frame(width: 132, height: 32, alignment: .leading)
-                        .accessibilityLabel("BEATBOI")
-                    HStack(spacing: 5) {
-                        Circle()
-                            .fill(store.isPlaying ? Color.arcadeRed : Color.gbGlow)
-                            .frame(width: 6, height: 6)
-                        Text(store.isPlaying ? "SEQUENCER LIVE" : "SEQUENCER READY")
-                            .font(.system(size: 7, weight: .black, design: .monospaced))
-                            .foregroundStyle(Color.mutedText)
-                    }
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(store.isPlaying ? Color.arcadeRed : Color.gbGlow)
+                        .frame(width: 6, height: 6)
+                    Text(store.isPlaying ? "SEQUENCER LIVE" : "SEQUENCER READY")
+                        .font(.custom("Futura-Bold", size: 8))
+                        .foregroundStyle(Color.mutedText)
                 }
                 Spacer(minLength: 4)
+                // Visible only once the receipt backs the Export Pack entitlement.
+                if storeKit.hasReceiptEntitlement {
+                    HStack(spacing: 4) {
+                        Image(systemName: "lock.open.fill")
+                            .font(.system(size: 9, weight: .black))
+                        Text("EXPORT PACK")
+                            .font(.custom("Futura-Bold", size: 8))
+                            .tracking(0.6)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
+                    }
+                    .foregroundStyle(Color.gbGlow)
+                    .padding(.horizontal, 9)
+                    .frame(minHeight: 32)
+                    .background(Color.hardwareBlack)
+                    .clipShape(Capsule())
+                    .overlay(Capsule().stroke(Color.gbGlow.opacity(0.55), lineWidth: 1))
+                    .accessibilityLabel("Export Pack unlocked")
+                    .accessibilityIdentifier("exportPackBadge")
+                }
                 HStack(spacing: 6) {
                     Image(systemName: "waveform")
                         .font(.system(size: 11, weight: .black))
                     Text(pageTitle)
-                        .font(.system(size: 8, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 8))
                         .tracking(0.7)
                 }
                 .foregroundStyle(Color.gbLight)
@@ -141,7 +405,7 @@ struct EditorView: View {
             }
             HStack(spacing: 8) {
                 Text(page == 0 ? "PERFORMANCE / 4 PARTS" : page == 1 ? "SOUND DESIGN / PATCH" : page == 2 ? "EFFECTS / BUS + SENDS" : "ARRANGEMENT / \(store.songArrangementLength) SLOTS")
-                    .font(.system(size: 8, weight: .black, design: .monospaced))
+                    .font(.custom("Futura-Bold", size: 8))
                     .tracking(0.6)
                     .foregroundStyle(Color.amber)
                     .lineLimit(1)
@@ -156,17 +420,18 @@ struct EditorView: View {
                         store.redo()
                         requestPlaybackRefresh()
                     }
-                    RestoredHeaderIcon(systemImage: "folder.fill") { showLibrary = true }
-                    RestoredHeaderIcon(systemImage: "square.and.arrow.up") { showExport = true }
+                    RestoredHeaderIcon(systemImage: "folder.fill", label: "Open project library") { showLibrary = true }
+                    RestoredHeaderIcon(systemImage: "square.and.arrow.down", label: "Import project") { showImport = true }
+                    RestoredHeaderIcon(systemImage: "square.and.arrow.up", label: "Export project") { showExport = true }
                 }
             }
         }
-        .padding(10)
+        .padding(12)
         .background(
             LinearGradient(colors: [Color.plasticRaised.opacity(0.92), Color.hardwareBlack.opacity(0.96)], startPoint: .topLeading, endPoint: .bottomTrailing)
         )
-        .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 15, style: .continuous).stroke(Color.plasticHighlight.opacity(0.8), lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.plasticHighlight.opacity(0.8), lineWidth: 1))
         .overlay(alignment: .bottom) { Rectangle().fill(Color.amber.opacity(0.72)).frame(height: 2).padding(.horizontal, 10) }
     }
 
@@ -174,10 +439,7 @@ struct EditorView: View {
         VStack(spacing: 10) {
             restoredHeader
             HardwareSection(title: "PERFORMANCE", detail: "16 STEP / LIVE") {
-                VStack(spacing: 9) {
-                    restoredTransport
-                    restoredPatternActions
-                }
+                restoredConsole
             }
             restoredVoicing
             // The mixer cards are the Beatpad channel selectors. Tapping a card selects
@@ -193,12 +455,9 @@ struct EditorView: View {
         VStack(spacing: 10) {
             restoredHeader
             HardwareSection(title: "SOUND LAB", detail: "SELECT A PART TO EDIT") {
-                VStack(spacing: 9) {
-                    restoredTransport
-                    restoredPatternActions
-                    restoredChannelTabs
-                }
+                restoredConsole
             }
+            restoredChannelTabs
             restoredChannelMixer
             restoredVoicing
             restoredSoundLab
@@ -210,10 +469,7 @@ struct EditorView: View {
         VStack(spacing: 10) {
             restoredHeader
             HardwareSection(title: "FX STATION", detail: "GLOBAL BUS / CHANNEL ROUTING") {
-                VStack(spacing: 9) {
-                    restoredTransport
-                    restoredPatternActions
-                }
+                restoredConsole
             }
             fxStation
             restoredChannelMixer
@@ -227,7 +483,7 @@ struct EditorView: View {
             restoredHeader
             HardwareSection(title: "SONG MACHINE", detail: "\(store.songArrangementLength) BARS / LOOP-BOUNDARY SAFE") {
                 VStack(spacing: 9) {
-                    restoredTransport
+                    restoredConsole
                     songTimelineReadout
                 }
             }
@@ -242,11 +498,11 @@ struct EditorView: View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(alignment: .firstTextBaseline) {
                 Text(store.isPlaying ? "ARRANGEMENT PLAYING" : "ARRANGEMENT READY")
-                    .font(.system(size: 9, weight: .black, design: .monospaced))
+                    .font(.custom("Futura-Bold", size: 9))
                     .foregroundStyle(Color.gbLight)
                 Spacer()
                 Text(arrangementReadoutSlot.map { "BAR \(String(format: "%02d", $0 + 1)) / \(store.songArrangementLength)" } ?? "BAR — / \(store.songArrangementLength)")
-                    .font(.system(size: 8, weight: .black, design: .monospaced))
+                    .font(.custom("Futura-Bold", size: 8))
                     .foregroundStyle(arrangementReadoutSlot.map { restoredSongColor(at: $0) } ?? Color.amber)
             }
             HStack(spacing: 3) {
@@ -264,7 +520,7 @@ struct EditorView: View {
                             }
                         }
                         if let scrubbedSongSlot {
-                            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
                                 .stroke(restoredSongColor(at: scrubbedSongSlot), lineWidth: 2)
                                 .frame(width: max(10, proxy.size.width / CGFloat(max(1, store.songArrangementLength)) - 2), height: 28)
                                 .position(
@@ -279,49 +535,59 @@ struct EditorView: View {
                             let stepProgress = CGFloat(max(0, min(15, currentStep))) / 16.0
                             let playheadX = proxy.size.width * (CGFloat(currentSongSlot) + stepProgress + 0.5) / totalBars
                             Capsule()
-                                .fill(Color.gbLight)
+                                .fill(Color.amber)
                                 .frame(width: 3, height: 27)
                                 .position(x: min(proxy.size.width - 2, max(2, playheadX)), y: 11)
-                                .shadow(color: Color.gbLight.opacity(0.95), radius: 5)
+                                .shadow(color: Color.amber.opacity(0.95), radius: 6)
+                                .beatGlow(active: true, phase: currentStep, color: .amber)
                                 .animation(.linear(duration: 0.08), value: currentStep)
                                 .animation(.easeOut(duration: 0.12), value: currentSongSlot)
                                 .accessibilityHidden(true)
                         }
                     }
                     .contentShape(Rectangle())
-                    .gesture(DragGesture(minimumDistance: 0).onChanged { gesture in
+                    // Direction-gated: a mostly-vertical drag belongs to the page scroll,
+                    // so the timeline only claims horizontal strokes (and plain taps).
+                    .gesture(DragGesture(minimumDistance: 8).onChanged { gesture in
+                        let dx = abs(gesture.translation.width)
+                        let dy = abs(gesture.translation.height)
+                        guard dx >= dy else { return }
                         scrubSongTimeline(at: gesture.location.x, width: proxy.size.width)
                     }.onEnded { gesture in
-                        scrubSongTimeline(at: gesture.location.x, width: proxy.size.width, commit: true)
+                        let dx = abs(gesture.translation.width)
+                        let dy = abs(gesture.translation.height)
+                        if gesture.translation.height == 0 || dx >= dy {
+                            scrubSongTimeline(at: gesture.location.x, width: proxy.size.width, commit: true)
+                        }
                     })
                 }
                 .frame(height: 22)
             }
             HStack(spacing: 5) {
                 Circle()
-                    .fill(Color.gbLight)
+                    .fill(Color.amber)
                     .frame(width: 5, height: 5)
-                    .shadow(color: Color.gbLight.opacity(0.9), radius: 3)
+                    .shadow(color: Color.amber.opacity(0.9), radius: 3)
                 Text("PLAYHEAD")
-                    .font(.system(size: 6, weight: .black, design: .monospaced))
-                    .foregroundStyle(Color.gbLight)
+                    .font(.custom("Futura-Bold", size: 8))
+                    .foregroundStyle(Color.amber)
                 Text("·")
                     .foregroundStyle(Color.mutedText)
                 Text("OUTLINE = SELECTED BAR")
-                    .font(.system(size: 6, weight: .black, design: .monospaced))
+                    .font(.custom("Futura-Bold", size: 8))
                     .foregroundStyle(Color.mutedText)
                 Spacer(minLength: 0)
             }
             Text("DRAG THE TIMELINE TO AUDITION A BAR  ·  ACTIVE PATTERN COLOR MATCHES BELOW")
-                .font(.system(size: 6, weight: .black, design: .monospaced))
+                .font(.custom("Futura-Bold", size: 8))
                 .foregroundStyle(Color.mutedText)
             .animation(.easeOut(duration: 0.12), value: currentSongSlot)
             .accessibilityHidden(true)
         }
-        .padding(10)
+        .padding(12)
         .background(Color.hardwareBlack.opacity(0.72))
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.plasticHighlight.opacity(0.6), lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.plasticHighlight.opacity(0.6), lineWidth: 1))
     }
 
     private var songArrangementPanel: some View {
@@ -330,16 +596,16 @@ struct EditorView: View {
                 arrangementPageSelector
                 HStack(spacing: 5) {
                     Text("LENGTH")
-                        .font(.system(size: 7, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 8))
                         .foregroundStyle(Color.screenShadow)
                     ForEach([16, 32, 64], id: \.self) { length in
                         Button { setSongArrangementLength(length) } label: {
                             Text("\(length)")
-                                .font(.system(size: 8, weight: .black, design: .monospaced))
+                                .font(.custom("Futura-Bold", size: 8))
                                 .foregroundStyle(store.songArrangementLength == length ? Color.gbInk : Color.screenShadow)
                                 .frame(minWidth: 38, minHeight: 30)
                                 .background(store.songArrangementLength == length ? Color.amber : Color.screenShadow.opacity(0.12))
-                                .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.screenShadow.opacity(0.55), lineWidth: 1))
+                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.screenShadow.opacity(0.55), lineWidth: 1))
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel("\(length) bar arrangement")
@@ -347,15 +613,22 @@ struct EditorView: View {
                     }
                     Spacer()
                     Text("TAP ASSIGN · SWIPE ↑↓ CYCLE")
-                        .font(.system(size: 6, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 8))
                         .foregroundStyle(Color.screenShadow)
                 }
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 5), count: 4), spacing: 7) {
                     ForEach(songArrangementPageStart..<songArrangementPageEnd, id: \.self) { index in
                         RestoredSongPad(index: index, slot: store.songSlot(at: index), pattern: restoredSongPattern(at: index), color: restoredSongColor(at: index), current: index == currentSongSlot) {
-                            if store.songSlot(at: index).patternID == nil { store.assignSongPattern(at: index, patternID: store.currentPatternID) } else { store.clearSongSlot(at: index) }
-                            requestPlaybackRefresh()
+                            Haptics.selection()
+                            if store.songSlot(at: index).patternID == nil {
+                                _ = store.assignSongPattern(at: index, patternID: store.currentPatternID)
+                                requestPlaybackRefresh()
+                            } else {
+                                songSlotToClear = index
+                                showClearSongSlotConfirmation = true
+                            }
                         } onCycle: { delta in
+                            Haptics.tap()
                             store.cycleSongSlot(at: index, delta: delta)
                             requestPlaybackRefresh()
                         }
@@ -372,67 +645,78 @@ struct EditorView: View {
             RestoredPageButton(title: "FX", systemImage: "dot.radiowaves.left.and.right", selected: page == 2) { setPage(2) }
             RestoredPageButton(title: "SONG", systemImage: "list.number", selected: page == 3) { setPage(3) }
         }
-        .padding(5)
+        .padding(8)
         .frame(height: 54)
         .background(
             LinearGradient(colors: [Color.plasticRaised.opacity(0.98), Color.hardwareBlack.opacity(0.98)], startPoint: .top, endPoint: .bottom)
         )
-        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.plasticHighlight.opacity(0.78), lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.plasticHighlight.opacity(0.78), lineWidth: 1))
         .overlay(alignment: .top) { Rectangle().fill(Color.plasticHighlight.opacity(0.42)).frame(height: 1).padding(.horizontal, 14) }
         .accessibilityElement(children: .contain)
     }
 
-    private var restoredTransport: some View {
-        LCDPanel(title: "TRANSPORT / \(store.project.name)") {
-            HStack(spacing: 9) {
-                Button { togglePlayback() } label: {
-                    ZStack {
-                        Circle().fill(store.isPlaying ? Color.arcadeRed : Color.gbDeep).frame(width: 48, height: 48).overlay(Circle().stroke(Color.gbInk, lineWidth: 2))
-                        Image(systemName: store.isPlaying ? "stop.fill" : "play.fill").font(.system(size: 18, weight: .black)).foregroundStyle(Color.gbLight)
-                    }
-                }
-                .buttonStyle(ArcadePressStyle(scale: 0.9))
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(store.isPlaying ? "PLAYING" : "READY").font(.system(size: 10, weight: .black, design: .monospaced)).foregroundStyle(Color.gbInk)
-                    Text("STEP \(String(format: "%02d", max(0, currentStep + 1))) / 16").font(.system(size: 9, weight: .bold, design: .monospaced)).foregroundStyle(Color.gbInk.opacity(0.62))
-                    if page == 3, currentSongSlot >= 0 { Text("BAR \(String(format: "%02d", currentSongSlot + 1))").font(.system(size: 8, weight: .black, design: .monospaced)).foregroundStyle(Color.gbInk.opacity(0.68)) }
-                }
-                Spacer(minLength: 2)
-                RestoredTempoBox(value: store.project.tempo) { value in store.updateTempo(value); requestPlaybackRefresh() }
-                if page == 0 { RestoredDiceButton(label: "Randomize melody") { randomizeMelody() } }
-                if page == 1 { RestoredDiceButton(label: "Randomize sound") { randomizeSound() } }
+    /// Shared console: transport plus pattern bank live in one LCD panel so every station
+    /// starts from the same familiar hardware strip instead of stacked duplicate blocks.
+    private var restoredConsole: some View {
+        LCDPanel(title: "CONSOLE / \(store.project.name)") {
+            VStack(spacing: 8) {
+                consoleTransportRow
+                Rectangle()
+                    .fill(Color.screenShadow.opacity(0.30))
+                    .frame(height: 1)
+                consolePatternRow
             }
         }
     }
 
-    private var restoredPatternActions: some View {
+    private var consoleTransportRow: some View {
+        HStack(spacing: 9) {
+            Button { togglePlayback() } label: {
+                ZStack {
+                    Circle().fill(store.isPlaying ? Color.arcadeRed : Color.gbDeep).frame(width: 44, height: 44).overlay(Circle().stroke(Color.gbInk, lineWidth: 2))
+                    Image(systemName: store.isPlaying ? "stop.fill" : "play.fill").font(.system(size: 17, weight: .black)).foregroundStyle(Color.gbLight)
+                }
+            }
+            .buttonStyle(ArcadePressStyle(scale: 0.9))
+            .accessibilityLabel(store.isPlaying ? "Stop playback" : "Start playback")
+            VStack(alignment: .leading, spacing: 2) {
+                Text(store.isPlaying ? "PLAYING" : "READY").font(.custom("Futura-Bold", size: 10)).foregroundStyle(Color.gbInk)
+                Text("STEP \(String(format: "%02d", max(0, currentStep + 1))) / 16").font(.custom("Futura-Medium", size: 8)).foregroundStyle(Color.gbInk.opacity(0.62))
+                if page == 3, currentSongSlot >= 0 { Text("BAR \(String(format: "%02d", currentSongSlot + 1))").font(.custom("Futura-Bold", size: 8)).foregroundStyle(Color.gbInk.opacity(0.68)) }
+            }
+            Spacer(minLength: 2)
+            RestoredTempoBox(value: store.project.tempo) { value in store.updateTempo(value); requestPlaybackRefresh() }
+        }
+    }
+
+    private var consolePatternRow: some View {
         VStack(alignment: .leading, spacing: 7) {
-            HStack {
+            HStack(spacing: 6) {
                 Text("PATTERN BANK")
-                    .font(.system(size: 9, weight: .black, design: .monospaced))
-                    .tracking(1.1)
-                    .foregroundStyle(Color.gbLight)
-                Spacer()
-                Text("\(store.project.patterns.count) / 16")
-                    .font(.system(size: 8, weight: .black, design: .monospaced))
-                    .foregroundStyle(Color.gbGlow)
+                    .font(.custom("Futura-Bold", size: 8))
+                    .tracking(0.9)
+                    .foregroundStyle(Color.gbInk)
+                Text("\(store.project.patterns.count) / \(ByteProject.maximumPatternCount)")
+                    .font(.custom("Futura-Bold", size: 8))
+                    .foregroundStyle(Color.gbInk.opacity(0.62))
+                Spacer(minLength: 2)
+                Text("HOLD TO RENAME")
+                    .font(.custom("Futura-Bold", size: 8))
+                    .foregroundStyle(Color.screenShadow.opacity(0.85))
             }
             restoredPatternSelector
             HStack(spacing: 6) {
                 RestoredActionButton(systemImage: "plus.square", label: "New pattern", disabled: store.project.patterns.count >= ByteProject.maximumPatternCount) { store.addPattern(); requestPlaybackRefresh() }
                 RestoredActionButton(systemImage: "doc.on.doc", label: "Copy pattern", disabled: store.project.patterns.count >= ByteProject.maximumPatternCount) { store.duplicateCurrentPattern(); requestPlaybackRefresh() }
-                RestoredActionButton(systemImage: "trash", label: "Delete pattern", destructive: true, disabled: store.project.patterns.count <= 1) { _ = store.deletePattern(store.currentPatternID); requestPlaybackRefresh() }
+                RestoredActionButton(systemImage: "trash", label: "Delete pattern", destructive: true, disabled: store.project.patterns.count <= 1) {
+                    guard store.project.patterns.count > 1 else { return }
+                    patternIDToDelete = store.currentPatternID
+                    showDeletePatternConfirmation = true
+                }
                 Spacer(minLength: 0)
-                Text("HOLD TO RENAME")
-                    .font(.system(size: 7, weight: .black, design: .monospaced))
-                    .foregroundStyle(Color.mutedText)
             }
         }
-        .padding(11)
-        .background(LinearGradient(colors: [Color.plasticRaised.opacity(0.82), Color.hardwareBlack.opacity(0.72)], startPoint: .topLeading, endPoint: .bottomTrailing))
-        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.plasticHighlight.opacity(0.7), lineWidth: 1))
     }
 
     private var restoredPatternSelector: some View {
@@ -442,12 +726,12 @@ struct EditorView: View {
                     .font(.system(size: 11, weight: .black))
                     .foregroundStyle(Color.amber)
                 Text(selectedPattern.name)
-                    .font(.system(size: 10, weight: .black, design: .monospaced))
+                    .font(.custom("Futura-Bold", size: 10))
                     .foregroundStyle(Color.gbLight)
                     .lineLimit(1)
                 Spacer(minLength: 4)
                 Text("HOLD TO RENAME")
-                    .font(.system(size: 6, weight: .black, design: .monospaced))
+                    .font(.custom("Futura-Bold", size: 8))
                     .foregroundStyle(Color.mutedText)
             }
             ScrollView(.horizontal, showsIndicators: false) {
@@ -458,9 +742,9 @@ struct EditorView: View {
                         } label: {
                             VStack(spacing: 2) {
                                 Text(String(format: "%02d", index + 1))
-                                    .font(.system(size: 8, weight: .black, design: .monospaced))
+                                    .font(.custom("Futura-Bold", size: 8))
                                 Text(pattern.name.replacingOccurrences(of: "PATTERN ", with: "P"))
-                                    .font(.system(size: 7, weight: .bold, design: .monospaced))
+                                    .font(.custom("Futura-Medium", size: 8))
                                     .lineLimit(1)
                                     .minimumScaleFactor(0.6)
                             }
@@ -486,10 +770,10 @@ struct EditorView: View {
                 if target != lastPatternDragIndex { lastPatternDragIndex = target; requestPatternSelection(store.project.patterns[target].id) }
             }.onEnded { _ in patternDragStartIndex = nil; lastPatternDragIndex = nil })
         }
-        .padding(9)
+        .padding(12)
         .background(Color.hardwareBlack.opacity(0.62))
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.plasticHighlight.opacity(0.72), lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.plasticHighlight.opacity(0.72), lineWidth: 1))
     }
 
     private func restoredPatternColor(index: Int, selected: Bool) -> Color {
@@ -500,7 +784,7 @@ struct EditorView: View {
     private var restoredVoicing: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("VOICING")
-                .font(.system(size: 8, weight: .black, design: .monospaced))
+                .font(.custom("Futura-Bold", size: 8))
                 .tracking(1)
                 .foregroundStyle(Color.mutedText)
             HStack(spacing: 6) {
@@ -508,18 +792,18 @@ struct EditorView: View {
                 RestoredChoiceBox(title: "MODE", value: store.project.mode.title, values: ByteScaleMode.allCases.map(\.title), index: ByteScaleMode.allCases.firstIndex(of: store.project.mode) ?? 0) { index in updateVoicing(mode: ByteScaleMode.allCases[index]) }
             }
         }
-        .padding(10)
+        .padding(12)
         .background(
             LinearGradient(colors: [Color.plasticRaised.opacity(0.72), Color.hardwareBlack.opacity(0.74)], startPoint: .topLeading, endPoint: .bottomTrailing)
         )
-        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.plasticHighlight.opacity(0.55), lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.plasticHighlight.opacity(0.55), lineWidth: 1))
     }
 
     private var restoredChannelTabs: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("EDIT CHANNEL")
-                .font(.system(size: 8, weight: .black, design: .monospaced))
+                .font(.custom("Futura-Bold", size: 8))
                 .tracking(1)
                 .foregroundStyle(Color.mutedText)
             HStack(spacing: 4) {
@@ -531,24 +815,24 @@ struct EditorView: View {
                                 .frame(width: 7, height: 7)
                                 .shadow(color: restoredChannelAccent(channel).opacity(0.75), radius: 3)
                             Text(channel.title)
-                                .font(.system(size: 7, weight: .black, design: .monospaced))
+                                .font(.custom("Futura-Bold", size: 8))
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.65)
                         }
                         .foregroundStyle(store.selectedChannel == channel ? Color.gbInk : Color.gbLight.opacity(0.82))
                         .frame(maxWidth: .infinity, minHeight: 46)
                         .background(store.selectedChannel == channel ? Color.amber : restoredChannelAccent(channel).opacity(0.18))
-                        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(store.selectedChannel == channel ? Color.gbInk : Color.plasticHighlight, lineWidth: 1))
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(store.selectedChannel == channel ? Color.gbInk : Color.plasticHighlight, lineWidth: 1))
                     }
                     .buttonStyle(.plain)
                 }
             }
         }
-        .padding(9)
+        .padding(12)
         .background(Color.plasticRaised.opacity(0.42))
-        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.plasticHighlight.opacity(0.55), lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.plasticHighlight.opacity(0.55), lineWidth: 1))
     }
 
     private var restoredChannelMixer: some View {
@@ -556,38 +840,40 @@ struct EditorView: View {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("CHANNEL MIXER")
-                        .font(.system(size: 10, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 10))
                         .tracking(1.0)
                         .foregroundStyle(Color.gbLight)
                     Text("TAP TO EDIT  ·  SWIPE ↔ TO MIX")
-                        .font(.system(size: 7, weight: .bold, design: .monospaced))
+                        .font(.custom("Futura-Medium", size: 8))
                         .foregroundStyle(Color.mutedText)
                 }
                 Spacer()
                 Text("MASTER")
-                    .font(.system(size: 7, weight: .black, design: .monospaced))
+                    .font(.custom("Futura-Bold", size: 8))
                     .foregroundStyle(Color.gbGlow)
             }
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 6), GridItem(.flexible(), spacing: 6)], spacing: 6) {
                 ForEach(ByteChannel.allCases) { channel in
-                    RestoredChannelFader(channel: channel, accent: restoredChannelAccent(channel), volume: store.channelVolumePercent(channel), selected: store.selectedChannel == channel, muted: store.isChannelMuted(channel), soloed: store.isChannelSoloed(channel), onSelect: { store.selectedChannel = channel; store.selectedStep = nil }, onChange: { value in store.setChannelVolume(channel: channel, percent: value); requestPlaybackRefresh() }, onToggleMute: { store.toggleChannelMute(channel); requestPlaybackRefresh() }, onToggleSolo: { store.toggleChannelSolo(channel); requestPlaybackRefresh() })
+                    RestoredChannelFader(channel: channel, accent: restoredChannelAccent(channel), volume: store.channelVolumePercent(channel), activity: store.channelActivityLevel(channel, step: currentStep, songSlot: page == 3 ? currentSongSlot : -1), selected: store.selectedChannel == channel, muted: store.isChannelMuted(channel), soloed: store.isChannelSoloed(channel), onSelect: { store.selectedChannel = channel; store.selectedStep = nil }, onChange: { value in store.setChannelVolume(channel: channel, percent: value); requestPlaybackRefresh() }, onToggleMute: { store.toggleChannelMute(channel); Haptics.toggle(); requestPlaybackRefresh() }, onToggleSolo: { store.toggleChannelSolo(channel); Haptics.toggle(); requestPlaybackRefresh() })
                 }
             }
         }
-        .padding(9)
+        .padding(12)
         .background(
             LinearGradient(colors: [Color.plasticRaised.opacity(0.74), Color.hardwareBlack.opacity(0.78)], startPoint: .topLeading, endPoint: .bottomTrailing)
         )
-        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.plasticHighlight.opacity(0.68), lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.plasticHighlight.opacity(0.68), lineWidth: 1))
     }
 
     private var restoredPadEditor: some View {
-        LCDPanel(title: "\(store.selectedChannel.title) / 16 STEP LOOP") {
+        LCDPanel(title: "\(store.selectedChannel.title) / 16 STEP LOOP", header: {
+            RestoredDiceButton(label: "Randomize melody", compact: true, live: store.isPlaying) { randomizeMelody() }
+        }) {
             VStack(spacing: 6) {
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 4), spacing: 6) {
                     ForEach(0..<16, id: \.self) { step in
-                        RestoredNotePad(step: step, note: selectedChannelNotes[step], length: store.noteLength(channel: store.selectedChannel, step: step), covered: store.isStepCovered(channel: store.selectedChannel, step: step), channel: store.selectedChannel, accent: restoredChannelAccent(store.selectedChannel), current: step == currentStep, linkSource: noteLinkSourceStep == step, linkArmed: noteLinkSourceStep != nil && noteLinkSourceStep != step, noteName: noteName, drumName: drumName) {
+                        RestoredNotePad(step: step, note: selectedChannelNotes[step], length: store.noteLength(channel: store.selectedChannel, step: step), covered: store.isStepCovered(channel: store.selectedChannel, step: step), channel: store.selectedChannel, rootNote: store.selectedChannel.rootNote(for: store.project.key), accent: restoredChannelAccent(store.selectedChannel), current: step == currentStep, phase: currentStep, linkSource: noteLinkSourceStep == step, linkArmed: noteLinkSourceStep != nil && noteLinkSourceStep != step, noteName: noteName, drumName: drumName) {
                             if let source = noteLinkSourceStep, source != step, step > source {
                                 store.setNoteLength(channel: store.selectedChannel, step: source, length: step - source)
                                 noteLinkSourceStep = nil
@@ -601,7 +887,7 @@ struct EditorView: View {
                     }
                 }
                 Text(store.selectedChannel == .drum ? "TAP: KICK ON / OFF  •  DRAG UP/DOWN: CHANGE VOICE" : (noteLinkSourceStep == nil ? "TAP: ON / OFF  •  HOLD: ARM LINK  •  DRAG UP/DOWN: PITCH" : "LINK ARMED  •  TAP A PAD TO SET THE NOTE END"))
-                    .font(.system(size: 7, weight: .black, design: .monospaced)).foregroundStyle(Color.gbInk.opacity(0.62)).frame(maxWidth: .infinity, alignment: .leading)
+                    .font(.custom("Futura-Bold", size: 8)).foregroundStyle(Color.gbInk.opacity(0.62)).frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }
@@ -624,23 +910,23 @@ struct EditorView: View {
                     }
                 )
             } else {
-                LCDPanel(title: "\(store.selectedChannel.title) / SYNTH PATCH") {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
+                LCDPanel(title: "\(store.selectedChannel.title) / SYNTH PATCH", header: {
+            RestoredDiceButton(label: "Randomize sound", compact: true, live: store.isPlaying) { randomizeSound() }
+        }) {
+            VStack(alignment: .leading, spacing: 6) {
+                        HStack(alignment: .center, spacing: 6) {
                             Text("TOUCH PARAMETERS")
-                                .font(.system(size: 8, weight: .black, design: .monospaced))
+                                .font(.custom("Futura-Bold", size: 8))
                                 .foregroundStyle(Color.gbInk)
-                            Spacer()
                             Text("SELECT + DRAG ↔")
-                                .font(.system(size: 7, weight: .black, design: .monospaced))
+                                .font(.custom("Futura-Bold", size: 8))
                                 .foregroundStyle(Color.screenShadow)
                         }
-                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 6), GridItem(.flexible(), spacing: 6)], spacing: 6) {
-                            ForEach(restoredParameters(for: store.selectedChannel)) { parameter in
+                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 5), GridItem(.flexible(), spacing: 5)], spacing: 5) {                            ForEach(restoredParameters(for: store.selectedChannel)) { parameter in
                                 RestoredPatchCard(parameter: parameter, patch: store.patch(for: store.selectedChannel), selected: store.selectedPatchParameter[store.selectedChannel] == parameter) {
                                     store.selectedPatchParameter[store.selectedChannel] = parameter
-                                } onChange: { delta in
-                                    store.adjustSelectedPatch(channel: store.selectedChannel, parameter: parameter, delta: delta)
+                                } onChange: { value in
+                                    store.setPatchValue(channel: store.selectedChannel, parameter: parameter, value: value)
                                     requestPlaybackRefresh()
                                 }
                             }
@@ -667,23 +953,23 @@ struct EditorView: View {
             }
             VStack(alignment: .leading, spacing: 3) {
                 Text(store.selectedChannel.title)
-                    .font(.system(size: 15, weight: .black, design: .monospaced))
+                    .font(.custom("Futura-Bold", size: 15))
                     .foregroundStyle(Color.gbLight)
                 Text(store.selectedChannel == .drum ? "RHYTHM VOICES / SAMPLE + MIX" : "SYNTH PATCH / TOUCH TO SELECT")
-                    .font(.system(size: 7, weight: .bold, design: .monospaced))
+                    .font(.custom("Futura-Medium", size: 8))
                     .foregroundStyle(Color.mutedText)
                 Text("DRAG HORIZONTAL TO CHANGE THE SELECTED CONTROL")
-                    .font(.system(size: 7, weight: .black, design: .monospaced))
+                    .font(.custom("Futura-Bold", size: 8))
                     .foregroundStyle(Color.gbGlow)
                     .lineLimit(1)
                     .minimumScaleFactor(0.65)
             }
             Spacer(minLength: 4)
         }
-        .padding(10)
+        .padding(12)
         .background(LinearGradient(colors: [Color.plasticRaised.opacity(0.88), Color.hardwareBlack.opacity(0.86)], startPoint: .topLeading, endPoint: .bottomTrailing))
-        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous).stroke(restoredChannelAccent(store.selectedChannel).opacity(0.72), lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(restoredChannelAccent(store.selectedChannel).opacity(0.72), lineWidth: 1))
     }
 
     private var fxStation: some View {
@@ -701,27 +987,27 @@ struct EditorView: View {
                     }
                     VStack(alignment: .leading, spacing: 2) {
                         Text(store.isPlaying ? "EFFECT BUS LIVE" : "EFFECT BUS READY")
-                            .font(.system(size: 8, weight: .black, design: .monospaced))
+                            .font(.custom("Futura-Bold", size: 8))
                             .foregroundStyle(Color.gbInk)
                         Text("GLOBAL BUS / ECHO + BIT CRUSH")
-                            .font(.system(size: 6, weight: .bold, design: .monospaced))
+                            .font(.custom("Futura-Medium", size: 8))
                             .foregroundStyle(Color.screenShadow)
                     }
                     Spacer()
                     Text("STEP \(String(format: "%02d", max(0, currentStep + 1)))")
-                        .font(.system(size: 7, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 8))
                         .foregroundStyle(Color.screenShadow)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 4)
                         .background(Color.screenShadow.opacity(0.10))
-                        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                 }
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel(store.isPlaying ? "Effect bus live" : "Effect bus ready")
                 .accessibilityValue("Step \(max(0, currentStep + 1))")
 
                 Text("EFFECT MODULES")
-                    .font(.system(size: 7, weight: .black, design: .monospaced))
+                    .font(.custom("Futura-Bold", size: 8))
                     .tracking(0.8)
                     .foregroundStyle(Color.gbInk.opacity(0.72))
                 LazyVGrid(columns: [GridItem(.flexible(), spacing: 7), GridItem(.flexible(), spacing: 7)], spacing: 7) {
@@ -746,7 +1032,7 @@ struct EditorView: View {
                         .fill(Color.screenShadow.opacity(0.42))
                         .frame(height: 1)
                     Text("SEND MATRIX")
-                        .font(.system(size: 7, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 8))
                         .foregroundStyle(Color.gbInk)
                     Rectangle()
                         .fill(Color.screenShadow.opacity(0.42))
@@ -754,17 +1040,17 @@ struct EditorView: View {
                 }
                 HStack {
                     Text("CHANNEL ROUTING / DRY SIGNAL + FX RETURN")
-                        .font(.system(size: 6, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 8))
                         .foregroundStyle(Color.screenShadow)
                     Spacer()
                     Text("0% — 100%")
-                        .font(.system(size: 6, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 8))
                         .foregroundStyle(Color.screenShadow)
                 }
                 VStack(spacing: 6) {
                     ForEach(ByteChannel.allCases) { channel in
                         RestoredFXSendStrip(
-                            title: channel == .pulseA ? "PULSE 1" : channel == .pulseB ? "PULSE 2" : channel.title,
+                            title: channel.title,
                             amount: store.effectSendPercent(channel),
                             accent: restoredChannelAccent(channel),
                             muted: store.isChannelMuted(channel),
@@ -800,7 +1086,7 @@ struct EditorView: View {
     private var arrangementPageSelector: some View {
         HStack(spacing: 5) {
             Text("ARRANGEMENT PAGE")
-                .font(.system(size: 7, weight: .black, design: .monospaced))
+                .font(.custom("Futura-Bold", size: 8))
                 .foregroundStyle(Color.screenShadow)
             ForEach(0..<4, id: \.self) { pageIndex in
                 let start = pageIndex * 16
@@ -810,15 +1096,15 @@ struct EditorView: View {
                 } label: {
                     VStack(spacing: 1) {
                         Text(["A", "B", "C", "D"][pageIndex])
-                            .font(.system(size: 9, weight: .black, design: .monospaced))
+                            .font(.custom("Futura-Bold", size: 9))
                         Text("\(start + 1)-\(end)")
-                            .font(.system(size: 5, weight: .black, design: .monospaced))
+                            .font(.custom("Futura-Bold", size: 8))
                     }
                     .foregroundStyle(songArrangementPage == pageIndex ? Color.gbInk : Color.screenShadow)
                     .frame(maxWidth: .infinity, minHeight: 34)
                     .background(songArrangementPage == pageIndex ? Color.amber : Color.screenShadow.opacity(0.12))
-                    .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.screenShadow.opacity(0.55), lineWidth: 1))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.screenShadow.opacity(0.55), lineWidth: 1))
                 }
                 .buttonStyle(.plain)
                 .disabled(start >= store.songArrangementLength)
@@ -864,8 +1150,13 @@ struct EditorView: View {
     }
     private func startSongPlayback(at slot: Int? = nil) {
         guard store.project.hasAssignedSongPattern else { store.presentToast("ASSIGN A PATTERN FIRST"); return }
+        page = 3
+        audioPage = 3
         store.isPlaying = true
         audio.play(project: store.project, patterns: store.songPlaybackPatterns, useSongArrangement: true, startSongSlot: slot) { step, songSlot in
+            // The transport timer polls at 120 Hz but steps only change a few times
+            // per beat — skip the main-actor hop when nothing moved.
+            guard step != currentStep || songSlot != currentSongSlot else { return }
             Task { @MainActor in
                 currentStep = step
                 currentSongSlot = songSlot
@@ -891,30 +1182,124 @@ struct EditorView: View {
     private func randomizeSound() { guard store.randomizeSelectedPatch() else { store.presentToast("SELECT A MELODIC CHANNEL"); return }; requestPlaybackRefresh() }
 
     private func requestPatternSelection(_ id: UUID) {
+        Haptics.selection()
         guard id != store.currentPatternID else { return }
         if store.isPlaying { pendingPatternID = id; store.presentToast("PATTERN SWITCH QUEUED / END OF LOOP") }
         else { store.selectPattern(id); requestPlaybackRefresh() }
     }
     private func beginPatternRename(_ pattern: BytePattern) { patternRenameID = pattern.id; patternRenameText = pattern.name; showPatternRename = true }
     private func setPage(_ newPage: Int) {
-        guard newPage != page else { return }
-        if store.isPlaying { pendingPage = newPage; store.presentToast("PAGE SWITCH QUEUED / END OF LOOP") }
-        else { applyPageNow(newPage) }
+        guard (0...3).contains(newPage), newPage != page else { return }
+        if store.isPlaying {
+            // Change the visible page immediately so every station remains navigable live.
+            // The audio source still changes only at the next 16-step boundary so a live
+            // bar is never cut short.
+            page = newPage
+            pendingPage = newPage
+            if newPage != 3 { currentSongSlot = -1 }
+            store.presentToast("PAGE SWITCH QUEUED / END OF LOOP")
+        } else {
+            applyPageNow(newPage)
+        }
     }
     private func applyPageNow(_ newPage: Int) {
         page = newPage
+        audioPage = newPage
         if store.isPlaying { audio.update(project: store.project, patterns: newPage == 3 ? store.songPlaybackPatterns : [selectedPattern], useSongArrangement: newPage == 3) }
         if newPage != 3 { currentSongSlot = -1 }
     }
     private func requestPlaybackRefresh() {
         guard store.isPlaying else { return }
-        audio.update(project: store.project, patterns: page == 3 ? store.songPlaybackPatterns : [selectedPattern], useSongArrangement: page == 3)
+        audio.update(project: store.project, patterns: audioPage == 3 ? store.songPlaybackPatterns : [selectedPattern], useSongArrangement: audioPage == 3)
+    }
+
+    /// Two-finger drag in flight: cumulative translation since gesture start.
+    private func twoFingerDragChanged(_ dy: CGFloat) {
+        guard let scrollProxy = twoFingerScrollProxy else { return }
+        let overflow = editorScrollMetrics.contentHeight - editorViewportHeight
+        guard overflow > 8 else { return }
+        let last = twoFingerLastDy ?? 0
+        let delta = dy - last
+        twoFingerLastDy = dy
+        let next = min(1, max(0, scrollFraction + delta / max(1, overflow)))
+        seekScroll(proxy: scrollProxy, fraction: next)
+    }
+
+    /// Two-finger drag released: flick velocity drives the capped glide.
+    private func twoFingerDragEnded(_ velocityY: CGFloat) {
+        guard let scrollProxy = twoFingerScrollProxy else { return }
+        twoFingerLastDy = nil
+        let overflow = editorScrollMetrics.contentHeight - editorViewportHeight
+        guard overflow > 8, abs(velocityY) > 150 else { return }
+        // Same glide model as the logo flick: capped at ~0.7 viewport heights
+        // so a hard two-finger flick covers about one screen.
+        let glide = (velocityY > 0 ? 1.0 : -1.0) * min(0.7, abs(velocityY) / 1000 * 0.85)
+        let target = min(1, max(0, scrollFraction + glide * editorViewportHeight / max(1, overflow)))
+        seekScroll(proxy: scrollProxy, fraction: target, animate: true)
+    }
+
+    /// DEBUG-only: simulates a two-finger swipe through the exact callbacks the
+    /// recognizer invokes, so UI tests can exercise the pipeline even though
+    /// this XCTest SDK cannot synthesize multi-touch drags.
+    private func simulateTwoFingerSwipeForTesting() {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            twoFingerLastDy = 0
+            for step in 1...12 {
+                twoFingerDragChanged(CGFloat(step) * 10)
+                try? await Task.sleep(nanoseconds: 16_000_000)
+            }
+            // Moderate flick: fires the glide without bottoming out the short
+            // page, so UI tests can discriminate drag vs. glide contributions.
+            twoFingerDragEnded(400)
+        }
+    }
+
+    /// Current scroll position as a 0...1 fraction (0 = top of page, 1 = bottom).
+    private var scrollFraction: CGFloat {
+        let overflow = max(0, editorScrollMetrics.contentHeight - editorViewportHeight)
+        guard overflow > 8 else { return 0 }
+        return min(1, max(0, -editorScrollMetrics.contentMinY / overflow))
+    }
+
+    /// Jumps the page scroll to the given 0...1 fraction using the hidden markers.
+    /// Each marker owns a real layout slice of height total/561 (~1pt), so its
+    /// center sits at (index + 0.5) * total/561 and centering it yields the
+    /// requested scroll offset. Sub-pixel marker spacing (~1pt) plus unanimated
+    /// per-event seeks keep finger tracking visually continuous: animating each
+    /// event restarts a clock and reads as stutter, while unanimated seeks move
+    /// the page exactly as fast as the finger (the flick glide animates its own
+    /// ease-out).
+    private func seekScroll(proxy: ScrollViewProxy, fraction: CGFloat, animate: Bool = false) {
+        let total = max(1, editorScrollMetrics.contentHeight)
+        let viewport = max(0, editorViewportHeight)
+        let overflow = max(0, total - viewport)
+        guard overflow > 8 else { return }
+        // Desired scroll offset = fraction * overflow; solve for the marker whose
+        // center, placed at the viewport center, produces that offset.
+        let desiredCenter = fraction * overflow + viewport * 0.5
+        let index = min(560, max(0, Int((desiredCenter * 561.0 / total - 0.5).rounded())))
+        if animate {
+            withAnimation(.easeOut(duration: 0.55)) {
+                proxy.scrollTo("beatboi-scroll-marker-\(index)", anchor: UnitPoint(x: 0.5, y: 0.5))
+            }
+        } else {
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                proxy.scrollTo("beatboi-scroll-marker-\(index)", anchor: UnitPoint(x: 0.5, y: 0.5))
+            }
+        }
     }
     private func togglePlayback() {
         playbackRefreshTask?.cancel()
         if store.isPlaying { pendingPatternID = nil; pendingPage = nil; store.stopPlayback(); audio.stop(); return }
+        audioPage = page
         store.isPlaying = true
         audio.play(project: store.project, patterns: page == 3 ? store.songPlaybackPatterns : [selectedPattern], useSongArrangement: page == 3, startSongSlot: page == 3 ? scrubbedSongSlot : nil) { step, slot in
+            // The transport timer polls at 120 Hz but steps only change a few times
+            // per beat — skip the main-actor hop when nothing moved.
+            guard step != currentStep || slot != currentSongSlot else { return }
             Task { @MainActor in
                 if step == 0 && currentStep == 15 {
                     if let pendingPatternID { store.selectPattern(pendingPatternID); self.pendingPatternID = nil }
@@ -935,8 +1320,194 @@ struct EditorView: View {
     }
 }
 
+private struct EditorScrollMetrics: Equatable {
+    var contentHeight: CGFloat = 0
+    var contentMinY: CGFloat = 0
+}
+
+private struct EditorScrollMetricsPreferenceKey: PreferenceKey {
+    static var defaultValue = EditorScrollMetrics()
+
+    static func reduce(value: inout EditorScrollMetrics, nextValue: () -> EditorScrollMetrics) {
+        value = nextValue()
+    }
+}
+
+/// Bridges a two-finger-only pan recognizer onto the editor's backing
+/// UIScrollView so a two-finger drag anywhere on the page scrolls it — without
+/// disturbing any one-finger behavior (native scroll, pads, knobs, faders).
+///
+/// Exclusivity: the scroll view's built-in pan REQUIRES the bridge to fail
+/// before it can begin, so one-finger gestures reach the scroll view untouched,
+/// while a two-finger drag can never also drive the native pan (no double
+/// movement). The bridge's fail-fast subclass (see below) guarantees that
+/// requirement resolves instantly for one-finger gestures — the recognizer
+/// never lingers in "possible" — so the handshake can never wedge either
+/// direction of the pair.
+///
+/// Drag semantics match a scrollbar (fingers move down -> page moves down),
+/// mirroring the logo drag. Release velocity feeds the same capped glide used
+/// by the logo flick.
+private struct TwoFingerScrollBridge: UIViewRepresentable {
+    var onStart: () -> Void
+    var onChanged: (_ dy: CGFloat) -> Void
+    var onEnd: (_ velocityY: CGFloat) -> Void
+
+    func makeUIView(context: Context) -> BridgeView {
+        let view = BridgeView()
+        view.isUserInteractionEnabled = false
+        view.isHidden = true
+        context.coordinator.view = view
+        return view
+    }
+
+    func updateUIView(_ uiView: BridgeView, context: Context) {
+        context.coordinator.onChanged = onChanged
+        context.coordinator.onEnd = onEnd
+        context.coordinator.onStart = onStart
+        context.coordinator.installIfNeeded()
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(onStart, onChanged, onEnd) }
+
+    final class BridgeView: UIView {}
+
+    /// Pan recognizer that refuses to start unless two touches are actively
+    /// driving it, and — critically — FAILS IMMEDIATELY (while still
+    /// "possible") when fewer than two fingers move. Fail-fast is what keeps
+    /// the `require(toFail:)` handshake with the native pan wedge-free: a
+    /// one-finger drag dismisses this recognizer instantly instead of leaving
+    /// it stuck in "possible" until touch-end, which is what made the second
+    /// two-finger swipe stop working. After the recognizer has begun (a real
+    /// two-finger drag), lifting fingers runs the normal ended path so the
+    /// flick glide still fires.
+    private final class TwoFingerPanGestureRecognizer: UIPanGestureRecognizer {
+        // Note: UIGestureRecognizer's touch overrides take a NON-optional
+        // UIEvent (unlike UIResponder's).
+        override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+            super.touchesBegan(touches, with: event)
+            failIfUndercommitted(event)
+        }
+
+        override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+            super.touchesMoved(touches, with: event)
+            failIfUndercommitted(event)
+        }
+
+        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+            super.touchesEnded(touches, with: event)
+            failIfUndercommitted(event)
+        }
+
+        override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+            super.touchesCancelled(touches, with: event)
+            failIfUndercommitted(event)
+        }
+
+        private func failIfUndercommitted(_ event: UIEvent) {
+            guard state == .possible else { return }
+            let active = event.allTouches?.filter {
+                $0.phase != .ended && $0.phase != .cancelled
+            }.count ?? 0
+            if active < 2 { state = .failed }
+        }
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        weak var view: BridgeView?
+        var onStart: () -> Void
+        var onChanged: (_ dy: CGFloat) -> Void
+        var onEnd: (_ velocityY: CGFloat) -> Void
+        private var installed = false
+
+        init(_ onStart: @escaping () -> Void,
+             _ onChanged: @escaping (_ dy: CGFloat) -> Void,
+             _ onEnd: @escaping (_ velocityY: CGFloat) -> Void) {
+            self.onStart = onStart
+            self.onChanged = onChanged
+            self.onEnd = onEnd
+        }
+
+        /// The bridge view may not be in a window yet on the first
+        /// updateUIView; retry until it lands under a UIScrollView.
+        func installIfNeeded() {
+            guard !installed, let view, view.window != nil else { return }
+            var current: UIView? = view
+            while let node = current {
+                if let scrollView = node as? UIScrollView {
+                    let pan = TwoFingerPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+                    pan.delegate = self
+                    scrollView.addGestureRecognizer(pan)
+                    // Make the native one-finger pan wait for this recognizer to
+                    // fail before it may begin: two-finger drags are claimed
+                    // exclusively by the bridge, one-finger behavior is unchanged.
+                    scrollView.panGestureRecognizer.require(toFail: pan)
+                    installed = true
+                    return
+                }
+                current = node.superview
+            }
+        }
+
+        @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
+            switch gesture.state {
+            case .began:
+                onStart()
+            case .changed:
+                onChanged(gesture.translation(in: gesture.view).y)
+            case .ended:
+                onEnd(gesture.velocity(in: gesture.view).y)
+            default:
+                break
+            }
+        }
+
+        func gestureRecognizer(_ g: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { false }
+
+        func gestureRecognizer(_ g: UIGestureRecognizer,
+                               shouldRequireFailureOf other: UIGestureRecognizer) -> Bool { false }
+    }
+}
+
+private struct EditorScrollBar: View {
+    let metrics: EditorScrollMetrics
+
+    var body: some View {
+        GeometryReader { proxy in
+            let viewportHeight = proxy.size.height
+            let overflow = max(0, metrics.contentHeight - viewportHeight)
+            let isScrollable = overflow > 8
+            let trackHeight = max(1, viewportHeight - 8)
+            let thumbHeight = max(28, trackHeight * viewportHeight / max(viewportHeight, metrics.contentHeight))
+            let scrollOffset = min(overflow, max(0, -metrics.contentMinY))
+            let travel = max(0, trackHeight - thumbHeight)
+            let progress = overflow > 0 ? scrollOffset / overflow : 0
+            let thumbOffset = travel * progress
+
+            ZStack(alignment: .top) {
+                Capsule()
+                    .fill(Color.gbLight.opacity(isScrollable ? 0.16 : 0))
+                    .frame(width: 3, height: trackHeight)
+                    .padding(.top, 4)
+                Capsule()
+                    .fill(Color.amber.opacity(isScrollable ? 0.9 : 0))
+                    .frame(width: 5, height: thumbHeight)
+                    .offset(y: 4 + thumbOffset)
+                    .shadow(color: Color.amber.opacity(isScrollable ? 0.42 : 0), radius: 3)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .animation(.easeOut(duration: 0.1), value: metrics.contentMinY)
+            .accessibilityHidden(true)
+        }
+        .frame(width: 9)
+    }
+}
+
 private struct RestoredHeaderIcon: View {
     let systemImage: String
+    let label: String
     let action: () -> Void
     var body: some View {
         Button(action: action) {
@@ -945,10 +1516,12 @@ private struct RestoredHeaderIcon: View {
                 .foregroundStyle(Color.gbLight)
                 .frame(width: 44, height: 44)
                 .background(Color.plasticRaised)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.plasticHighlight, lineWidth: 1))
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.plasticHighlight, lineWidth: 1))
         }
         .buttonStyle(ArcadePressStyle())
+        .accessibilityLabel(label)
+        .accessibilityHint("Tap to open")
     }
 }
 
@@ -965,8 +1538,8 @@ private struct RestoredHistoryButton: View {
                 .foregroundStyle(disabled ? Color.mutedText.opacity(0.42) : Color.gbLight)
                 .frame(width: 30, height: 30)
                 .background(disabled ? Color.hardwareBlack.opacity(0.34) : Color.plasticRaised)
-                .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(Color.plasticHighlight.opacity(disabled ? 0.28 : 0.8), lineWidth: 1))
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.plasticHighlight.opacity(disabled ? 0.28 : 0.8), lineWidth: 1))
         }
         .buttonStyle(ArcadePressStyle(scale: 0.88))
         .disabled(disabled)
@@ -983,23 +1556,78 @@ private struct RestoredPageButton: View {
     var body: some View {
         Button(action: action) {
             Label(title, systemImage: systemImage)
-                .font(.system(size: 8, weight: .black, design: .monospaced))
+                .font(.custom("Futura-Bold", size: 8))
                 .lineLimit(1)
                 .minimumScaleFactor(0.72)
                 .foregroundStyle(selected ? Color.gbInk : Color.gbLight.opacity(0.82))
                 .frame(maxWidth: .infinity, minHeight: 46)
                 .background(selected ? Color.amber : Color.clear)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(selected ? Color.gbInk : Color.plasticHighlight.opacity(0.45), lineWidth: selected ? 2 : 1))
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(selected ? Color.gbInk : Color.plasticHighlight.opacity(0.45), lineWidth: selected ? 2 : 1))
         }
         .buttonStyle(ArcadePressStyle())
     }
 }
 
+private struct DiceRollValue {
+    var rotation: Double = 0
+    var offsetY: CGFloat = 0
+    var scale: CGFloat = 1
+}
+
 private struct RestoredDiceButton: View {
     let label: String
+    var compact = false
+    var live = false
     let action: () -> Void
-    var body: some View { Button(action: action) { Image(systemName: "dice.fill").font(.system(size: 20, weight: .black)).foregroundStyle(Color.gbInk).frame(width: 52, height: 48).background(LinearGradient(colors: [Color.amber, Color.linkedOrange.opacity(0.8)], startPoint: .top, endPoint: .bottom)).clipShape(RoundedRectangle(cornerRadius: 10)).overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.gbInk, lineWidth: 2)) }.buttonStyle(ArcadePressStyle(scale: 0.88)).accessibilityLabel(label) }
+    @State private var rollTrigger = 0
+
+    var body: some View {
+        Button(action: {
+            rollTrigger += 1
+            action()
+        }) {
+            Image(systemName: "dice.fill")
+                .font(.system(size: compact ? 13 : 20, weight: .black))
+                .foregroundStyle(Color.gbInk)
+                .frame(width: compact ? 34 : 52, height: compact ? 30 : 48)
+                .background(LinearGradient(colors: [Color.amber, Color.linkedOrange.opacity(0.8)], startPoint: .top, endPoint: .bottom))
+                .clipShape(RoundedRectangle(cornerRadius: compact ? 7 : 12))
+                .overlay(RoundedRectangle(cornerRadius: compact ? 7 : 12).stroke(Color.gbInk, lineWidth: compact ? 1.5 : 2))
+                // Soft green halo while a channel is playing so the randomizer
+                // reads as live without competing with the amber die.
+                .shadow(color: live ? Color.gbGlow.opacity(0.55) : .clear, radius: live ? 6 : 0)
+                // Quick physical shake-and-roll: the die rattles left/right, hops
+                // up, and settles with a bounce every time it's tapped.
+                .keyframeAnimator(initialValue: DiceRollValue(), trigger: rollTrigger) { content, value in
+                    content
+                        .rotationEffect(.degrees(value.rotation))
+                        .offset(y: value.offsetY)
+                        .scaleEffect(value.scale)
+                } keyframes: { _ in
+                    KeyframeTrack(\.rotation) {
+                        CubicKeyframe(-16, duration: 0.05)
+                        CubicKeyframe(13, duration: 0.07)
+                        CubicKeyframe(-10, duration: 0.07)
+                        CubicKeyframe(8, duration: 0.07)
+                        CubicKeyframe(0, duration: 0.06)
+                    }
+                    KeyframeTrack(\.offsetY) {
+                        CubicKeyframe(-4, duration: 0.10)
+                        CubicKeyframe(0, duration: 0.10)
+                        CubicKeyframe(-2, duration: 0.06)
+                        CubicKeyframe(0, duration: 0.06)
+                    }
+                    KeyframeTrack(\.scale) {
+                        CubicKeyframe(1.14, duration: 0.07)
+                        CubicKeyframe(0.94, duration: 0.09)
+                        CubicKeyframe(1.0, duration: 0.16)
+                    }
+                }
+        }
+        .buttonStyle(ArcadePressStyle(scale: 0.88))
+        .accessibilityLabel(label)
+    }
 }
 
 private struct RestoredActionButton: View {
@@ -1016,7 +1644,7 @@ private struct RestoredTempoBox: View {
     let onChange: (Int) -> Void
     @State private var start: Int?
     @State private var last: Int?
-    var body: some View { VStack(spacing: 1) { Text("BPM").font(.system(size: 8, weight: .black, design: .monospaced)); Text("\(value)").font(.system(size: 14, weight: .black, design: .monospaced)) }.foregroundStyle(Color.gbInk).frame(width: 66, height: 46).background(Color.amber).overlay(Rectangle().stroke(Color.gbInk, lineWidth: 2)).gesture(DragGesture(minimumDistance: 0).onChanged { gesture in if start == nil { start = value }; let proposed = restoredBound((start ?? value) + Int((gesture.translation.width / 8).rounded()) + Int((-gesture.translation.height / 8).rounded()), 60, 240); if proposed != last { last = proposed; onChange(proposed) } }.onEnded { _ in start = nil; last = nil }) }
+    var body: some View { VStack(spacing: 1) { Text("BPM").font(.custom("Futura-Bold", size: 8)); Text("\(value)").font(.custom("Futura-Bold", size: 14)) }.foregroundStyle(Color.gbInk).frame(width: 66, height: 46).background(Color.amber).overlay(Rectangle().stroke(Color.gbInk, lineWidth: 2)).gesture(DragGesture(minimumDistance: 10).onChanged { gesture in if start == nil { start = value }; let proposed = restoredBound((start ?? value) + Int((gesture.translation.width / 8).rounded()) + Int((-gesture.translation.height / 8).rounded()), 60, 240); if proposed != last { last = proposed; onChange(proposed) } }.onEnded { _ in start = nil; last = nil }) }
     private func restoredBound(_ value: Int, _ low: Int, _ high: Int) -> Int { min(max(value, low), high) }
 }
 
@@ -1028,13 +1656,14 @@ private struct RestoredChoiceBox: View {
     let onSelect: (Int) -> Void
     @State private var start: Int?
     @State private var last: Int?
-    var body: some View { HStack(spacing: 4) { VStack(alignment: .leading, spacing: 1) { Text(title).font(.system(size: 8, weight: .black, design: .monospaced)); Text(value).font(.system(size: 9, weight: .black, design: .monospaced)).lineLimit(1) }; Spacer(); Image(systemName: "arrow.left.and.right").font(.system(size: 9, weight: .black)) }.foregroundStyle(Color.gbInk).padding(.horizontal, 9).frame(maxWidth: .infinity, minHeight: 44).background(title == "KEY" ? Color.amber : Color.gbGlow).overlay(Rectangle().stroke(Color.gbInk, lineWidth: 2)).gesture(DragGesture(minimumDistance: 0).onChanged { gesture in if start == nil { start = index }; guard !values.isEmpty else { return }; let offset = Int((gesture.translation.width / 20).rounded()); let selected = min(max((start ?? index) + offset, 0), values.count - 1); if selected != last { last = selected; onSelect(selected) } }.onEnded { _ in start = nil; last = nil }) }
+    var body: some View { HStack(spacing: 4) { VStack(alignment: .leading, spacing: 1) { Text(title).font(.custom("Futura-Bold", size: 8)); Text(value).font(.custom("Futura-Bold", size: 9)).lineLimit(1) }; Spacer(); Image(systemName: "arrow.left.and.right").font(.system(size: 9, weight: .black)) }.foregroundStyle(Color.gbInk).padding(.horizontal, 9).frame(maxWidth: .infinity, minHeight: 44).background(title == "KEY" ? Color.amber : Color.gbGlow).overlay(Rectangle().stroke(Color.gbInk, lineWidth: 2)).gesture(DragGesture(minimumDistance: 0).onChanged { gesture in if start == nil { start = index }; guard !values.isEmpty else { return }; let offset = Int((gesture.translation.width / 20).rounded()); let selected = min(max((start ?? index) + offset, 0), values.count - 1); if selected != last { last = selected; onSelect(selected) } }.onEnded { _ in start = nil; last = nil }) }
 }
 
 private struct RestoredChannelFader: View {
     let channel: ByteChannel
     let accent: Color
     let volume: Int
+    let activity: Int
     let selected: Bool
     let muted: Bool
     let soloed: Bool
@@ -1060,14 +1689,18 @@ private struct RestoredChannelFader: View {
                     Circle()
                         .fill(selected ? Color.gbInk : Color.screenShadow)
                         .frame(width: 5, height: 5)
-                    Text(channel.title)
-                        .font(.system(size: 8, weight: .black, design: .monospaced))
-                        .opacity(muted ? 0.46 : 1)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(channel.title)
+                            .font(.custom("Futura-Bold", size: 9))
+                            .opacity(muted ? 0.46 : 1)
+                        RestoredActivityMeter(level: activity, accent: accent, active: activity > 0)
+                            .frame(height: 5)
+                    }
                     Spacer(minLength: 2)
                     RestoredMiniMixerButton(title: "M", active: muted, accent: Color.arcadeRed, action: onToggleMute)
                     RestoredMiniMixerButton(title: "S", active: soloed, accent: Color.amber, action: onToggleSolo)
                     Text("\(volume)%")
-                        .font(.system(size: 8, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 8))
                 }
                 .foregroundStyle(Color.gbInk)
                 .padding(.horizontal, 4)
@@ -1101,15 +1734,83 @@ private struct RestoredChannelFader: View {
             .accessibilityLabel("\(channel.title) channel")
             .accessibilityValue(accessibilityValue)
             .accessibilityHint("Tap the channel to edit. Swipe left or right to change volume. Use M to mute or S to solo.")
+            .accessibilityAdjustableAction { direction in
+                switch direction {
+                case .increment: onChange(min(100, volume + 5))
+                case .decrement: onChange(max(0, volume - 5))
+                @unknown default: break
+                }
+            }
         }
-        .frame(minHeight: 48)
+        .frame(minHeight: 72)
     }
 
     private var accessibilityValue: String {
-        var parts = ["\(volume) percent"]
+        var parts = ["\(volume) percent", "activity \(activity) percent"]
         if muted { parts.append("muted") }
         if soloed { parts.append("soloed") }
         return parts.joined(separator: ", ")
+    }
+}
+
+private struct RestoredActivityMeter: View {
+    let level: Int
+    let accent: Color
+    let active: Bool
+    @State private var peak: Int = 0
+    @State private var peakSetAt: TimeInterval = 0
+
+    var body: some View {
+        Group {
+            if active {
+                TimelineView(.periodic(from: .now, by: 0.25)) { context in
+                    let elapsed = context.date.timeIntervalSinceReferenceDate - peakSetAt
+                    let heldPeak = max(level, peak - Int(elapsed * 26))
+                    GeometryReader { proxy in
+                        ZStack(alignment: .leading) {
+                            HStack(spacing: 2) {
+                                ForEach(0..<8, id: \.self) { index in
+                                    let threshold = CGFloat(index + 1) / 8.0
+                                    RoundedRectangle(cornerRadius: 1, style: .continuous)
+                                        .fill(CGFloat(level) / 100.0 >= threshold ? accent : Color.gbInk.opacity(0.18))
+                                        .frame(maxWidth: .infinity)
+                                        .shadow(color: CGFloat(level) / 100.0 >= threshold ? accent.opacity(0.55) : .clear, radius: 2)
+                                }
+                            }
+                            if heldPeak > level {
+                                Capsule()
+                                    .fill(accent)
+                                    .frame(width: 2, height: 5)
+                                    .position(x: min(proxy.size.width - 2, max(2, proxy.size.width * CGFloat(heldPeak) / 100.0)), y: proxy.size.height / 2)
+                                    .shadow(color: accent.opacity(0.9), radius: 2)
+                            }
+                        }
+                    }
+                }
+                .onChange(of: level) { _, newValue in
+                    if newValue > peak {
+                        peak = newValue
+                        peakSetAt = Date().timeIntervalSinceReferenceDate
+                    }
+                }
+            } else {
+                HStack(spacing: 2) {
+                    ForEach(0..<8, id: \.self) { index in
+                        let threshold = CGFloat(index + 1) / 8.0
+                        RoundedRectangle(cornerRadius: 1, style: .continuous)
+                            .fill(CGFloat(level) / 100.0 >= threshold ? accent : Color.gbInk.opacity(0.18))
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+                .animation(.easeOut(duration: 0.08), value: level)
+            }
+        }
+        .onChange(of: active) { _, newValue in
+            if !newValue { peak = 0; peakSetAt = 0 }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Channel activity")
+        .accessibilityValue("\(level) percent")
     }
 }
 
@@ -1122,12 +1823,12 @@ private struct RestoredMiniMixerButton: View {
     var body: some View {
         Button(action: action) {
             Text(title)
-                .font(.system(size: 7, weight: .black, design: .monospaced))
+                .font(.custom("Futura-Bold", size: 8))
                 .foregroundStyle(active ? Color.gbInk : Color.gbInk.opacity(0.58))
-                .frame(width: 22, height: 22)
+                .frame(width: 30, height: 30)
                 .background(active ? accent : Color.gbLight.opacity(0.38))
-                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 4, style: .continuous).stroke(Color.gbInk.opacity(active ? 0.9 : 0.34), lineWidth: active ? 1.5 : 1))
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.gbInk.opacity(active ? 0.9 : 0.34), lineWidth: active ? 1.5 : 1))
         }
         .buttonStyle(ArcadePressStyle(scale: 0.88))
         .accessibilityLabel(title == "M" ? "Mute channel" : "Solo channel")
@@ -1149,7 +1850,9 @@ private struct SongTimelineTick: View {
                 .frame(height: current ? 10 : 6)
             if showLabel {
                 Text(String(index + 1))
-                    .font(.system(size: 5, weight: .black, design: .monospaced))
+                    .font(.custom("Futura-Bold", size: 8))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.55)
                     .foregroundStyle(Color.mutedText)
             }
         }
@@ -1172,27 +1875,27 @@ private struct RestoredSongPad: View {
             VStack(spacing: 3) {
                 HStack {
                     Text(String(format: "%02d", index + 1))
-                        .font(.system(size: 9, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 9))
                     Spacer()
                     Circle()
                         .fill(current ? Color.gbLight : Color.gbInk.opacity(0.22))
                         .frame(width: 6, height: 6)
                 }
                 Text(pattern?.name.replacingOccurrences(of: "PATTERN ", with: "P") ?? "EMPTY")
-                    .font(.system(size: 8, weight: .black, design: .monospaced))
+                    .font(.custom("Futura-Bold", size: 8))
                     .lineLimit(1)
                     .minimumScaleFactor(0.6)
                 Text(pattern == nil ? "TAP TO ASSIGN" : "16 STEP BAR")
-                    .font(.system(size: 6, weight: .black, design: .monospaced))
+                    .font(.custom("Futura-Bold", size: 8))
             }
             .foregroundStyle(Color.gbInk)
-            .padding(7)
+            .padding(8)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(
                 LinearGradient(colors: pattern == nil ? [Color.gbDeep.opacity(0.3), Color.gbDeep.opacity(0.16)] : [color, color.opacity(0.68)], startPoint: .topLeading, endPoint: .bottomTrailing)
             )
-            .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(current ? Color.gbLight : pattern == nil ? Color.plasticHighlight.opacity(0.55) : Color.gbInk.opacity(0.45), lineWidth: current ? 3 : 1.5))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(current ? Color.gbLight : pattern == nil ? Color.plasticHighlight.opacity(0.55) : Color.gbInk.opacity(0.45), lineWidth: current ? 3 : 1.5))
             .contentShape(Rectangle())
             .onTapGesture { if Date() >= suppressTap { onTap() } }
             .simultaneousGesture(DragGesture(minimumDistance: 10).onChanged { gesture in
@@ -1212,14 +1915,53 @@ private struct RestoredSongPad: View {
     }
 }
 
+/// Soft amber glow that swells on each beat (phase change) while active.
+/// Used by the song playhead and the active step pads so the instrument
+/// visibly breathes with the sequencer clock.
+private struct BeatGlow: ViewModifier {
+    let active: Bool
+    let phase: Int
+    var color: Color = .amber
+    @State private var intensity: CGFloat = 0
+
+    func body(content: Content) -> some View {
+        content
+            .shadow(color: active ? color.opacity(0.18 + intensity * 0.85) : .clear, radius: 8)
+            .onChange(of: phase) { _, _ in
+                guard active else { return }
+                pulse()
+            }
+            .onAppear {
+                guard active else { return }
+                pulse()
+            }
+    }
+
+    private func pulse() {
+        intensity = 0
+        withAnimation(.easeOut(duration: 0.07)) { intensity = 1 }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.07) {
+            withAnimation(.easeIn(duration: 0.16)) { intensity = 0 }
+        }
+    }
+}
+
+private extension View {
+    func beatGlow(active: Bool, phase: Int, color: Color = .amber) -> some View {
+        modifier(BeatGlow(active: active, phase: phase, color: color))
+    }
+}
+
 private struct RestoredNotePad: View {
     let step: Int
     let note: Int?
     let length: Int
     let covered: Bool
     let channel: ByteChannel
+    let rootNote: Int
     let accent: Color
     let current: Bool
+    let phase: Int
     let linkSource: Bool
     let linkArmed: Bool
     let noteName: (Int) -> String
@@ -1245,11 +1987,11 @@ private struct RestoredNotePad: View {
 
     var body: some View {
         VStack(spacing: 3) {
-            Text(String(format: "%02d", step + 1)).font(.system(size: 9, weight: .black, design: .monospaced))
-            Text(note.map(channel == .drum ? drumName : noteName) ?? "—").font(.system(size: 10, weight: .black, design: .monospaced))
-            if linkSource { Text("LINK ARMED").font(.system(size: 6, weight: .black, design: .monospaced)) }
-            else if linkArmed { Text("TAP TO LINK").font(.system(size: 6, weight: .black, design: .monospaced)) }
-            else if note != nil && length > 1 { Text("HOLD \(length)").font(.system(size: 6, weight: .black, design: .monospaced)) }
+            Text(String(format: "%02d", step + 1)).font(.custom("Futura-Bold", size: 9))
+            Text(note.map(channel == .drum ? drumName : noteName) ?? "—").font(.custom("Futura-Bold", size: 10))
+            if linkSource { Text("LINK ARMED").font(.custom("Futura-Bold", size: 8)) }
+            else if linkArmed { Text("TAP TO LINK").font(.custom("Futura-Bold", size: 8)) }
+            else if note != nil && length > 1 { Text("HOLD \(length)").font(.custom("Futura-Bold", size: 8)) }
         }
         .foregroundStyle(Color.gbInk)
         .frame(maxWidth: .infinity, minHeight: 54)
@@ -1262,8 +2004,9 @@ private struct RestoredNotePad: View {
                 endPoint: .bottomTrailing
             )
         )
-        .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(linkSource || linkArmed ? Color.arcadeRed : current ? Color.gbLight : Color.gbInk.opacity(0.34), lineWidth: linkSource || current ? 3 : 1))
-        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(linkSource || linkArmed ? Color.arcadeRed : current ? Color.gbLight : Color.gbInk.opacity(0.34), lineWidth: linkSource || current ? 3 : 1))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .beatGlow(active: current, phase: phase, color: .amber)
         .contentShape(Rectangle())
         .onTapGesture {
             guard !didDrag else { return }
@@ -1284,7 +2027,7 @@ private struct RestoredNotePad: View {
                             onSetDrum(voice)
                         }
                     } else {
-                        if startNote == nil { startNote = note ?? channel.defaultNotes[step % channel.defaultNotes.count] }
+                        if startNote == nil { startNote = note ?? rootNote }
                         let base = startNote ?? 60
                         let semitones = Int((-gesture.translation.height / 8).rounded())
                         onSetNote(min(96, max(24, base + semitones)))
@@ -1310,10 +2053,10 @@ private struct RestoredDrumEditor: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 6) {
                     Text("VOICE")
-                        .font(.system(size: 7, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 8))
                     Spacer()
                     Text("SAMPLE")
-                        .font(.system(size: 7, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 8))
                 }
                 .foregroundStyle(Color.gbInk.opacity(0.62))
                 ForEach(ByteDrumVoice.allCases) { voice in
@@ -1327,7 +2070,7 @@ private struct RestoredDrumEditor: View {
                     )
                 }
                 Text("TAP SAMPLE 1 OR 2. SWIPE LEFT / RIGHT ON A VOICE TO MIX IT. DRAG THE BEAT PAD UP, DOWN, LEFT, OR RIGHT TO CHOOSE KICK, SNARE, PERC, OR HI-HAT.")
-                    .font(.system(size: 7, weight: .black, design: .monospaced))
+                    .font(.custom("Futura-Bold", size: 8))
                     .foregroundStyle(Color.gbInk.opacity(0.68))
             }
         }
@@ -1353,14 +2096,14 @@ private struct RestoredDrumVoiceRow: View {
                     .frame(width: proxy.size.width * CGFloat(volume) / 100.0)
                 HStack(spacing: 5) {
                     Text(voice.title)
-                        .font(.system(size: 8, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 8))
                     Text("\(volume)%")
-                        .font(.system(size: 7, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 8))
                     Spacer(minLength: 2)
                     ForEach(1...2, id: \.self) { variant in
                         Button { onSelectSample(variant) } label: {
                             Text("\(variant)")
-                                .font(.system(size: 8, weight: .black, design: .monospaced))
+                                .font(.custom("Futura-Bold", size: 8))
                                 .foregroundStyle(sample == variant ? Color.gbInk : Color.gbMid)
                                 .frame(width: 27, height: 24)
                                 .background(sample == variant ? Color.amber : Color.gbLight.opacity(0.55))
@@ -1408,24 +2151,70 @@ private struct RestoredPatchCard: View {
     let patch: ByteChannelPatch
     let selected: Bool
     let onSelect: () -> Void
+    /// Receives the absolute value represented by the fader, not a gesture delta.
     let onChange: (Int) -> Void
-    @State private var lastX: CGFloat = 0
+    @State private var dragStartValue: Int?
+
+    private var currentValue: Int {
+        switch parameter {
+        case .tone: return patch.channel == .wave ? patch.waveShape : patch.duty
+        case .duty: return patch.duty
+        case .envelopeAttack: return patch.envelopeAttack
+        case .envelopeDecay: return patch.envelopeDecay
+        case .envelopeSustain: return patch.envelopeSustain
+        case .envelopeRelease: return patch.envelopeRelease
+        case .portamento: return patch.portamento
+        case .portamentoTime: return patch.portamentoTime
+        case .vibratoCycleLength: return patch.vibratoCycleLength
+        case .vibratoDepth: return patch.vibratoDepth
+        case .vibratoDelay: return patch.vibratoDelay
+        case .octaveFlutterSpeed: return patch.octaveFlutterAmount
+        case .octaveFlutterPattern: return patch.octaveFlutterPattern
+        case .bendRange: return patch.bendRange
+        case .octave: return patch.octave
+        case .tremolo: return patch.tremolo
+        case .envelope: return patch.envelope
+        case .waveShape: return patch.waveShape
+        case .waveFilter: return patch.waveFilter
+        case .waveEnvelope: return patch.waveEnvelope
+        case .volume: return patch.initialVolume
+        case .envelopeDirection: return patch.envelopeIncrease ? 100 : 0
+        case .envelopePace: return patch.envelopePace
+        case .sweepPace: return patch.sweepPace
+        case .sweepDirection: return patch.sweepIncrease ? 100 : 0
+        case .sweepShift: return patch.sweepShift
+        case .waveVolume: return patch.waveVolume
+        case .drumSample: return patch.drumSamples.indices.contains(patch.drumVoice) ? patch.drumSamples[patch.drumVoice] : 1
+        case .panLeft: return patch.panLeft ? 100 : 0
+        case .panRight: return patch.panRight ? 100 : 0
+        case .lengthCounter: return patch.lengthCounter ? 100 : 0
+        case .length: return patch.length
+        }
+    }
+
+    private var faderFraction: CGFloat {
+        let range = parameter.range
+        guard range.upperBound > range.lowerBound else { return 0.5 }
+        return CGFloat(currentValue - range.lowerBound) / CGFloat(range.upperBound - range.lowerBound)
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 6) {
                 Circle()
                     .fill(selected ? Color.gbInk : Color.screenShadow.opacity(0.55))
                     .frame(width: 6, height: 6)
                 Text(parameter.title)
-                    .font(.system(size: 8, weight: .black, design: .monospaced))
+                    .font(.custom("Futura-Bold", size: 8))
                     .foregroundStyle(Color.gbInk)
                     .lineLimit(1)
                     .minimumScaleFactor(0.65)
                 Spacer(minLength: 2)
                 Text(restoredPatchValue)
-                    .font(.system(size: 9, weight: .black, design: .monospaced))
+                    .font(.custom("Futura-Bold", size: 9))
                     .foregroundStyle(Color.gbInk)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
             }
             GeometryReader { proxy in
                 ZStack(alignment: .leading) {
@@ -1443,26 +2232,29 @@ private struct RestoredPatchCard: View {
                 .contentShape(Rectangle())
             }
             .frame(height: 7)
-            Text("DRAG ↔ TO ADJUST")
-                .font(.system(size: 6, weight: .black, design: .monospaced))
-                .foregroundStyle(Color.screenShadow.opacity(0.78))
         }
         .padding(9)
-        .frame(minHeight: 68)
+        .frame(minHeight: 56)
         .background(selected ? Color.amber : Color.gbDeep.opacity(0.12))
-        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(selected ? Color.gbInk : Color.gbInk.opacity(0.3), lineWidth: selected ? 2 : 1))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(selected ? Color.gbInk : Color.gbInk.opacity(0.3), lineWidth: selected ? 2 : 1))
         .contentShape(Rectangle())
         .onTapGesture { onSelect() }
-        .gesture(DragGesture(minimumDistance: 8).onChanged { gesture in
-            onSelect()
-            let move = gesture.translation.width - lastX
-            if abs(move) >= 8 {
-                onChange(Int((move / 8).rounded()))
-                lastX = gesture.translation.width
-            }
-        }.onEnded { _ in lastX = 0 })
-        .accessibilityElement(children: .ignore)
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 12)
+                .onChanged { gesture in
+                    onSelect()
+                    if dragStartValue == nil { dragStartValue = currentValue }
+                    let range = parameter.range
+                    // One full card-width should cover most continuous controls while
+                    // smaller controls remain deliberately tactile.
+                    let pointsPerStep: CGFloat = range.count > 10 ? 1.25 : 8.0
+                    let raw = (dragStartValue ?? currentValue) + Int((gesture.translation.width / pointsPerStep).rounded())
+                    onChange(min(max(raw, range.lowerBound), range.upperBound))
+                }
+                .onEnded { _ in dragStartValue = nil }
+        )
+        .accessibilityElement(children: .contain)
         .accessibilityLabel(parameter.title)
         .accessibilityValue(restoredPatchValue)
         .accessibilityHint("Tap to select. Swipe left or right to adjust.")
@@ -1470,32 +2262,29 @@ private struct RestoredPatchCard: View {
 
     private var restoredPatchValue: String {
         switch parameter {
+        case .tone: return patch.channel == .wave ? ByteWaveShape.allCases[min(ByteWaveShape.allCases.count - 1, max(0, patch.waveShape))].title : ["12.5%", "25%", "50%", "75%"][min(3, max(0, patch.duty))]
         case .duty: return ["12.5%", "25%", "50%", "75%"][min(3, max(0, patch.duty))]
-        case .octave: return patch.octave >= 0 ? "+\(patch.octave)" : "\(patch.octave)"
+        case .octave: return patch.octave >= 0 ? "+\(patch.octave) OCT" : "\(patch.octave) OCT"
         case .octaveFlutterSpeed: return ByteEffects.octaveFlutterDivisionTitle(for: patch.octaveFlutterAmount)
         case .octaveFlutterPattern: return ByteOctaveFlutterPattern(rawValue: patch.octaveFlutterPattern)?.title ?? "BASE / +1"
         case .volume: return "\(patch.initialVolume)/15"
-        case .waveShape: return "\(patch.waveShape)"
-        case .waveVolume: return "\(patch.waveVolume)"
+        case .waveShape: return ByteWaveShape.allCases[min(ByteWaveShape.allCases.count - 1, max(0, patch.waveShape))].title
+        case .waveVolume: return "SHIFT \(patch.waveVolume)"
         case .envelopeDirection: return patch.envelopeIncrease ? "UP" : "DOWN"
         case .sweepDirection: return patch.sweepIncrease ? "UP" : "DOWN"
         case .panLeft: return patch.panLeft ? "ON" : "OFF"
         case .panRight: return patch.panRight ? "ON" : "OFF"
         case .lengthCounter: return patch.lengthCounter ? "ON" : "OFF"
-        default: return "—"
+        case .drumSample: return "SAMPLE \(currentValue)"
+        case .envelopePace, .sweepPace, .sweepShift: return "\(currentValue)"
+        case .bendRange: return "\(currentValue) ST"
+        case .length: return "\(currentValue)"
+        default: return "\(currentValue)%"
         }
     }
 
     private var restoredPatchFraction: CGFloat {
-        switch parameter {
-        case .duty: return CGFloat(min(3, max(0, patch.duty)) + 1) / 4
-        case .octave: return CGFloat(min(4, max(0, patch.octave + 2))) / 4
-        case .octaveFlutterSpeed: return CGFloat(patch.octaveFlutterAmount) / 100
-        case .octaveFlutterPattern: return CGFloat(patch.octaveFlutterPattern + 1) / CGFloat(ByteOctaveFlutterPattern.allCases.count)
-        case .volume: return CGFloat(patch.initialVolume) / 15
-        case .waveVolume: return CGFloat(patch.waveVolume) / 3
-        default: return selected ? 0.72 : 0.42
-        }
+        min(1, max(0, faderFraction))
     }
 }
 
@@ -1513,7 +2302,7 @@ private struct RestoredFXModule: View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 5) {
                 Text(title)
-                    .font(.system(size: 7, weight: .black, design: .monospaced))
+                    .font(.custom("Futura-Bold", size: 8))
                     .foregroundStyle(Color.gbLight)
                     .lineLimit(1)
                     .minimumScaleFactor(0.65)
@@ -1527,7 +2316,7 @@ private struct RestoredFXModule: View {
                 .frame(height: 16)
             RestoredAmountCard(title: "AMOUNT", amount: amount, onChange: onChange)
         }
-        .padding(7)
+        .padding(8)
         .background(
             LinearGradient(
                 colors: [Color.plasticRaised.opacity(0.92), Color.hardwareBlack.opacity(0.86)],
@@ -1560,22 +2349,22 @@ private struct RestoredFXSendStrip: View {
                     .shadow(color: accent.opacity(0.65), radius: 3)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(title)
-                        .font(.system(size: 8, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 8))
                         .foregroundStyle(Color.gbLight)
                     Text(muted ? "MUTED" : soloed ? "SOLO MONITOR" : "ROUTED TO BUS")
-                        .font(.system(size: 6, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 8))
                         .foregroundStyle(muted ? Color.arcadeRed : soloed ? Color.amber : Color.mutedText)
                 }
                 Spacer(minLength: 2)
                 Text("\(amount)%")
-                    .font(.system(size: 9, weight: .black, design: .monospaced))
+                    .font(.custom("Futura-Bold", size: 9))
                     .foregroundStyle(accent)
             }
             RestoredFXMeter(level: amount, accent: accent, active: active && !muted, phase: phase)
                 .frame(height: 13)
             RestoredAmountCard(title: "SEND LEVEL", amount: amount, onChange: onChange)
         }
-        .padding(7)
+        .padding(8)
         .background(Color.hardwareBlack.opacity(0.74))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(accent.opacity(0.48), lineWidth: 1))
@@ -1629,12 +2418,12 @@ private struct RestoredAmountCard: View {
                 HStack(spacing: 6) {
                     Circle().fill(Color.gbInk.opacity(0.62)).frame(width: 5, height: 5)
                     Text(title)
-                        .font(.system(size: 8, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 8))
                         .lineLimit(1)
                         .minimumScaleFactor(0.7)
                     Spacer(minLength: 2)
                     Text("\(amount)%")
-                        .font(.system(size: 8, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 8))
                 }
                 .foregroundStyle(Color.gbInk)
                 .padding(.horizontal, 8)
@@ -1643,7 +2432,7 @@ private struct RestoredAmountCard: View {
             .contentShape(Rectangle())
             // Use a simultaneous gesture so the vertical editor ScrollView cannot swallow
             // horizontal parameter edits. The fader remains horizontal-only by design.
-            .simultaneousGesture(DragGesture(minimumDistance: 2).onChanged { gesture in
+            .simultaneousGesture(DragGesture(minimumDistance: 12).onChanged { gesture in
                 if start == nil { start = amount }
                 let proposed = min(max((start ?? amount) + Int((gesture.translation.width / 2).rounded()), 0), 100)
                 if proposed != last { last = proposed; onChange(proposed) }
@@ -1658,322 +2447,28 @@ private struct RestoredAmountCard: View {
 }
 
 
-struct LegacyEditorView: View {
-    @Environment(GameStore.self) private var store
-    @State private var audio = ByteAudioEngine()
-    @State private var showLibrary = false
-    @State private var showExport = false
-    @State private var showPurchase = false
-    @State private var showImport = false
-    @State private var showProjectExporter = false
-    @State private var showRename = false
-    @State private var renameText = ""
-    @State private var currentStep = -1
-    @State private var projectDocument = ByteProjectDocument()
-
-    private var selectedPattern: BytePattern {
-        store.project.patterns.first(where: { $0.id == store.currentPatternID }) ?? store.project.patterns[0]
-    }
-
-    private var selectedChannelNotes: [Int?] {
-        let index = ByteChannel.allCases.firstIndex(of: store.selectedChannel) ?? 0
-        return selectedPattern.steps[index]
-    }
-
-    var body: some View {
-        ZStack {
-            PocketBackdrop()
-            ScrollView {
-                VStack(spacing: 14) {
-                    header
-                    transport
-                    patternPicker
-                    channelPicker
-                    padEditor
-                    effectsPanel
-                    actionBar
-                    footer
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 18)
-                .frame(maxWidth: 620)
-                .frame(maxWidth: .infinity)
-            }
-
-            if let toast = store.toast {
-                VStack {
-                    Spacer()
-                    Text(toast)
-                        .font(.system(size: 12, weight: .black, design: .monospaced))
-                        .foregroundStyle(Color.gbInk)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                        .background(Color.amber)
-                        .overlay(Rectangle().stroke(Color.gbInk, lineWidth: 2))
-                        .padding(.bottom, 18)
-                }
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-        }
-        .sheet(isPresented: $showLibrary) { ProjectLibraryView() }
-        .sheet(isPresented: $showExport) { ExportView(useSongArrangement: false) }
-        .sheet(isPresented: $showPurchase) { UnlockView() }
-        .fileImporter(isPresented: $showImport, allowedContentTypes: [.bytePocketProject, .json, .bytePocketMIDI]) { result in
-            importFile(result)
-        }
-        .fileExporter(isPresented: $showProjectExporter, document: projectDocument, contentTypes: [.bytePocketProject], defaultFilename: store.project.name.lowercased()) { _ in }
-        .alert("RENAME QUEST", isPresented: $showRename) {
-            TextField("PROJECT NAME", text: $renameText)
-            Button("SAVE") { store.renameProject(renameText) }
-            Button("CANCEL", role: .cancel) {}
-        } message: { Text("Give this run a memorable name.") }
-        .onDisappear { audio.stop() }
-    }
-
-    private var header: some View {
-        HStack(alignment: .bottom) {
-            VStack(alignment: .leading, spacing: 3) {
-                Image("beatboi")
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: 122, height: 26, alignment: .leading)
-                    .accessibilityLabel("BEATBOI")
-                Text("BEATPAD / 4-CHANNEL DMG")
-                    .font(.system(size: 9, weight: .black, design: .monospaced))
-                    .foregroundStyle(Color.mutedText)
-            }
-            Spacer()
-            HeaderIcon(systemImage: "folder.fill") { showLibrary = true }
-        }
-    }
-
-    private var transport: some View {
-        LCDPanel(title: "TRANSPORT / \(store.project.name)") {
-            HStack(spacing: 11) {
-                Button { togglePlayback() } label: {
-                    Image(systemName: store.isPlaying ? "stop.fill" : "play.fill")
-                        .font(.system(size: 19, weight: .black))
-                        .foregroundStyle(Color.gbLight)
-                        .frame(width: 54, height: 50)
-                        .background(Color.gbInk)
-                        .overlay(Rectangle().stroke(Color.gbInk, lineWidth: 2))
-                }
-                .buttonStyle(.plain)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(store.isPlaying ? "PLAYING" : "READY")
-                        .font(.system(size: 11, weight: .black, design: .monospaced))
-                        .foregroundStyle(Color.gbInk)
-                    Text("STEP \(String(format: "%02d", max(0, currentStep + 1))) / 16")
-                        .font(.system(size: 10, weight: .bold, design: .monospaced))
-                        .foregroundStyle(Color.gbInk.opacity(0.62))
-                }
-                Spacer(minLength: 4)
-                TempoBox(value: store.project.tempo) { value in store.updateTempo(value) }
-            }
-        }
-    }
-
-    private var patternPicker: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("SONG PATTERNS")
-                    .font(.system(size: 11, weight: .black, design: .monospaced))
-                    .foregroundStyle(Color.gbLight)
-                Spacer()
-                Text("16 MAX")
-                    .font(.system(size: 9, weight: .black, design: .monospaced))
-                    .foregroundStyle(Color.gbGlow)
-            }
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(store.project.patterns) { pattern in
-                        Button {
-                            store.selectPattern(pattern.id)
-                            store.presentToast("\(pattern.name) READY")
-                        } label: {
-                            Text(pattern.name)
-                                .font(.system(size: 10, weight: .black, design: .monospaced))
-                                .foregroundStyle(Color.gbInk)
-                                .frame(width: 92, height: 42)
-                                .background(pattern.id == store.currentPatternID ? Color.amber : Color.gbLight)
-                                .overlay(Rectangle().stroke(Color.gbInk, lineWidth: 2))
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-        }
-    }
-
-    private var channelPicker: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("CHANNELS / VOLUME")
-                .font(.system(size: 11, weight: .black, design: .monospaced))
-                .foregroundStyle(Color.gbLight)
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
-                ForEach(ByteChannel.allCases) { channel in
-                    Button {
-                        store.selectedChannel = channel
-                        store.selectedStep = nil
-                    } label: {
-                        HStack {
-                            Text(channel.title)
-                                .font(.system(size: 11, weight: .black, design: .monospaced))
-                            Spacer()
-                            Text("\(store.channelVolumePercent(channel))%")
-                                .font(.system(size: 9, weight: .black, design: .monospaced))
-                        }
-                        .foregroundStyle(Color.gbInk)
-                        .padding(10)
-                        .background(store.selectedChannel == channel ? Color.amber : Color.gbLight)
-                        .overlay(Rectangle().stroke(Color.gbInk, lineWidth: 2))
-                    }
-                    .buttonStyle(.plain)
-                    .simultaneousGesture(DragGesture(minimumDistance: 8).onChanged { value in
-                        let delta = Int((value.translation.width / 4).rounded())
-                        store.setChannelVolume(channel: channel, percent: store.channelVolumePercent(channel) + delta)
-                    })
-                }
-            }
-        }
-    }
-
-    private var padEditor: some View {
-        LCDPanel(title: "\(store.selectedChannel.title) / 16 STEP LOOP") {
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 7), count: 4), spacing: 7) {
-                ForEach(0..<16, id: \.self) { step in
-                    let note = selectedChannelNotes[step]
-                    Button {
-                        store.toggleStep(channel: store.selectedChannel, step: step)
-                    } label: {
-                        VStack(spacing: 4) {
-                            Text(String(format: "%02d", step + 1))
-                                .font(.system(size: 10, weight: .black, design: .monospaced))
-                            Text(note.map(noteName) ?? "—")
-                                .font(.system(size: 11, weight: .black, design: .monospaced))
-                        }
-                        .foregroundStyle(note == nil ? Color.gbInk.opacity(0.46) : Color.gbInk)
-                        .frame(maxWidth: .infinity, minHeight: 58)
-                        .background(note == nil ? Color.gbDeep.opacity(0.16) : Color.amber)
-                        .overlay(Rectangle().stroke(step == currentStep ? Color.gbInk : Color.gbInk.opacity(0.34), lineWidth: step == currentStep ? 3 : 1))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-    }
-
-    private var effectsPanel: some View {
-        LCDPanel(title: "FX STATION") {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("NES-STYLE TRACKER EFFECTS")
-                    .font(.system(size: 9, weight: .black, design: .monospaced))
-                    .foregroundStyle(Color.gbInk)
-                ForEach(ByteEffect.allCases) { effect in
-                    Text(effect.title)
-                        .font(.system(size: 10, weight: .black, design: .monospaced))
-                        .foregroundStyle(Color.gbInk)
-                }
-            }
-        }
-    }
-
-    private var actionBar: some View {
-        HStack(spacing: 8) {
-            PixelButton("IMPORT", systemImage: "square.and.arrow.down", accent: .gbLight) { showImport = true }
-            PixelButton("EXPORT", systemImage: "square.and.arrow.up", accent: .amber) { showExport = true }
-        }
-    }
-
-    private var footer: some View {
-        Text("4 CHANNELS / LOCAL PROJECT / NO ADS")
-            .font(.system(size: 8, weight: .black, design: .monospaced))
-            .foregroundStyle(Color.mutedText)
-    }
-
-    private func togglePlayback() {
-        if store.isPlaying {
-            store.stopPlayback()
-            audio.stop()
-        } else {
-            store.isPlaying = true
-            audio.play(project: store.project, patterns: [selectedPattern]) { step, _ in
-                Task { @MainActor in currentStep = step }
-            }
-        }
-    }
-
-    private func importFile(_ result: Result<URL, Error>) {
-        guard case .success(let url) = result, let data = try? Data(contentsOf: url) else {
-            store.presentToast("IMPORT FAILED")
-            return
-        }
-        if url.pathExtension.lowercased() == "mid", let imported = ByteMIDI.importIntoProject(data, project: store.project) {
-            store.importProject(imported)
-            store.presentToast("MIDI IMPORTED")
-        } else if let imported = try? JSONDecoder.bytePocketDecoder.decode(ByteProject.self, from: data) {
-            store.importProject(imported)
-            store.presentToast("PROJECT OPENED")
-        } else {
-            store.presentToast("UNKNOWN FILE")
-        }
-    }
-
-    private func noteName(_ midi: Int) -> String {
-        let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-        return "\(names[(midi % 12 + 12) % 12])\(midi / 12 - 1)"
-    }
-}
-
-private struct HeaderIcon: View {
-    let systemImage: String
-    let action: () -> Void
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: systemImage)
-                .font(.system(size: 16, weight: .black))
-                .foregroundStyle(Color.gbLight)
-                .frame(width: 42, height: 38)
-                .background(Color.plasticRaised)
-                .overlay(Rectangle().stroke(Color.gbMid, lineWidth: 2))
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-private struct TempoBox: View {
-    let value: Int
-    let onChange: (Int) -> Void
-    @State private var startValue: Int?
-    @State private var lastValue: Int?
-
-    var body: some View {
-        VStack(spacing: 1) {
-            Text("BPM")
-                .font(.system(size: 8, weight: .black, design: .monospaced))
-            Text("\(value)")
-                .font(.system(size: 14, weight: .black, design: .monospaced))
-        }
-        .foregroundStyle(Color.gbInk)
-        .frame(width: 72, height: 50)
-        .background(Color.amber)
-        .overlay(Rectangle().stroke(Color.gbInk, lineWidth: 2))
-        .gesture(DragGesture(minimumDistance: 0).onChanged { value in
-            if startValue == nil { startValue = self.value }
-            let proposed = min(240, max(60, startValue! + Int((-value.translation.height / 8).rounded())))
-            if proposed != lastValue { lastValue = proposed; onChange(proposed) }
-        }.onEnded { _ in startValue = nil; lastValue = nil })
-    }
-}
-
 struct ProjectLibraryView: View {
     @Environment(GameStore.self) private var store
     @Environment(\.dismiss) private var dismiss
+    @State private var projectIDToDelete: UUID?
+    @State private var showDeleteConfirmation = false
     var body: some View {
         NavigationStack {
             ZStack {
                 PocketBackdrop()
                 List {
+                    if store.canRestoreDeletedProject {
+                        Section {
+                            Button {
+                                store.restoreDeletedProject()
+                            } label: {
+                                Label("RESTORE LAST DELETED PROJECT", systemImage: "arrow.uturn.backward.circle.fill")
+                                    .font(.custom("Futura-Bold", size: 12))
+                                    .foregroundStyle(Color.gbInk)
+                            }
+                            .accessibilityHint("Restores the most recently deleted project")
+                        }
+                    }
                     Section {
                         ForEach(store.projects) { project in
                             Button { store.selectProject(project); dismiss() } label: {
@@ -1981,15 +2476,19 @@ struct ProjectLibraryView: View {
                                     Image(systemName: project.id == store.project.id ? "checkmark.circle.fill" : "circle")
                                         .foregroundStyle(project.id == store.project.id ? Color.amber : Color.gbLight)
                                     VStack(alignment: .leading) {
-                                        Text(project.name).font(.system(size: 14, weight: .black, design: .monospaced))
+                                        Text(project.name).font(.custom("Futura-Bold", size: 14))
                                         Text("\(project.patterns.count) PATTERN\(project.patterns.count == 1 ? "" : "S") · \(project.tempo) BPM")
-                                            .font(.system(size: 10, weight: .bold, design: .monospaced)).foregroundStyle(Color.mutedText)
+                                            .font(.custom("Futura-Medium", size: 10)).foregroundStyle(Color.mutedText)
                                     }
                                     Spacer()
                                 }
                             }
                         }
-                        .onDelete { offsets in offsets.forEach { store.deleteProject(store.projects[$0]) } }
+                        .onDelete { offsets in
+                            guard let first = offsets.first, store.projects.indices.contains(first), store.projects.count > 1 else { return }
+                            projectIDToDelete = store.projects[first].id
+                            showDeleteConfirmation = true
+                        }
                     }
                     Section { Button { store.newProject(); dismiss() } label: { Label("NEW PROJECT", systemImage: "plus.square.fill") } }
                 }
@@ -1999,14 +2498,27 @@ struct ProjectLibraryView: View {
             .navigationTitle("PROJECT CART")
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("DONE") { dismiss() } } }
         }
+        .alert("DELETE PROJECT?", isPresented: $showDeleteConfirmation) {
+            Button("DELETE", role: .destructive) {
+                if let projectIDToDelete, let project = store.projects.first(where: { $0.id == projectIDToDelete }) {
+                    store.deleteProject(project)
+                }
+                self.projectIDToDelete = nil
+            }
+            Button("CANCEL", role: .cancel) { projectIDToDelete = nil }
+        } message: {
+            Text("This removes the project from the project cart. You can restore the most recently deleted project from this screen.")
+        }
         .preferredColorScheme(.dark)
     }
 }
 
 struct ExportView: View {
     @Environment(GameStore.self) private var store
+    @Environment(StoreKitManager.self) private var storeKit
     @Environment(\.dismiss) private var dismiss
     let useSongArrangement: Bool
+    @State private var showPaywall = false
     @State private var projectDocument = ByteProjectDocument()
     @State private var waveDocument = ByteWaveDocument()
     @State private var midiDocument = ByteMIDIDocument()
@@ -2022,19 +2534,33 @@ struct ExportView: View {
                 PocketBackdrop()
                 VStack(spacing: 12) {
                     Text("TAKE YOUR TRACK OUT OF THE POCKET")
-                        .font(.system(size: 15, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 15))
                         .foregroundStyle(Color.gbLight)
                         .multilineTextAlignment(.center)
-                    exportButton("PROJECT FILE", "EDITABLE / REOPEN ANYTIME", "doc.fill") { projectDocument = store.projectDocument(); showProjectExporter = true }
-                    exportButton("MIDI FILE", "4 CHANNELS / NOTE DATA", "pianokeys") { midiDocument = ByteMIDIDocument(data: ByteMIDI.export(project: store.project, patterns: useSongArrangement ? store.songPlaybackPatterns : store.project.arrangedPatterns)); showMIDIExporter = true }
-                    exportButton("WAV AUDIO", "SYNTHESIZED / 44.1 KHZ", "waveform") { startWaveExport() }
+                    exportButton("PROJECT FILE", "EDITABLE / REOPEN ANYTIME", "doc.fill", identifier: "export.project") { projectDocument = store.projectDocument(); showProjectExporter = true }
+                    exportButton("MIDI FILE", "4 CHANNELS / NOTE DATA", "pianokeys", locked: !storeKit.canExport, identifier: "export.midi") {
+                        guard storeKit.canExport else { showPaywall = true; return }
+                        midiDocument = ByteMIDIDocument(data: ByteMIDI.export(project: store.project, patterns: useSongArrangement ? store.songPlaybackPatterns : store.project.arrangedPatterns))
+                        showMIDIExporter = true
+                    }
+                    exportButton("WAV AUDIO", "SYNTHESIZED / 44.1 KHZ", "waveform", locked: !storeKit.canExport, identifier: "export.wav") {
+                        guard storeKit.canExport else { showPaywall = true; return }
+                        startWaveExport()
+                    }
                     if isRenderingWave { renderProgressView }
+                    if !storeKit.canExport {
+                        Text("EXPORT PACK — MIDI + WAV / ONE-TIME UNLOCK")
+                            .font(.custom("Futura-Bold", size: 9))
+                            .foregroundStyle(Color.mutedText)
+                            .multilineTextAlignment(.center)
+                    }
                     Spacer()
                 }
                 .padding(22)
             }
             .navigationTitle("EXPORT")
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("DONE") { dismiss() }.disabled(isRenderingWave) } }
+            .sheet(isPresented: $showPaywall) { ExportPaywallView() }
         }
         .fileExporter(isPresented: $showProjectExporter, document: projectDocument, contentTypes: [.bytePocketProject], defaultFilename: store.project.name.lowercased()) { _ in }
         .fileExporter(isPresented: $showMIDIExporter, document: midiDocument, contentTypes: [.bytePocketMIDI], defaultFilename: store.project.name.lowercased() + ".mid") { _ in }
@@ -2050,11 +2576,11 @@ struct ExportView: View {
                 Spacer()
                 Text("\(Int(exportProgress * 100))%")
             }
-            .font(.system(size: 10, weight: .black, design: .monospaced))
+            .font(.custom("Futura-Bold", size: 10))
             .foregroundStyle(Color.gbLight)
             ProgressView(value: exportProgress).tint(Color.gbGlow)
             Text("SYNTHESIZING EVERY SAMPLE — KEEP THIS WINDOW OPEN")
-                .font(.system(size: 8, weight: .bold, design: .monospaced))
+                .font(.custom("Futura-Medium", size: 8))
                 .foregroundStyle(Color.mutedText)
         }
         .padding(12)
@@ -2088,12 +2614,20 @@ struct ExportView: View {
         }
     }
 
-    private func exportButton(_ title: String, _ detail: String, _ icon: String, _ action: @escaping () -> Void) -> some View {
+    private func exportButton(_ title: String, _ detail: String, _ icon: String, locked: Bool = false, identifier: String, _ action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack {
                 Image(systemName: icon).frame(width: 34)
-                VStack(alignment: .leading) { Text(title).font(.system(size: 13, weight: .black, design: .monospaced)); Text(detail).font(.system(size: 9, weight: .bold, design: .monospaced)).foregroundStyle(Color.mutedText) }
-                Spacer(); Image(systemName: "chevron.right")
+                VStack(alignment: .leading) { Text(title).font(.custom("Futura-Bold", size: 13)); Text(detail).font(.custom("Futura-Medium", size: 9)).foregroundStyle(Color.mutedText) }
+                Spacer()
+                if locked {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.amber)
+                        .accessibilityLabel("\(title) requires the Export Pack")
+                } else {
+                    Image(systemName: "chevron.right")
+                }
             }
             .foregroundStyle(Color.gbInk)
             .padding(14)
@@ -2101,12 +2635,13 @@ struct ExportView: View {
             .overlay(Rectangle().stroke(Color.gbInk, lineWidth: 2))
         }
         .buttonStyle(.plain)
+        .accessibilityIdentifier(identifier)
         .disabled(isRenderingWave)
         .opacity(isRenderingWave ? 0.55 : 1)
     }
 }
 
-struct UnlockView: View {
+struct ExportPaywallView: View {
     @Environment(GameStore.self) private var store
     @Environment(StoreKitManager.self) private var storeKit
     @Environment(\.dismiss) private var dismiss
@@ -2115,29 +2650,44 @@ struct UnlockView: View {
             ZStack {
                 PocketBackdrop()
                 VStack(spacing: 16) {
-                    Text("FX CARTRIDGE").font(.system(size: 27, weight: .black, design: .monospaced)).foregroundStyle(Color.gbLight)
-                    Text("OPTIONAL CLASSIC EFFECTS / CORE IS FREE").font(.system(size: 10, weight: .black, design: .monospaced)).foregroundStyle(Color.mutedText)
+                    Text("EXPORT PACK").font(.custom("Futura-Bold", size: 27)).foregroundStyle(Color.gbLight)
+                    Text("ONE-TIME UNLOCK / NO SUBSCRIPTION").font(.custom("Futura-Bold", size: 10)).foregroundStyle(Color.mutedText)
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("ECHO").font(.system(size: 11, weight: .black, design: .monospaced)).foregroundStyle(Color.gbGlow)
-                        Text("BIT CRUSH").font(.system(size: 11, weight: .black, design: .monospaced)).foregroundStyle(Color.gbGlow)
-                        Text("OCTAVE FLUTTER").font(.system(size: 11, weight: .black, design: .monospaced)).foregroundStyle(Color.gbGlow)
+                        Text("MIDI FILE EXPORT").font(.custom("Futura-Bold", size: 11)).foregroundStyle(Color.gbGlow)
+                        Text("WAV AUDIO RENDER").font(.custom("Futura-Bold", size: 11)).foregroundStyle(Color.gbGlow)
+                        Text("UNLOCKED FOREVER").font(.custom("Futura-Bold", size: 11)).foregroundStyle(Color.gbGlow)
                     }
                     .padding(16)
                     .background(Color.gbDeep)
                     .overlay(Rectangle().stroke(Color.gbMid, lineWidth: 2))
-                    switch storeKit.status {
-                    case .available(let product): PixelButton("LOAD FX / \(product.displayPrice)", systemImage: "sparkle", accent: .amber) { Task { if await storeKit.purchase() { store.setUnlocked(true); dismiss() } } }
-                    case .purchased: Text("FX CARTRIDGE LOADED").foregroundStyle(Color.gbGlow)
-                    default: Text("CONNECTING TO CART…").foregroundStyle(Color.mutedText)
+                    Text("PROJECT FILES STAY FREE — YOUR TRACKS ALWAYS REOPEN IN THE POCKET")
+                        .font(.custom("Futura-Medium", size: 8))
+                        .foregroundStyle(Color.mutedText)
+                        .multilineTextAlignment(.center)
+                    if storeKit.hasReceiptEntitlement {
+                        Text("EXPORT PACK LOADED").font(.custom("Futura-Bold", size: 11)).foregroundStyle(Color.gbGlow)
+                    } else {
+                        // Entitlement is the only gate; a stray .purchased status with no
+                        // receipt must never claim the unlock.
+                        switch storeKit.status {
+                        case .available(let product): PixelButton("UNLOCK / \(product.displayPrice)", systemImage: "lock.open", accent: .amber) { Task { if await storeKit.purchase() { store.setUnlocked(true); dismiss() } } }
+                            .accessibilityIdentifier("exportPaywall.unlockButton")
+                        case .loading: Text("CONNECTING TO CART…").font(.custom("Futura-Bold", size: 11)).foregroundStyle(Color.mutedText)
+                        case .failed:
+                            Text("STORE UNAVAILABLE — CHECK YOUR CONNECTION").font(.custom("Futura-Bold", size: 10)).foregroundStyle(Color.mutedText)
+                            PixelButton("TRY AGAIN", systemImage: "arrow.clockwise", accent: .amber) { Task { await storeKit.load() } }
+                        case .purchased: Text("CONNECTING TO CART…").font(.custom("Futura-Bold", size: 11)).foregroundStyle(Color.mutedText)
+                        }
                     }
                     Button("RESTORE PURCHASES") { Task { if await storeKit.restore() { store.setUnlocked(true); dismiss() } } }
-                        .font(.system(size: 10, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 10))
                         .foregroundStyle(Color.gbLight)
+                        .accessibilityIdentifier("exportPaywall.restoreButton")
                     Spacer()
                 }
                 .padding(22)
             }
-            .navigationTitle("OPTIONAL FX")
+            .navigationTitle("EXPORT PACK")
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("CLOSE") { dismiss() } } }
         }
         .preferredColorScheme(.dark)

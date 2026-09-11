@@ -12,31 +12,70 @@ final class StoreKitManager {
         case failed(String)
     }
 
-    /// One-time optional FX cartridge; the four-channel core remains free.
-    let unlockProductID = "com.bytepocket.studio.unlock"
+    /// One-time Export Pack; unlocking MIDI and WAV export. Project-file export stays free.
+    let unlockProductID = "com.bytepocket.studio.export"
     var status: PurchaseStatus = .loading
+    /// Receipt-backed entitlement. Only a signed, verified, non-revoked transaction
+    /// for the Export Pack sets this true — a successful product fetch never does.
+    private(set) var hasReceiptEntitlement = false
+
+    /// Entitlement updates for the life of the process: purchases made here,
+    /// restores from other devices, and revocations (refunds, Family Sharing
+    /// removal) all arrive as signed transactions on this stream.
+    private var updatesTask: Task<Void, Never>?
+
+    private func startTransactionObserverIfNeeded() {
+        guard updatesTask == nil else { return }
+        updatesTask = Task { [weak self] in
+            for await update in Transaction.updates {
+                guard case .verified(let transaction) = update else { continue }
+                await transaction.finish()
+                guard let self, transaction.productID == self.unlockProductID else { continue }
+                await self.syncEntitlement()
+                await self.load()
+            }
+        }
+    }
+
+    /// Re-derives the entitlement from every current signed receipt entry.
+    /// A revoked transaction (refund / Family Sharing removal) fails the check.
+    func syncEntitlement() async {
+        var owned = false
+        for await result in Transaction.currentEntitlements {
+            guard case .verified(let transaction) = result else { continue }
+            guard transaction.productID == unlockProductID else { continue }
+            if transaction.revocationDate == nil {
+                owned = true
+            }
+        }
+        hasReceiptEntitlement = owned
+    }
 
     func load() async {
+        startTransactionObserverIfNeeded()
         status = .loading
+        // The receipt is checked first so a previously-purchased user stays
+        // unlocked even if the product fetch below fails (offline, store outage).
+        await syncEntitlement()
+        if hasReceiptEntitlement {
+            status = .purchased
+            return
+        }
         do {
             let products = try await Product.products(for: [unlockProductID])
             guard let product = products.first else {
                 status = .failed("Product unavailable")
                 return
             }
-            status = await isPurchased() ? .purchased : .available(product)
+            status = .available(product)
         } catch {
             status = .failed(error.localizedDescription)
         }
     }
 
     func isPurchased() async -> Bool {
-        for await result in Transaction.currentEntitlements {
-            if case .verified(let transaction) = result, transaction.productID == unlockProductID {
-                return true
-            }
-        }
-        return false
+        await syncEntitlement()
+        return hasReceiptEntitlement
     }
 
     func purchase() async -> Bool {
@@ -46,8 +85,13 @@ final class StoreKitManager {
             case .success(let verification):
                 guard case .verified(let transaction) = verification else { return false }
                 await transaction.finish()
-                status = .purchased
-                return true
+                // Grant only after the signed transaction shows up in the receipt.
+                await syncEntitlement()
+                if hasReceiptEntitlement {
+                    status = .purchased
+                    return true
+                }
+                return false
             case .userCancelled, .pending:
                 return false
             @unknown default:
@@ -62,11 +106,17 @@ final class StoreKitManager {
     func restore() async -> Bool {
         do {
             try await AppStore.sync()
-            let owned = await isPurchased()
-            if owned { status = .purchased }
-            return owned
+            await syncEntitlement()
+            if hasReceiptEntitlement { status = .purchased }
+            return hasReceiptEntitlement
         } catch {
             return false
         }
+    }
+
+    /// Synchronous gate for export UI. True only when the receipt currently
+    /// backs the Export Pack entitlement.
+    var canExport: Bool {
+        hasReceiptEntitlement
     }
 }

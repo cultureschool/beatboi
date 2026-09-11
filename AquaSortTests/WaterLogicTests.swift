@@ -11,8 +11,8 @@ final class BeatboiTests: XCTestCase {
         store.updateLoopLength(32)
         XCTAssertEqual(store.loopLength, 16)
         XCTAssertTrue(store.project.patterns[0].steps.allSatisfy { $0.count == 16 })
-        store.toggleStep(channel: .pulseA, step: 15)
-        XCTAssertEqual(store.project.patterns[0].steps[0][15], 72)
+        store.toggleStep(channel: .pulseA, step: 1)
+        XCTAssertEqual(store.project.patterns[0].steps[0][1], ByteChannel.pulseA.rootNote(for: store.project.key))
 
         let data = try! JSONEncoder.bytePocketEncoder.encode(store.project)
         let decoded = try! JSONDecoder.bytePocketDecoder.decode(ByteProject.self, from: data)
@@ -64,6 +64,25 @@ final class BeatboiTests: XCTestCase {
         defaults.removePersistentDomain(forName: suite)
     }
 
+    func testNewMelodicNotesUseTheProjectKeyRootAcrossChannels() {
+        let suite = "BeatboiRootNoteTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+        store.updateVoicing(key: 2, mode: .chromatic) // D
+
+        for channel in [ByteChannel.pulseA, .pulseB, .wave] {
+            store.toggleStep(channel: channel, step: 1)
+            let row = ByteChannel.allCases.firstIndex(of: channel)!
+            XCTAssertEqual(store.project.patterns[0].steps[row][1], channel.rootNote(for: 2))
+            XCTAssertEqual(store.project.patterns[0].steps[row][1]! % 12, 2)
+        }
+
+        // Manual vertical pitch editing can still choose another pitch from the same pad.
+        store.setNote(channel: .pulseA, step: 1, note: 67)
+        XCTAssertEqual(store.project.patterns[0].steps[0][1], 67)
+        defaults.removePersistentDomain(forName: suite)
+    }
+
     func testAllSupportedScaleModesExposeExpectedNamesAndIntervals() {
         XCTAssertEqual(ByteScaleMode.allCases.count, 10)
         XCTAssertNil(ByteScaleMode.chromatic.intervals)
@@ -76,10 +95,21 @@ final class BeatboiTests: XCTestCase {
 
     func testStarterProjectHasFourChannelsAndSixteenSteps() {
         let project = ByteProject.starter
-        XCTAssertEqual(project.patterns.count, 1)
-        XCTAssertEqual(project.patterns[0].steps.count, 4)
-        XCTAssertTrue(project.patterns[0].steps.allSatisfy { $0.count == 16 })
-        XCTAssertEqual(project.arrangement, [project.patterns[0].id])
+        // The starter ships as a ready-to-play groove: two patterns chained into a song.
+        XCTAssertEqual(project.patterns.count, 2)
+        XCTAssertEqual(project.arrangement, project.patterns.map(\.id))
+        XCTAssertTrue(project.patterns.allSatisfy { $0.steps.count == 4 && $0.steps.allSatisfy { $0.count == 16 } })
+        // Every pattern in the bank carries at least one note so first play is musical.
+        for pattern in project.patterns {
+            XCTAssertTrue(pattern.steps.flatMap { $0 }.contains { $0 != nil })
+        }
+        XCTAssertEqual(project.songArrangement.count, 16)
+        // The starter seeds Song Mode with a two-bar idea and leaves the rest to the user.
+        XCTAssertEqual(project.songArrangement[0].patternID, project.patterns[0].id)
+        XCTAssertEqual(project.songArrangement[1].patternID, project.patterns[1].id)
+        XCTAssertNil(project.songArrangement[2].patternID)
+        XCTAssertEqual(project.key, 0)
+        XCTAssertEqual(project.mode, .major)
     }
 
     func testProjectCodableRoundTrip() throws {
@@ -141,6 +171,7 @@ final class BeatboiTests: XCTestCase {
         let data = ByteMIDI.export(project: source)
         let imported = ByteMIDI.importIntoProject(data, project: source)
         XCTAssertNotNil(imported)
+        // MIDI import flattens the arrangement into a single 16-step pattern by design.
         XCTAssertEqual(imported?.patterns.count, 1)
         XCTAssertEqual(imported?.patterns[0].steps.count, 4)
     }
@@ -150,7 +181,7 @@ final class BeatboiTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suite)!
         let store = GameStore(defaults: defaults)
         store.toggleStep(channel: .pulseA, step: 1)
-        XCTAssertEqual(store.project.patterns[0].steps[0][1], 64)
+        XCTAssertEqual(store.project.patterns[0].steps[0][1], ByteChannel.pulseA.rootNote(for: store.project.key))
         store.toggleStep(channel: .pulseA, step: 1)
         XCTAssertNil(store.project.patterns[0].steps[0][1])
         defaults.removePersistentDomain(forName: suite)
@@ -160,6 +191,8 @@ final class BeatboiTests: XCTestCase {
         let suite = "BeatboiUndoRedoTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         let store = GameStore(defaults: defaults)
+        // Effects reset to a vanilla baseline so undo restores known values.
+        store.project.effects = ByteEffects()
         let patternID = store.project.patterns[0].id
 
         store.toggleStep(channel: .pulseA, step: 1)
@@ -271,6 +304,8 @@ final class BeatboiTests: XCTestCase {
         let suite = "BeatboiDrumVolumeTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         let store = GameStore(defaults: defaults)
+        // Reset the tuned starter kit so this test exercises a vanilla baseline.
+        store.project.channelPatches = ByteChannelPatch.defaults
 
         store.setDrumVoiceVolume(voice: .kick, percent: 35)
         store.setDrumVoiceVolume(voice: .snare, percent: 80)
@@ -367,7 +402,7 @@ final class BeatboiTests: XCTestCase {
         XCTAssertFalse(store.songSlot(at: 1).isContinuation)
         XCTAssertNil(store.songSlot(at: 2).patternID)
         store.project.arrangement.append(second.id)
-        XCTAssertEqual(store.project.arrangedPatterns.map(\.id), [firstID, second.id])
+        XCTAssertEqual(store.project.arrangedPatterns.map(\.id), store.project.patterns.map(\.id))
         XCTAssertEqual(store.playbackPatterns.map(\.id), [firstID])
         XCTAssertFalse(store.project.songModeEnabled)
 
@@ -376,7 +411,8 @@ final class BeatboiTests: XCTestCase {
         store.cycleSongSlot(at: 1, delta: 100)
         XCTAssertEqual(store.songSlot(at: 1).patternID, second.id)
         store.cycleSongSlot(at: 1, delta: -1)
-        XCTAssertEqual(store.songSlot(at: 1).patternID, firstID)
+        // One step back lands on the previous pattern in the three-pattern bank.
+        XCTAssertEqual(store.songSlot(at: 1).patternID, store.project.patterns[1].id)
         XCTAssertFalse(store.songSlot(at: 1).isContinuation)
 
         let data = try! JSONEncoder.bytePocketEncoder.encode(store.project)
@@ -424,8 +460,11 @@ final class BeatboiTests: XCTestCase {
         XCTAssertFalse(store.project.patterns.contains(where: { $0.id == deletedID }))
         XCTAssertFalse(store.project.arrangement.contains(deletedID))
         XCTAssertNil(store.songSlot(at: 3).patternID)
-        XCTAssertEqual(store.currentPatternID, firstID)
-        XCTAssertFalse(store.deletePattern(firstID))
+        XCTAssertTrue(store.project.patterns.contains(where: { $0.id == store.currentPatternID }))
+        // The final remaining pattern is protected from deletion.
+        XCTAssertTrue(store.deletePattern(firstID))
+        XCTAssertEqual(store.project.patterns.count, 1)
+        XCTAssertFalse(store.deletePattern(store.project.patterns[0].id))
         defaults.removePersistentDomain(forName: suite)
     }
 
@@ -464,7 +503,7 @@ final class BeatboiTests: XCTestCase {
 
         store.addPattern()
 
-        XCTAssertEqual(store.project.patterns.count, 2)
+        XCTAssertEqual(store.project.patterns.count, 3)
         XCTAssertNotEqual(store.currentPatternID, originalID)
         let fresh = store.project.patterns.first(where: { $0.id == store.currentPatternID })!
         XCTAssertTrue(fresh.steps.allSatisfy { $0.allSatisfy { $0 == nil } })
@@ -483,12 +522,12 @@ final class BeatboiTests: XCTestCase {
 
         store.duplicateCurrentPattern()
 
-        XCTAssertEqual(store.project.patterns.count, 2)
+        XCTAssertEqual(store.project.patterns.count, 3)
         XCTAssertNotEqual(store.currentPatternID, sourceID)
-        XCTAssertEqual(store.project.patterns[1].steps, source.steps)
-        XCTAssertEqual(store.project.patterns[1].noteLengths, source.noteLengths)
-        XCTAssertEqual(store.project.patterns[1].steps.count, 4)
-        XCTAssertEqual(store.project.patterns[1].steps.allSatisfy { $0.count == 16 }, true)
+        XCTAssertEqual(store.project.patterns[2].steps, source.steps)
+        XCTAssertEqual(store.project.patterns[2].noteLengths, source.noteLengths)
+        XCTAssertEqual(store.project.patterns[2].steps.count, 4)
+        XCTAssertEqual(store.project.patterns[2].steps.allSatisfy { $0.count == 16 }, true)
 
         store.toggleStep(channel: .pulseA, step: 3)
         XCTAssertNotEqual(store.project.patterns[1].steps, source.steps)
@@ -504,6 +543,25 @@ final class BeatboiTests: XCTestCase {
         XCTAssertEqual(ByteEffects.bitCrushEffectiveAmount(for: 25), 6.25)
         XCTAssertEqual(ByteEffects.bitCrushEffectiveAmount(for: 100), 25)
         XCTAssertEqual(ByteEffects.bitCrushEffectiveAmount(for: 140), 25)
+    }
+
+    func testTriangleWaveShapeChangesRenderedAudio() {
+        var base = ByteProject.starter
+        var pattern = BytePattern.empty(name: "TRIANGLE SHAPE TEST")
+        pattern.steps[2][0] = 48
+        base.patterns = [pattern]
+        base.arrangement = [pattern.id]
+        guard let waveIndex = base.channelPatches.firstIndex(where: { $0.channel == .wave }) else {
+            XCTFail("Triangle patch missing")
+            return
+        }
+        base.channelPatches[waveIndex].waveShape = ByteWaveShape.waveBass.rawValue
+        let bass = ByteRenderer.render(project: base, sampleRate: 8_000)
+        base.channelPatches[waveIndex].waveShape = ByteWaveShape.metal.rawValue
+        let metal = ByteRenderer.render(project: base, sampleRate: 8_000)
+
+        XCTAssertEqual(bass.count, metal.count)
+        XCTAssertTrue(zip(bass, metal).contains { abs($0 - $1) > 0.0001 })
     }
 
     func testEffectRenderPathsChangeAudioWhenEnabled() {
@@ -532,10 +590,101 @@ final class BeatboiTests: XCTestCase {
         XCTAssertEqual(ByteEffects.octaveFlutterMultiplier(at: 0.03125005, bpm: 120, amount: 70, pattern: .baseUpTwoUp), 4)
     }
 
+    func testAbsoluteSoundLabValuesUpdateEveryMelodicChannel() {
+        let suite = "BeatboiAbsolutePatchValueTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+
+        for channel in [ByteChannel.pulseA, .pulseB, .wave] {
+            store.setPatchValue(channel: channel, parameter: .envelopeAttack, value: 63)
+            store.setPatchValue(channel: channel, parameter: .portamento, value: 47)
+            store.setPatchValue(channel: channel, parameter: .octave, value: 1)
+            XCTAssertEqual(store.patch(for: channel).envelopeAttack, 63)
+            XCTAssertEqual(store.patch(for: channel).portamento, 47)
+            XCTAssertEqual(store.patch(for: channel).octave, 1)
+        }
+
+        store.setPatchValue(channel: .pulseA, parameter: .duty, value: 3)
+        XCTAssertEqual(store.patch(for: .pulseA).duty, 3)
+        store.setPatchValue(channel: .wave, parameter: .waveShape, value: ByteWaveShape.metal.rawValue)
+        XCTAssertEqual(store.patch(for: .wave).waveShape, ByteWaveShape.metal.rawValue)
+
+        // Absolute values clamp at the parameter's real hardware range rather than
+        // getting stuck at the old value or overflowing during a fast swipe.
+        store.setPatchValue(channel: .pulseA, parameter: .envelopeSustain, value: 140)
+        store.setPatchValue(channel: .pulseB, parameter: .envelopeRelease, value: -20)
+        XCTAssertEqual(store.patch(for: .pulseA).envelopeSustain, 100)
+        XCTAssertEqual(store.patch(for: .pulseB).envelopeRelease, 0)
+
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    func testAudioTaperMakesLowValuesUsable() {
+        // Square-root taper: 25% of fader travel delivers 50% of the gain.
+        XCTAssertEqual(ByteAudioTaper.gain(for: 0), 0, accuracy: 0.0001)
+        XCTAssertEqual(ByteAudioTaper.gain(for: 25), 0.5, accuracy: 0.0001)
+        XCTAssertEqual(ByteAudioTaper.gain(for: 100), 1.0, accuracy: 0.0001)
+        XCTAssertGreaterThan(ByteAudioTaper.gain(for: 10), 0.2)
+        // Monotonic and bounded across the whole travel.
+        var previous = -1.0
+        for percent in stride(from: 0, through: 100, by: 5) {
+            let gain = ByteAudioTaper.gain(for: percent)
+            XCTAssertGreaterThanOrEqual(gain, previous)
+            XCTAssertLessThanOrEqual(gain, 1.0)
+            previous = gain
+        }
+        // Out-of-range values clamp like the rest of the engine.
+        XCTAssertEqual(ByteAudioTaper.gain(for: -50), 0, accuracy: 0.0001)
+        XCTAssertEqual(ByteAudioTaper.gain(for: 150), 1.0, accuracy: 0.0001)
+    }
+
+    func testStarterGrooveUsesPresetPatchesAndBalancedMix() {
+        let project = ByteProject.starter
+        XCTAssertEqual(project.name, "FIRST BEAT")
+        XCTAssertGreaterThan(project.effects.echoAmount, 0)
+        // Starter channels use the seeded hand-tuned sounds.
+        let lead = ByteInstrumentPreset.library(for: .pulseA).first(where: { $0.id == "chipLead" })
+        XCTAssertEqual(project.channelPatches[0].duty, lead?.patch.duty ?? -1)
+        let bass = ByteInstrumentPreset.library(for: .pulseB).first(where: { $0.id == "bassDub" })
+        XCTAssertEqual(project.channelPatches[1].octave, bass?.patch.octave ?? -99)
+        // The starter's mix is a hand-set balance, not the default fader positions.
+        XCTAssertNotEqual(project.channelPatches[0].masterVolume, 50)
+        XCTAssertNotEqual(project.channelPatches[1].masterVolume, 50)
+        XCTAssertEqual(project.channelPatches[3].masterVolume, 66)
+        // The seeded arrangement chains GROOVE into BREAK and keeps the mix intact.
+        XCTAssertEqual(project.songArrangement[0].patternID, project.patterns[0].id)
+        XCTAssertEqual(project.songArrangement[1].patternID, project.patterns[1].id)
+        XCTAssertNil(project.songArrangement[2].patternID)
+    }
+
+    func testSoundLabFineTuneStepsRespectParameterBounds() {
+        let suite = "BeatboiFineTuneTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+
+        store.setPatchValue(channel: .pulseA, parameter: .envelopeAttack, value: 50)
+        store.setPatchValue(channel: .pulseA, parameter: .envelopeAttack, value: 51)
+        XCTAssertEqual(store.patch(for: .pulseA).envelopeAttack, 51)
+        store.setPatchValue(channel: .pulseA, parameter: .envelopeAttack, value: 0)
+        store.setPatchValue(channel: .pulseA, parameter: .envelopeAttack, value: -1)
+        XCTAssertEqual(store.patch(for: .pulseA).envelopeAttack, 0)
+
+        store.setPatchValue(channel: .pulseA, parameter: .octave, value: -2)
+        store.setPatchValue(channel: .pulseA, parameter: .octave, value: -1)
+        XCTAssertEqual(store.patch(for: .pulseA).octave, -1)
+        store.setPatchValue(channel: .pulseA, parameter: .octave, value: 2)
+        store.setPatchValue(channel: .pulseA, parameter: .octave, value: 3)
+        XCTAssertEqual(store.patch(for: .pulseA).octave, 2)
+
+        defaults.removePersistentDomain(forName: suite)
+    }
+
     func testSharedBeginnerPatchControlsAndDMGEffectsPersist() {
         let suite = "BeatboiSoundControlsTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         let store = GameStore(defaults: defaults)
+        // Reset the hand-tuned starter patches so this test exercises a vanilla baseline.
+        store.project.channelPatches = ByteChannelPatch.defaults
         for channel in [ByteChannel.pulseA, .pulseB, .wave] {
             store.adjustPatch(channel: channel, parameter: .octave, delta: 1)
             XCTAssertEqual(store.patch(for: channel).octave, 1)
@@ -641,16 +790,76 @@ final class BeatboiTests: XCTestCase {
         XCTAssertEqual(project.arrangement, [project.patterns[0].id])
     }
 
-    func testOnlyOptionalEffectsArePaywalled() {
+    func testClearingChannelRowRemainsUndoable() {
+        let suite = "BeatboiClearRowTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+        let originalRow = store.project.patterns[0].steps[0]
+
+        store.clearChannelRow(.pulseA)
+        XCTAssertTrue(store.project.patterns[0].steps[0].allSatisfy { $0 == nil })
+        XCTAssertTrue(store.canUndo)
+        store.undo()
+        XCTAssertEqual(store.project.patterns[0].steps[0], originalRow)
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    func testChannelActivityMetersFollowPlaybackStepAndMuteState() {
+        let suite = "BeatboiActivityMeterTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+
+        XCTAssertEqual(store.channelActivityLevel(.pulseA, step: 0), 0)
+        store.isPlaying = true
+        XCTAssertEqual(store.channelActivityLevel(.pulseA, step: 0), 100)
+        XCTAssertEqual(store.channelActivityLevel(.pulseA, step: 1), 0)
+        store.toggleChannelMute(.pulseA)
+        XCTAssertEqual(store.channelActivityLevel(.pulseA, step: 0), 0)
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    func testChannelNamesStayConsistentAcrossTheHardwareModel() {
+        XCTAssertEqual(ByteChannel.pulseA.title, "PULSE 1")
+        XCTAssertEqual(ByteChannel.pulseB.title, "PULSE 2")
+        XCTAssertEqual(ByteChannel.wave.title, "TRIANGLE")
+        XCTAssertEqual(ByteChannel.drum.title, "DRUM")
+    }
+
+    func testUnlockFlagPersistsAcrossStoreInstances() {
         let suite = "BeatboiTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         let store = GameStore(defaults: defaults)
-        store.toggleEffect(.echo)
-        XCTAssertTrue(store.project.effects.echo)
+        XCTAssertFalse(store.isUnlocked)
         store.setUnlocked(true)
-        store.toggleEffect(.echo)
-        XCTAssertFalse(store.project.effects.echo)
+        let reloaded = GameStore(defaults: defaults)
+        XCTAssertTrue(reloaded.isUnlocked)
         defaults.removePersistentDomain(forName: suite)
+    }
+
+    /// The persisted flag must reconcile DOWN when the receipt no longer backs
+    /// the entitlement — this is the branch the app calls at launch.
+    func testUnlockedFlagReconcilesDownWhenReceiptDisappears() {
+        let suite = "BeatboiTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+        store.setUnlocked(true)
+        let relocked = GameStore(defaults: defaults)
+        XCTAssertTrue(relocked.isUnlocked)
+        relocked.setUnlocked(false)
+        let reconciled = GameStore(defaults: defaults)
+        XCTAssertFalse(reconciled.isUnlocked)
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    /// Export must never be granted without a signed receipt transaction: a
+    /// fresh manager (no purchase in this environment) stays gated.
+    @MainActor
+    func testExportGateRequiresReceiptBackedEntitlement() async {
+        let manager = StoreKitManager()
+        let owned = await manager.isPurchased()
+        XCTAssertFalse(owned, "test environment must not hold an Export Pack entitlement")
+        XCTAssertFalse(manager.hasReceiptEntitlement)
+        XCTAssertFalse(manager.canExport)
     }
 }
 

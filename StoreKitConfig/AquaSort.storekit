@@ -5,18 +5,18 @@
   ],
   "products" : [
     {
-      "displayPrice" : "2.99",
+      "displayPrice" : "1.99",
       "familyShareable" : false,
-      "internalID" : "A1B2C3D4",
+      "internalID" : "B7E4A9C1",
       "localizations" : [
         {
-          "description" : "Optional FX cartridge with echo, bit crush, vibrato, wide pulse, and bonus presets. One-time purchase — no ads, no subscription.",
-          "displayName" : "FX Cartridge",
+          "description" : "Unlock MIDI and WAV audio export from the pocket. One-time purchase — no ads, no subscription.",
+          "displayName" : "Export Pack",
           "locale" : "en_US"
         }
       ],
-      "productID" : "com.bytepocket.studio.unlock",
-      "referenceName" : "FX Cartridge",
+      "productID" : "com.bytepocket.studio.export",
+      "referenceName" : "Export Pack",
       "type" : "NonConsumable"
     }
   ],

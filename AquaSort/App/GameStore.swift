@@ -12,8 +12,9 @@ final class GameStore {
     var isPlaying = false
     var isUnlocked = false
     var selectedPatchParameter: [ByteChannel: BytePatchParameter] = [:]
-    var showStore = false
     var toast: String?
+    /// Keeps the most recently deleted project recoverable until the next destructive delete.
+    private var deletedProjectRecovery: ByteProject?
 
     private let defaults: UserDefaults
     private let projectsKey = "bytePocket.projects"
@@ -63,9 +64,8 @@ final class GameStore {
     var canUndo: Bool { !undoStack.isEmpty }
     var canRedo: Bool { !redoStack.isEmpty }
 
-    /// All four classic channels are available without a purchase.
+    /// The paid Export Pack adds MIDI/WAV export; all four classic channels are free.
     var visibleChannels: [ByteChannel] { ByteChannel.allCases }
-    var isPremium: Bool { isUnlocked }
 
     func setUnlocked(_ value: Bool) {
         isUnlocked = value
@@ -135,13 +135,27 @@ final class GameStore {
         persist()
     }
 
+    var canRestoreDeletedProject: Bool { deletedProjectRecovery != nil }
+
     func deleteProject(_ project: ByteProject) {
-        guard projects.count > 1 else { return }
+        guard projects.count > 1, projects.contains(where: { $0.id == project.id }) else { return }
+        deletedProjectRecovery = project
         projects.removeAll { $0.id == project.id }
         if self.project.id == project.id { self.project = projects[0] }
         currentPatternID = self.project.arrangedPatterns.first?.id ?? self.project.patterns[0].id
         resetHistory()
         persist()
+        presentToast("PROJECT DELETED · RESTORE AVAILABLE")
+    }
+
+    func restoreDeletedProject() {
+        guard let deletedProjectRecovery,
+              !projects.contains(where: { $0.id == deletedProjectRecovery.id }) else { return }
+        projects.insert(deletedProjectRecovery, at: 0)
+        let recovered = deletedProjectRecovery
+        self.deletedProjectRecovery = nil
+        selectProject(recovered)
+        presentToast("PROJECT RESTORED")
     }
 
     func renameProject(_ name: String) {
@@ -266,6 +280,42 @@ final class GameStore {
         return true
     }
 
+    /// Clears one channel row while keeping the edit undoable and recoverable.
+    func clearChannelRow(_ channel: ByteChannel) {
+        guard let patternIndex, project.patterns.indices.contains(patternIndex) else { return }
+        let row = channelIndex(channel)
+        project.patterns[patternIndex].steps[row] = Array(repeating: nil, count: project.loopLength)
+        project.patterns[patternIndex].noteLengths[row] = Array(repeating: 1, count: project.loopLength)
+        selectedChannel = channel
+        selectedStep = nil
+        touch()
+        presentToast("\(channel.title) ROW CLEARED · UNDO AVAILABLE")
+    }
+
+    /// Returns a stable 0–100 activity value for mixer meters. A covered melodic step
+    /// still counts as active, so sustained notes remain visible between note starts.
+    func channelActivityLevel(_ channel: ByteChannel, step: Int, songSlot slotIndex: Int = -1) -> Int {
+        guard isPlaying, (0..<project.loopLength).contains(step) else { return 0 }
+        let row = channelIndex(channel)
+        let hasSolo = project.channelPatches.contains(where: { $0.soloed })
+        let channelPatch = patch(for: channel)
+        guard !channelPatch.muted, !hasSolo || channelPatch.soloed else { return 0 }
+
+        let pattern: BytePattern
+        if slotIndex >= 0, let id = self.songSlot(at: slotIndex).patternID,
+           let songPattern = project.pattern(with: id) {
+            pattern = songPattern
+        } else if let patternIndex {
+            pattern = project.patterns[patternIndex]
+        } else {
+            return 0
+        }
+        guard pattern.steps.indices.contains(row), pattern.steps[row].indices.contains(step) else { return 0 }
+        if pattern.steps[row][step] != nil { return 100 }
+        guard channel != .drum else { return 0 }
+        return noteStart(row: row, step: step, in: pattern) == nil ? 0 : 74
+    }
+
     /// A single tap toggles a step on or off. Pitch editing is handled by the pad's vertical drag.
     func toggleStep(channel: ByteChannel, step: Int) {
         guard (0..<project.loopLength).contains(step), let patternIndex = patternIndex else { return }
@@ -278,7 +328,7 @@ final class GameStore {
             }
             project.patterns[patternIndex].steps[row][step] = channel == .drum
                 ? ByteDrumVoice.note(voice: .kick)
-                : project.mode.quantize(channel.defaultNotes[step % channel.defaultNotes.count], key: project.key)
+                : channel.rootNote(for: project.key)
             project.patterns[patternIndex].noteLengths[row][step] = 1
         } else {
             project.patterns[patternIndex].steps[row][step] = nil
@@ -545,6 +595,56 @@ final class GameStore {
         touch()
     }
 
+    /// Sets a Sound Lab control from an absolute fader position. The UI uses this path
+    /// for both direct track drags and VoiceOver adjustments, so every parameter has a
+    /// real writable value instead of relying on a gesture-specific delta.
+    func setPatchValue(channel: ByteChannel, parameter: BytePatchParameter, value: Int) {
+        guard let index = project.channelPatches.firstIndex(where: { $0.channel == channel }) else { return }
+        var patch = project.channelPatches[index]
+        switch parameter {
+        case .tone:
+            if channel == .wave {
+                patch.waveShape = value.clamped(to: 0...(ByteWaveShape.allCases.count - 1))
+            } else {
+                patch.duty = value.clamped(to: 0...3)
+            }
+        case .duty: patch.duty = value.clamped(to: 0...3)
+        case .envelopeAttack: patch.envelopeAttack = value.clamped(to: 0...100)
+        case .envelopeDecay: patch.envelopeDecay = value.clamped(to: 0...100)
+        case .envelopeSustain: patch.envelopeSustain = value.clamped(to: 0...100)
+        case .envelopeRelease: patch.envelopeRelease = value.clamped(to: 0...100)
+        case .portamento: patch.portamento = value.clamped(to: 0...100)
+        case .portamentoTime: patch.portamentoTime = value.clamped(to: 0...100)
+        case .octaveFlutterSpeed: patch.octaveFlutterAmount = value.clamped(to: 0...100)
+        case .octaveFlutterPattern: patch.octaveFlutterPattern = value.clamped(to: 0...(ByteOctaveFlutterPattern.allCases.count - 1))
+        case .vibratoCycleLength: patch.vibratoCycleLength = value.clamped(to: 0...100)
+        case .vibratoDepth: patch.vibratoDepth = value.clamped(to: 0...100)
+        case .vibratoDelay: patch.vibratoDelay = value.clamped(to: 0...100)
+        case .bendRange: patch.bendRange = value.clamped(to: 0...24)
+        case .octave: patch.octave = value.clamped(to: -2...2)
+        case .tremolo: patch.tremolo = value.clamped(to: 0...100)
+        case .envelope: patch.envelope = value.clamped(to: 0...100)
+        case .waveShape: patch.waveShape = value.clamped(to: 0...(ByteWaveShape.allCases.count - 1))
+        case .waveFilter: patch.waveFilter = value.clamped(to: 0...100)
+        case .waveEnvelope: patch.waveEnvelope = value.clamped(to: 0...100)
+        case .volume: patch.initialVolume = value.clamped(to: 0...15)
+        case .envelopeDirection: patch.envelopeIncrease = value >= 50
+        case .envelopePace: patch.envelopePace = value.clamped(to: 0...7)
+        case .sweepPace: patch.sweepPace = value.clamped(to: 0...7)
+        case .sweepDirection: patch.sweepIncrease = value >= 50
+        case .sweepShift: patch.sweepShift = value.clamped(to: 0...7)
+        case .waveVolume: patch.waveVolume = value.clamped(to: 0...3)
+        case .drumSample:
+            if patch.drumSamples.indices.contains(patch.drumVoice) { patch.drumSamples[patch.drumVoice] = value.clamped(to: 1...2) }
+        case .panLeft: patch.panLeft = value >= 50
+        case .panRight: patch.panRight = value >= 50
+        case .lengthCounter: patch.lengthCounter = value >= 50
+        case .length: patch.length = value.clamped(to: 0...63)
+        }
+        project.channelPatches[index] = patch
+        touch()
+    }
+
     func adjustSelectedPatch(channel: ByteChannel, parameter: BytePatchParameter, delta: Int) {
         selectedPatchParameter[channel] = parameter
         adjustPatch(channel: channel, parameter: parameter, delta: delta)
@@ -583,8 +683,8 @@ final class GameStore {
     }
 
     func toggleEffect(_ effect: ByteEffect) {
-        // Sound design stays available in the core app. Export entitlements can be
-        // added later without making the instrument editor paywalled.
+    // Sound design stays available in the core app; the Export Pack gates MIDI/WAV
+    // export without making the instrument editor paywalled.
         project.effects.toggle(effect)
         touch()
     }

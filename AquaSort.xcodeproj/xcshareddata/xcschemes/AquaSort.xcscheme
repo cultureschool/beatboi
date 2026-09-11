@@ -40,6 +40,16 @@
                ReferencedContainer = "container:AquaSort.xcodeproj">
             </BuildableReference>
          </TestableReference>
+         <TestableReference
+            skipped = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "AA000000000000000000001D"
+               BuildableName = "AquaSortUITests.xctest"
+               BlueprintName = "AquaSortUITests"
+               ReferencedContainer = "container:AquaSort.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
    </TestAction>
    <LaunchAction

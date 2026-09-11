@@ -149,8 +149,8 @@ enum ByteChannel: String, CaseIterable, Codable, Identifiable, Sendable {
 
     var title: String {
         switch self {
-        case .pulseA: return "PULSE"
-        case .pulseB: return "SQUARE"
+        case .pulseA: return "PULSE 1"
+        case .pulseB: return "PULSE 2"
         case .wave: return "TRIANGLE"
         case .drum: return "DRUM"
         }
@@ -179,6 +179,19 @@ enum ByteChannel: String, CaseIterable, Codable, Identifiable, Sendable {
         case .pulseB: return [48, 55, 60, 55]
         case .wave: return [36, 36, 43, 36]
         case .drum: return ByteDrumVoice.allCases.map(\.baseNote)
+        }
+    }
+
+    /// The tap-to-place note for a melodic channel keeps the same root pitch class as
+    /// the project's key while preserving each channel's comfortable register.
+    func rootNote(for key: Int) -> Int {
+        guard self != .drum else { return ByteDrumVoice.kick.baseNote }
+        let root = min(11, max(0, key))
+        switch self {
+        case .pulseA: return 60 + root
+        case .pulseB: return 48 + root
+        case .wave: return 36 + root
+        case .drum: return ByteDrumVoice.kick.baseNote
         }
     }
 }
@@ -478,37 +491,314 @@ struct ByteInstrumentPreset: Identifiable, Hashable, Sendable {
     let patch: ByteChannelPatch
     let waveform: [Int]
 
+    /// Shared waveform table for the seeded starter sounds. Kept off
+    /// ByteProject.starter so building the library can never recursively trigger
+    /// starter init.
+    static let defaultWaveform: [Int] = [8, 10, 13, 15, 14, 12, 9, 6, 3, 1, 0, 1, 3, 6, 9, 12, 14, 13, 11, 8, 5, 2, 1, 2, 4, 7, 10, 13, 15, 14, 11, 8]
+
+    /// Hand-tuned starter patches. No longer a user-facing Sound Lab bank — the
+    /// presets exist so ByteProject.starter can seed its channels with sounds that
+    /// map to parameters the live audio engine actually renders.
     static func library(for channel: ByteChannel) -> [ByteInstrumentPreset] {
         switch channel {
         case .pulseA:
             return [
-                preset("lead", "LEAD", channel, duty: 1, volume: 15, envelopePace: 0, sweepPace: 0, sweepShift: 0),
-                preset("laser", "LASER", channel, duty: 0, volume: 15, envelopePace: 2, sweepPace: 2, sweepIncrease: false, sweepShift: 3),
-                preset("jump", "JUMP", channel, duty: 2, volume: 14, envelopePace: 1, sweepPace: 3, sweepIncrease: true, sweepShift: 2),
-                preset("arp", "ARPEGGIO", channel, duty: 1, volume: 13, envelopePace: 0, sweepPace: 0, sweepShift: 0),
-                preset("bell", "BELL", channel, duty: 3, volume: 12, envelopePace: 3, sweepPace: 1, sweepIncrease: true, sweepShift: 1),
-                preset("coin", "COIN", channel, duty: 0, volume: 14, envelopePace: 1, sweepPace: 2, sweepIncrease: true, sweepShift: 2),
-                preset("zap", "ZAP", channel, duty: 0, volume: 15, envelopePace: 1, sweepPace: 1, sweepIncrease: false, sweepShift: 5)
+                tuned("chipLead", "CHIP LEAD", channel) { p in
+                    p.duty = 1
+                    p.initialVolume = 15
+                    p.envelopeDecay = 22
+                    p.envelopeSustain = 100
+                    p.envelopeRelease = 14
+                    p.vibratoDepth = 26
+                    p.vibratoCycleLength = 50
+                    p.vibratoDelay = 30
+                },
+                tuned("laser", "LASER", channel) { p in
+                    p.duty = 0
+                    p.initialVolume = 15
+                    p.envelopeAttack = 2
+                    p.envelopeDecay = 55
+                    p.envelopeSustain = 30
+                    p.sweepPace = 2
+                    p.sweepShift = 3
+                    p.sweepIncrease = false
+                },
+                tuned("coin", "COIN", channel) { p in
+                    p.duty = 0
+                    p.initialVolume = 15
+                    p.envelopeDecay = 40
+                    p.envelopeSustain = 20
+                    p.envelopeRelease = 8
+                    p.sweepPace = 2
+                    p.sweepShift = 4
+                    p.sweepIncrease = true
+                },
+                tuned("zap", "ZAP", channel) { p in
+                    p.duty = 0
+                    p.initialVolume = 15
+                    p.envelopeDecay = 70
+                    p.envelopeSustain = 15
+                    p.sweepPace = 3
+                    p.sweepShift = 5
+                    p.sweepIncrease = false
+                },
+                tuned("bell", "BELL", channel) { p in
+                    p.duty = 3
+                    p.initialVolume = 15
+                    p.envelopeAttack = 18
+                    p.envelopeDecay = 15
+                    p.envelopeSustain = 95
+                    p.envelopeRelease = 60
+                    p.vibratoDepth = 12
+                    p.vibratoCycleLength = 40
+                    p.vibratoDelay = 10
+                },
+                tuned("arp16", "ARP 16TH", channel) { p in
+                    p.duty = 1
+                    p.initialVolume = 14
+                    p.envelopeDecay = 45
+                    p.envelopeSustain = 40
+                    p.envelopeRelease = 4
+                    p.octaveFlutterAmount = 16
+                    p.octaveFlutterPattern = ByteOctaveFlutterPattern.baseUp.rawValue
+                },
+                tuned("ghost", "GHOST", channel) { p in
+                    p.duty = 2
+                    p.initialVolume = 14
+                    p.envelopeSustain = 90
+                    p.envelopeRelease = 10
+                    p.octaveFlutterAmount = 8
+                    p.octaveFlutterPattern = ByteOctaveFlutterPattern.baseUpTwoUp.rawValue
+                    p.vibratoDepth = 18
+                    p.vibratoCycleLength = 60
+                    p.portamento = 30
+                    p.portamentoTime = 45
+                    p.bendRange = 4
+                },
+                tuned("sawChip", "SAW CHIP", channel) { p in
+                    p.duty = 2
+                    p.initialVolume = 15
+                    p.envelopeDecay = 15
+                    p.envelopeSustain = 100
+                    p.envelopeRelease = 10
+                    p.vibratoDepth = 30
+                    p.vibratoCycleLength = 40
+                    p.vibratoDelay = 20
+                    p.tremolo = 12
+                },
+                tuned("siren", "SIREN", channel) { p in
+                    p.duty = 1
+                    p.initialVolume = 14
+                    p.envelopeAttack = 8
+                    p.envelopeSustain = 100
+                    p.vibratoDepth = 55
+                    p.vibratoCycleLength = 85
+                    p.portamento = 55
+                    p.portamentoTime = 70
+                    p.bendRange = 12
+                },
+                tuned("tremPulse", "TREM PULSE", channel) { p in
+                    p.duty = 1
+                    p.initialVolume = 15
+                    p.envelopeAttack = 2
+                    p.envelopeDecay = 15
+                    p.envelopeSustain = 100
+                    p.envelopeRelease = 10
+                    p.tremolo = 60
+                }
             ]
         case .pulseB:
             return [
-                preset("bass", "BASS", channel, duty: 2, volume: 15, envelopePace: 0),
-                preset("pluck", "PLUCK", channel, duty: 0, volume: 14, envelopePace: 2),
-                preset("chord", "CHORD STAB", channel, duty: 1, volume: 12, envelopePace: 3),
-                preset("warm", "WARM LEAD", channel, duty: 3, volume: 13, envelopePace: 1),
-                preset("sub", "SUB BASS", channel, duty: 2, volume: 15, envelopePace: 0),
-                preset("marimba", "MARIMBA", channel, duty: 0, volume: 13, envelopePace: 2),
-                preset("wide", "WIDE PULSE", channel, duty: 3, volume: 12, envelopePace: 1)
+                tuned("bassDub", "BASS DUB", channel) { p in
+                    p.duty = 2
+                    p.initialVolume = 15
+                    p.octave = -1
+                    p.envelopeAttack = 3
+                    p.envelopeDecay = 38
+                    p.envelopeSustain = 70
+                    p.envelopeRelease = 6
+                    p.portamento = 35
+                    p.portamentoTime = 40
+                    p.bendRange = 2
+                },
+                tuned("subBass", "SUB BASS", channel) { p in
+                    p.duty = 2
+                    p.initialVolume = 15
+                    p.octave = -1
+                    p.envelopeAttack = 2
+                    p.envelopeDecay = 12
+                    p.envelopeSustain = 100
+                    p.envelopeRelease = 2
+                },
+                tuned("pluck", "PLUCK", channel) { p in
+                    p.duty = 0
+                    p.initialVolume = 14
+                    p.envelopeDecay = 65
+                    p.envelopeSustain = 25
+                    p.envelopeRelease = 6
+                    p.portamento = 25
+                    p.portamentoTime = 30
+                    p.bendRange = 3
+                },
+                tuned("chordStab", "CHORD STAB", channel) { p in
+                    p.duty = 1
+                    p.initialVolume = 12
+                    p.envelopeAttack = 2
+                    p.envelopeDecay = 45
+                    p.envelopeSustain = 45
+                    p.envelopeRelease = 15
+                },
+                tuned("marimba", "MARIMBA", channel) { p in
+                    p.duty = 0
+                    p.initialVolume = 13
+                    p.envelopeDecay = 72
+                    p.envelopeSustain = 18
+                    p.envelopeRelease = 18
+                    p.portamento = 30
+                    p.portamentoTime = 25
+                    p.bendRange = 4
+                },
+                tuned("warmLead", "WARM LEAD", channel) { p in
+                    p.duty = 3
+                    p.initialVolume = 13
+                    p.envelopeAttack = 6
+                    p.envelopeDecay = 18
+                    p.envelopeSustain = 100
+                    p.envelopeRelease = 16
+                    p.vibratoDepth = 22
+                    p.vibratoCycleLength = 55
+                    p.vibratoDelay = 35
+                },
+                tuned("squareBass", "SQUARE BASS", channel) { p in
+                    p.duty = 1
+                    p.initialVolume = 15
+                    p.octave = -1
+                    p.envelopeAttack = 2
+                    p.envelopeDecay = 42
+                    p.envelopeSustain = 55
+                    p.envelopeRelease = 4
+                },
+                tuned("vibe", "VIBE", channel) { p in
+                    p.duty = 1
+                    p.initialVolume = 14
+                    p.envelopeDecay = 15
+                    p.envelopeSustain = 95
+                    p.envelopeRelease = 20
+                    p.vibratoDepth = 42
+                    p.vibratoCycleLength = 30
+                    p.vibratoDelay = 15
+                    p.tremolo = 10
+                },
+                tuned("arpBass", "ARP BASS", channel) { p in
+                    p.duty = 2
+                    p.initialVolume = 15
+                    p.octave = -1
+                    p.envelopeAttack = 2
+                    p.envelopeDecay = 30
+                    p.envelopeSustain = 60
+                    p.octaveFlutterAmount = 16
+                    p.octaveFlutterPattern = ByteOctaveFlutterPattern.baseUp.rawValue
+                },
+                tuned("organPulse", "ORGAN PULSE", channel) { p in
+                    p.duty = 3
+                    p.initialVolume = 13
+                    p.envelopeAttack = 2
+                    p.envelopeDecay = 10
+                    p.envelopeSustain = 100
+                    p.envelopeRelease = 8
+                    p.tremolo = 25
+                }
             ]
         case .wave:
             return [
-                wavePreset("waveBass", "WAVE BASS", channel, [8, 10, 12, 14, 15, 14, 12, 10, 8, 6, 4, 2, 1, 2, 4, 6, 8, 10, 12, 14, 15, 14, 12, 10, 8, 6, 4, 2, 1, 2, 4, 6], volume: 0),
-                wavePreset("triangle", "TRIANGLE", channel, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0], volume: 0),
-                wavePreset("organ", "ORGAN", channel, [8, 12, 14, 12, 8, 4, 2, 4, 8, 12, 14, 12, 8, 4, 2, 4, 8, 12, 14, 12, 8, 4, 2, 4, 8, 12, 14, 12, 8, 4, 2, 4], volume: 1),
-                wavePreset("metal", "METAL", channel, [8, 15, 2, 13, 1, 12, 3, 14, 0, 15, 4, 11, 2, 13, 1, 14, 8, 0, 13, 2, 15, 3, 12, 1, 14, 4, 11, 2, 15, 0, 13, 3], volume: 1),
-                wavePreset("ramp", "RAMP", channel, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], volume: 2),
-                wavePreset("pluck", "PLUCK WAVE", channel, [8, 15, 14, 10, 5, 2, 1, 2, 4, 7, 10, 12, 13, 12, 10, 8, 8, 6, 4, 2, 1, 2, 4, 7, 10, 12, 13, 12, 10, 8, 8, 8], volume: 1),
-                wavePreset("pulse", "PULSE WAVE", channel, [8, 15, 15, 15, 8, 0, 0, 0, 8, 15, 15, 15, 8, 0, 0, 0, 8, 15, 15, 15, 8, 0, 0, 0, 8, 15, 15, 15, 8, 0, 0, 0], volume: 0)
+                tuned("waveBass", "WAVE BASS", channel) { p in
+                    p.waveShape = ByteWaveShape.waveBass.rawValue
+                    p.waveVolume = 0
+                    p.octave = -1
+                    p.envelopeAttack = 2
+                    p.envelopeDecay = 15
+                    p.envelopeSustain = 100
+                },
+                tuned("triLead", "TRI LEAD", channel) { p in
+                    p.waveShape = ByteWaveShape.triangle.rawValue
+                    p.waveVolume = 0
+                    p.envelopeDecay = 15
+                    p.envelopeSustain = 95
+                    p.envelopeRelease = 12
+                    p.vibratoDepth = 26
+                    p.vibratoCycleLength = 50
+                    p.vibratoDelay = 30
+                },
+                tuned("organ", "ORGAN", channel) { p in
+                    p.waveShape = ByteWaveShape.organ.rawValue
+                    p.waveVolume = 1
+                    p.envelopeAttack = 3
+                    p.envelopeDecay = 10
+                    p.envelopeSustain = 100
+                    p.envelopeRelease = 8
+                    p.tremolo = 15
+                },
+                tuned("metal", "METAL", channel) { p in
+                    p.waveShape = ByteWaveShape.metal.rawValue
+                    p.waveVolume = 1
+                    p.envelopeDecay = 20
+                    p.envelopeSustain = 90
+                    p.octaveFlutterAmount = 10
+                    p.octaveFlutterPattern = ByteOctaveFlutterPattern.baseUp.rawValue
+                },
+                tuned("ramp", "RAMP", channel) { p in
+                    p.waveShape = ByteWaveShape.ramp.rawValue
+                    p.waveVolume = 1
+                    p.envelopeSustain = 100
+                    p.portamento = 40
+                    p.portamentoTime = 50
+                    p.bendRange = 6
+                    p.vibratoDepth = 12
+                    p.vibratoCycleLength = 45
+                },
+                tuned("wavePluck", "WAVE PLUCK", channel) { p in
+                    p.waveShape = ByteWaveShape.triangle.rawValue
+                    p.waveVolume = 0
+                    p.envelopeDecay = 65
+                    p.envelopeSustain = 22
+                    p.envelopeRelease = 8
+                },
+                tuned("arpWave", "ARP WAVE", channel) { p in
+                    p.waveShape = ByteWaveShape.waveBass.rawValue
+                    p.waveVolume = 0
+                    p.envelopeDecay = 30
+                    p.envelopeSustain = 50
+                    p.octaveFlutterAmount = 18
+                    p.octaveFlutterPattern = ByteOctaveFlutterPattern.baseUp.rawValue
+                },
+                tuned("bassFlutter", "BASS FLUTTER", channel) { p in
+                    p.waveShape = ByteWaveShape.waveBass.rawValue
+                    p.waveVolume = 0
+                    p.octave = -1
+                    p.envelopeAttack = 2
+                    p.envelopeDecay = 25
+                    p.envelopeSustain = 80
+                    p.octaveFlutterAmount = 12
+                    p.octaveFlutterPattern = ByteOctaveFlutterPattern.baseUpTwoUp.rawValue
+                },
+                tuned("triVibe", "TRI VIBE", channel) { p in
+                    p.waveShape = ByteWaveShape.triangle.rawValue
+                    p.waveVolume = 0
+                    p.envelopeSustain = 100
+                    p.envelopeRelease = 22
+                    p.vibratoDepth = 48
+                    p.vibratoCycleLength = 35
+                    p.vibratoDelay = 10
+                },
+                tuned("rampBass", "RAMP BASS", channel) { p in
+                    p.waveShape = ByteWaveShape.ramp.rawValue
+                    p.waveVolume = 1
+                    p.octave = -1
+                    p.envelopeSustain = 100
+                    p.portamento = 30
+                    p.portamentoTime = 45
+                    p.bendRange = 3
+                }
             ]
         case .drum:
             return [
@@ -520,21 +810,20 @@ struct ByteInstrumentPreset: Identifiable, Hashable, Sendable {
         }
     }
 
-    private static func preset(_ id: String, _ name: String, _ channel: ByteChannel, duty: Int, volume: Int, envelopePace: Int, sweepPace: Int = 0, sweepIncrease: Bool = false, sweepShift: Int = 0) -> ByteInstrumentPreset {
+    /// Builds a hand-tuned patch. The optional waveform lets wave presets carry the
+    /// exact table for their selected fixed shape.
+    private static func tuned(_ id: String, _ name: String, _ channel: ByteChannel, waveform: [Int]? = nil, _ tune: (inout ByteChannelPatch) -> Void) -> ByteInstrumentPreset {
         var patch = ByteChannelPatch(channel: channel)
-        patch.duty = duty
-        patch.initialVolume = volume
-        patch.envelopePace = envelopePace
-        patch.sweepPace = sweepPace
-        patch.sweepIncrease = sweepIncrease
-        patch.sweepShift = sweepShift
-        return ByteInstrumentPreset(id: id, name: name, channel: channel, patch: patch, waveform: ByteProject.starter.waveform)
-    }
-
-    private static func wavePreset(_ id: String, _ name: String, _ channel: ByteChannel, _ table: [Int], volume: Int) -> ByteInstrumentPreset {
-        var patch = ByteChannelPatch(channel: channel)
-        patch.waveVolume = volume
-        patch.waveShape = ["waveBass": 0, "triangle": 1, "organ": 2, "metal": 3, "ramp": 4][id] ?? 0
+        tune(&patch)
+        let table: [Int]
+        if let waveform {
+            table = waveform
+        } else if channel == .wave {
+            let shape = ByteWaveShape.allCases[min(ByteWaveShape.allCases.count - 1, max(0, patch.waveShape))]
+            table = shape.table
+        } else {
+            table = Self.defaultWaveform
+        }
         return ByteInstrumentPreset(id: id, name: name, channel: channel, patch: patch, waveform: table)
     }
 
@@ -550,7 +839,7 @@ struct ByteInstrumentPreset: Identifiable, Hashable, Sendable {
         patch.envelopePace = id == "kick" ? 3 : id == "snare" ? 3 : id == "hat" ? 1 : 2
         patch.lengthCounter = true
         patch.length = length
-        return ByteInstrumentPreset(id: id, name: name, channel: channel, patch: patch, waveform: ByteProject.starter.waveform)
+        return ByteInstrumentPreset(id: id, name: name, channel: channel, patch: patch, waveform: Self.defaultWaveform)
     }
 }
 
@@ -642,6 +931,17 @@ enum BytePatchParameter: String, CaseIterable, Identifiable, Hashable, Sendable 
         case .drumSample: return 1...2
         case .length: return 0...63
         }
+    }
+}
+
+/// Musical response curve shared by faders and sends. Perceptual loudness is roughly
+/// logarithmic, so a linear 0–100 knob wastes the bottom of its travel. The square-root
+/// taper boosts low percentages: 25% of fader travel now delivers 50% of the gain, which
+/// keeps quiet settings audible and gives the top of the range fine control.
+enum ByteAudioTaper {
+    static func gain(for percent: Int) -> Double {
+        let clamped = Double(min(100, max(0, percent)))
+        return pow(clamped / 100.0, 0.5)
     }
 }
 
@@ -986,7 +1286,85 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         self.modifiedAt = modifiedAt
     }
 
-    static let starter = ByteProject()
+    /// Default project: a ready-to-play groove in C major. Two patterns seed a two-bar
+    /// song with preset patches and a light echo, so the very first play already sounds
+    /// like a track instead of an empty grid.
+    static let starter: ByteProject = {
+        let groove = BytePattern(
+            name: "GROOVE",
+            steps: [
+                // PULSE 1 — eighth-note lead motif in C major: E G A C5 A G E D.
+                [64, nil, 67, nil, 69, nil, 72, nil, 69, nil, 67, nil, 64, nil, 62, 67],
+                // PULSE 2 — quarter-note bass: C G F G.
+                [36, nil, nil, nil, 43, nil, nil, nil, 41, nil, nil, nil, 43, nil, nil, nil],
+                // TRIANGLE — held root and fifth an octave up.
+                [48, nil, nil, nil, nil, nil, nil, nil, 55, nil, nil, nil, nil, nil, nil, nil],
+                // DRUM — kick on 0/8, snare on 4/12, offbeat hats.
+                [36, nil, 42, nil, 38, nil, 42, nil, 36, nil, 42, nil, 38, nil, 42, nil]
+            ],
+            noteLengths: [
+                [1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+                [4, 1, 1, 1, 4, 1, 1, 1, 4, 1, 1, 1, 4, 1, 1, 1],
+                [8, 1, 1, 1, 1, 1, 1, 1, 8, 1, 1, 1, 1, 1, 1, 1],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+            ]
+        )
+        let breakdown = BytePattern(
+            name: "BREAK",
+            steps: [
+                // PULSE 1 — sparse C5 A G E line with a pickup.
+                [72, nil, nil, nil, 69, nil, nil, nil, 67, nil, nil, nil, 64, nil, nil, 67],
+                // PULSE 2 — longer bass tones.
+                [36, nil, nil, nil, nil, nil, 43, nil, nil, nil, nil, nil, 36, nil, nil, nil],
+                // TRIANGLE — one sustained root.
+                [48, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil],
+                // DRUM — four-on-the-floor kick, snare on 2/10, hats on 6/14.
+                [36, nil, 38, nil, 36, nil, 42, nil, 36, nil, 38, nil, 36, nil, 42, nil]
+            ],
+            noteLengths: [
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+                [6, 1, 1, 1, 1, 1, 6, 1, 1, 1, 1, 1, 4, 1, 1, 1],
+                [16, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+            ]
+        )
+
+        var project = ByteProject(
+            name: "FIRST BEAT",
+            tempo: 138,
+            key: 0,
+            mode: .major,
+            patterns: [groove, breakdown]
+        )
+        // Hand-tuned starter sounds (from the seed library) so the groove sounds
+        // right immediately.
+        var patches = ByteChannelPatch.defaults
+        if let lead = ByteInstrumentPreset.library(for: .pulseA).first(where: { $0.id == "chipLead" }) { patches[0] = lead.patch }
+        if let bass = ByteInstrumentPreset.library(for: .pulseB).first(where: { $0.id == "bassDub" }) { patches[1] = bass.patch }
+        if let triangle = ByteInstrumentPreset.library(for: .wave).first(where: { $0.id == "waveBass" }) { patches[2] = triangle.patch }
+        // Balanced quick mix; the square-root taper keeps these settings musical.
+        patches[0].masterVolume = 58
+        patches[1].masterVolume = 62
+        patches[2].masterVolume = 60
+        patches[3].masterVolume = 66
+        project.channelPatches = patches
+
+        // Light echo on the lead and drums; bass stays mostly dry.
+        project.effects.echoAmount = 22
+        project.effects.echo = true
+        project.effects.channelSends = [52, 30, 42, 68]
+
+        // Seed Song Mode with a two-bar idea: GROOVE then BREAK. The remaining slots
+        // stay empty so a new user learns to build the arrangement themselves.
+        let a = groove.id
+        let b = breakdown.id
+        project.arrangement = [a, b]
+        project.songArrangement = (0..<16).map { index in
+            let patternID: UUID? = index == 0 ? a : (index == 1 ? b : nil)
+            return ByteSongSlot(patternID: patternID, isContinuation: false)
+        }
+        return project
+    }()
 
     var arrangedPatterns: [BytePattern] {
         let lookup = Dictionary(uniqueKeysWithValues: patterns.map { ($0.id, $0) })

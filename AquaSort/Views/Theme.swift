@@ -131,13 +131,13 @@ struct HardwareSection<Content: View>: View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(title)
-                    .font(.system(size: 9, weight: .black, design: .monospaced))
+                    .font(.custom("Futura-Bold", size: 9))
                     .tracking(1.1)
                     .foregroundStyle(Color.gbLight)
                 Spacer(minLength: 4)
                 if let detail {
                     Text(detail)
-                        .font(.system(size: 7, weight: .bold, design: .monospaced))
+                        .font(.custom("Futura-Medium", size: 8))
                         .foregroundStyle(Color.mutedText)
                         .lineLimit(1)
                         .minimumScaleFactor(0.7)
@@ -151,32 +151,40 @@ struct HardwareSection<Content: View>: View {
         .padding(11)
         .background(
             ZStack {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
                     .fill(Color.plasticRaised.opacity(0.72))
                 LinearGradient(
                     colors: [Color.white.opacity(0.045), Color.clear, Color.hardwareBlack.opacity(0.22)],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
                 )
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
                     .stroke(Color.plasticHighlight.opacity(0.72), lineWidth: 1)
-                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .stroke(Color.hardwareBlack.opacity(0.8), lineWidth: 1)
                     .padding(3)
             }
         )
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .shadow(color: Color.black.opacity(0.28), radius: 5, y: 3)
     }
 }
 
-struct LCDPanel<Content: View>: View {
+struct LCDPanel<Content: View, Header: View>: View {
     let title: String?
+    let header: Header?
     @ViewBuilder let content: () -> Content
 
-    init(title: String? = nil, @ViewBuilder content: @escaping () -> Content) {
+    init(title: String? = nil, @ViewBuilder content: @escaping () -> Content) where Header == EmptyView {
         self.title = title
+        self.header = nil
+        self.content = content
+    }
+
+    init(title: String? = nil, @ViewBuilder header: () -> Header, @ViewBuilder content: @escaping () -> Content) {
+        self.title = title
+        self.header = header()
         self.content = content
     }
 
@@ -185,7 +193,7 @@ struct LCDPanel<Content: View>: View {
             if let title {
                 HStack(spacing: 8) {
                     Text(title)
-                        .font(.system(size: 10, weight: .black, design: .monospaced))
+                        .font(.custom("Futura-Bold", size: 10))
                         .tracking(0.9)
                         .lineLimit(1)
                         .minimumScaleFactor(0.62)
@@ -193,6 +201,9 @@ struct LCDPanel<Content: View>: View {
                     Rectangle()
                         .fill(Color.screenShadow.opacity(0.45))
                         .frame(height: 2)
+                    if let header {
+                        header
+                    }
                 }
                 .padding(.bottom, 1)
             }
@@ -201,31 +212,75 @@ struct LCDPanel<Content: View>: View {
         .padding(11)
         .background(
             ZStack {
-                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
                     .fill(Color.screen)
                 LinearGradient(
                     colors: [Color.white.opacity(0.32), Color.clear, Color.screenShadow.opacity(0.14)],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
                 )
-                .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .stroke(Color.screenShadow.opacity(0.22), lineWidth: 1)
                     .padding(3)
             }
         )
-        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        // Faint dot-matrix scanlines sit above the content so the panel reads as a
+        // real LCD screen. Opacity is kept low so text and controls stay crisp.
         .overlay(
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
+            LCDScreenTexture()
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        )
+        // Soft glass sheen: light catches the top edge of the screen glass.
+        .overlay(alignment: .top) {
+            LinearGradient(
+                colors: [Color.white.opacity(0.09), Color.white.opacity(0.02), Color.clear],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .frame(height: 46)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        }
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .stroke(Color.gbInk.opacity(0.78), lineWidth: 1.5)
         )
         .overlay(alignment: .top) {
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .stroke(Color.white.opacity(0.48), lineWidth: 1)
                 .padding(2)
                 .allowsHitTesting(false)
         }
         .shadow(color: Color.black.opacity(0.34), radius: 7, y: 4)
+    }
+}
+
+/// A faint dot-matrix texture that makes an LCD panel read as a real Game Boy
+/// screen. The scanlines sit above the content at very low opacity so contrast
+/// and readability are preserved.
+private struct LCDScreenTexture: View {
+    var body: some View {
+        Canvas { context, size in
+            // Horizontal scanlines — the DMG's characteristic line pattern.
+            for y in stride(from: 0, through: size.height, by: 3) {
+                context.fill(
+                    Path(CGRect(x: 0, y: y, width: size.width, height: 1)),
+                    with: .color(Color.black.opacity(0.055))
+                )
+            }
+            // Faint vertical columns complete the dot-matrix grid without moiré.
+            for x in stride(from: 0, through: size.width, by: 3) {
+                context.fill(
+                    Path(CGRect(x: x, y: 0, width: 1, height: size.height)),
+                    with: .color(Color.black.opacity(0.022))
+                )
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 
@@ -250,7 +305,7 @@ struct PixelButton: View {
                         .font(.system(size: 14, weight: .black))
                 }
                 Text(title)
-                    .font(.system(size: 12, weight: .black, design: .monospaced))
+                    .font(.custom("Futura-Bold", size: 12))
                     .tracking(0.4)
                     .lineLimit(1)
                     .minimumScaleFactor(0.72)
@@ -260,14 +315,14 @@ struct PixelButton: View {
             .frame(minWidth: 44, minHeight: 44)
             .background(
                 ZStack {
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .fill(accent)
                     LinearGradient(colors: [Color.white.opacity(0.20), Color.clear, Color.black.opacity(0.12)], startPoint: .top, endPoint: .bottom)
                 }
             )
-            .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             .overlay(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .stroke(Color.gbInk, lineWidth: 1.5)
             )
             .shadow(color: Color.black.opacity(0.28), radius: 3, y: 2)

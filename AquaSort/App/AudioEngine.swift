@@ -250,7 +250,7 @@ private final class ByteLiveAudioState: @unchecked Sendable {
                     value = livePulse(phase: phases[channelIndex], duty: duty)
                     phases[channelIndex] = (phases[channelIndex] + frequency / sampleRate).truncatingRemainder(dividingBy: 1.0)
                 case .wave:
-                    value = liveTriangle(phase: phases[channelIndex])
+                    value = liveWave(phase: phases[channelIndex], shape: patch.waveShape, volume: patch.waveVolume)
                     phases[channelIndex] = (phases[channelIndex] + frequency / sampleRate).truncatingRemainder(dividingBy: 1.0)
                 case .drum:
                     value = liveDrumSample(note: note, patch: patch, channelIndex: channelIndex)
@@ -262,11 +262,11 @@ private final class ByteLiveAudioState: @unchecked Sendable {
                     let tremolo = 1.0 - tremoloAmount * 0.65 * (0.5 + 0.5 * sin((stepElapsed + Double(step) * secondsPerStep) * 2.0 * .pi * 7.0))
                     shaped *= tremolo
                 }
-                let masterLevel = Double(min(100, max(0, patch.masterVolume))) / 100.0
+                let masterLevel = ByteAudioTaper.gain(for: patch.masterVolume)
                 let mixed = gated ? 0.0 : shaped * (channel == .drum ? 0.16 : (channel == .pulseA || channel == .pulseB ? 0.06 : 0.12)) * (Double(effectiveVolume) / 15.0) * envelopeLevel * masterLevel
                 let sendIndex = ByteChannel.allCases.firstIndex(of: channel) ?? 0
                 let send = project.effects.channelSends.indices.contains(sendIndex)
-                    ? Double(min(100, max(0, project.effects.channelSends[sendIndex]))) / 100.0
+                    ? ByteAudioTaper.gain(for: project.effects.channelSends[sendIndex])
                     : 1.0
                 if patch.panLeft {
                     left += mixed
@@ -353,6 +353,20 @@ private final class ByteLiveAudioState: @unchecked Sendable {
     private func liveTriangle(phase: Double) -> Double {
         let wrapped = phase.truncatingRemainder(dividingBy: 1.0)
         return wrapped < 0.5 ? (wrapped * 4.0 - 1.0) : (3.0 - wrapped * 4.0)
+    }
+
+    /// Channel 3 is a 32-sample wavetable. The Sound Lab shape selector chooses the
+    /// table, while the hardware-style volume control applies the DMG four-level gain.
+    private func liveWave(phase: Double, shape: Int, volume: Int) -> Double {
+        let table = ByteWaveShape.allCases[min(ByteWaveShape.allCases.count - 1, max(0, shape))].table
+        let wrapped = phase - floor(phase)
+        let position = wrapped * Double(table.count)
+        let lower = Int(position) % table.count
+        let upper = (lower + 1) % table.count
+        let blend = position - floor(position)
+        let sample = Double(table[lower]) + (Double(table[upper]) - Double(table[lower])) * blend
+        let gains = [1.0, 0.5, 0.25, 0.0]
+        return (sample / 7.5 - 1.0) * gains[min(3, max(0, volume))]
     }
 
     private func liveSweep(_ normalized: Double, patch: ByteChannelPatch) -> Double {
@@ -452,7 +466,10 @@ final class ByteAudioEngine {
             try engine.start()
             playing = true
             onStep(0, startSongSlot.flatMap { slotIndices.firstIndex(of: $0) }.flatMap { slotIndices[$0] } ?? slotIndices.first ?? -1)
-            timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
+            // Poll transport at 60 Hz: steps are at least ~62 ms apart even at 240 BPM,
+            // and the playhead animates between updates, so 120 Hz only doubled lock
+            // contention with the audio thread and battery drain in the background.
+            timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
                 guard let self else { return }
                 let position = self.liveState.currentPosition()
                 onStep(position.step, position.songSlot)
@@ -566,7 +583,7 @@ enum ByteRenderer {
                         let crushed = (value * levels).rounded() / levels
                         value += (crushed - value) * blend
                     }
-                    let masterLevel = Double(min(100, max(0, patch.masterVolume))) / 100.0
+                    let masterLevel = ByteAudioTaper.gain(for: patch.masterVolume)
                     let mixed = gated ? 0.0 : Float(value * baseGain * (Double(effectiveVolume) / 15.0) * envelopeLevel * masterLevel)
                     if patch.panLeft { output[sample * 2] += mixed }
                     if patch.panRight { output[sample * 2 + 1] += mixed }
@@ -667,7 +684,7 @@ enum ByteRenderer {
                     value = pulse(phases[channelIndex], duty: duties[min(3, max(0, patch.duty))])
                     phases[channelIndex] = (phases[channelIndex] + frequency / sampleRate).truncatingRemainder(dividingBy: 1.0)
                 case .wave:
-                    value = triangle(phase: phases[channelIndex])
+                    value = wave(phase: phases[channelIndex], shape: patch.waveShape, volume: patch.waveVolume)
                     phases[channelIndex] = (phases[channelIndex] + frequency / sampleRate).truncatingRemainder(dividingBy: 1.0)
                 case .drum:
                     let voice = ByteDrumVoice.voice(for: note)
@@ -687,11 +704,11 @@ enum ByteRenderer {
                     let tremolo = 1.0 - tremoloAmount * 0.65 * (0.5 + 0.5 * sin((stepElapsed + Double(step) * secondsPerStep) * 2.0 * .pi * 7.0))
                     shaped *= tremolo
                 }
-                let masterLevel = Double(min(100, max(0, patch.masterVolume))) / 100.0
+                let masterLevel = ByteAudioTaper.gain(for: patch.masterVolume)
                 let mixed = gated ? 0.0 : shaped * (channel == .drum ? 0.16 : (channel == .pulseA || channel == .pulseB ? 0.06 : 0.12)) * (Double(effectiveVolume) / 15.0) * envelopeLevel * masterLevel
                 let sendIndex = ByteChannel.allCases.firstIndex(of: channel) ?? 0
                 let send = project.effects.channelSends.indices.contains(sendIndex)
-                    ? Double(min(100, max(0, project.effects.channelSends[sendIndex]))) / 100.0
+                    ? ByteAudioTaper.gain(for: project.effects.channelSends[sendIndex])
                     : 1.0
                 if patch.panLeft {
                     left += mixed
@@ -790,6 +807,19 @@ enum ByteRenderer {
     private static func triangle(phase: Double) -> Double {
         let wrapped = phase.truncatingRemainder(dividingBy: 1.0)
         return wrapped < 0.5 ? (wrapped * 4.0 - 1.0) : (3.0 - wrapped * 4.0)
+    }
+
+    /// Stateful renderer counterpart to liveWave so exports match live playback.
+    private static func wave(phase: Double, shape: Int, volume: Int) -> Double {
+        let table = ByteWaveShape.allCases[min(ByteWaveShape.allCases.count - 1, max(0, shape))].table
+        let wrapped = phase - floor(phase)
+        let position = wrapped * Double(table.count)
+        let lower = Int(position) % table.count
+        let upper = (lower + 1) % table.count
+        let blend = position - floor(position)
+        let sample = Double(table[lower]) + (Double(table[upper]) - Double(table[lower])) * blend
+        let gains = [1.0, 0.5, 0.25, 0.0]
+        return (sample / 7.5 - 1.0) * gains[min(3, max(0, volume))]
     }
 
 
