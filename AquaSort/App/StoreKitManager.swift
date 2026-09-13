@@ -13,7 +13,14 @@ final class StoreKitManager {
     }
 
     /// One-time Export Pack; unlocking MIDI and WAV export. Project-file export stays free.
-    let unlockProductID = "com.bytepocket.studio.export"
+    ///
+    /// This must be the identifier the product actually carries in App Store Connect. That app's
+    /// live product is `exportunlock`, and an in-app purchase identifier cannot be renamed once the
+    /// product exists, so the code side is the side that conforms. It was previously
+    /// `com.bytepocket.studio.export`, which no live product answered to — `Product.products(for:)`
+    /// came back empty and the pack was unbuyable while the local StoreKit config, which the same
+    /// string also satisfies, kept it looking healthy in Xcode.
+    let unlockProductID = "exportunlock"
     var status: PurchaseStatus = .loading
     /// Receipt-backed entitlement. Only a signed, verified, non-revoked transaction
     /// for the Export Pack sets this true — a successful product fetch never does.

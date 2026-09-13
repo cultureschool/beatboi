@@ -2517,8 +2517,13 @@ final class BeatboiTests: XCTestCase {
     /// while App Store Connect offered `exportunlock`, so `Product.products(for:)`
     /// came back empty and the pack was unbuyable in TestFlight — while looking
     /// perfectly healthy in Xcode, because the local StoreKit config masks exactly
-    /// this class of mistake. This test covers the app-versus-config half; the
-    /// release script checks both of them against live App Store Connect.
+    /// this class of mistake.
+    ///
+    /// Both sides now carry the live `exportunlock`, because a product identifier
+    /// cannot be renamed once the product exists, so the code is the side that had
+    /// to move. This test covers the app-versus-config half; the release script
+    /// checks both against live App Store Connect, which is the one side a test
+    /// cannot reach.
     func testExportPackProductIDMatchesStoreKitConfig() throws {
         let config = URL(fileURLWithPath: #filePath)   // <repo>/AquaSortTests/WaterLogicTests.swift
             .deletingLastPathComponent()               // <repo>/AquaSortTests

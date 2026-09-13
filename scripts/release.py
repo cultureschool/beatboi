@@ -374,7 +374,9 @@ class Release:
         A mismatch makes the paid unlock impossible to buy in TestFlight and in the
         App Store, while Xcode's local StoreKit config keeps it looking healthy.
         That is exactly how `exportunlock` (live) and `com.bytepocket.studio.export`
-        (app and config) drifted apart unnoticed, so check all three here.
+        (app and config) drifted apart unnoticed, so check all three here. This is
+        the only side a unit test cannot reach, which is why the gate lives on the
+        release path.
         """
         requested = export_pack_product_id()
         offered = storekit_config_product_ids()

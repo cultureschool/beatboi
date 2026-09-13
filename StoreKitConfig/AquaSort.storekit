@@ -15,7 +15,7 @@
           "locale" : "en_US"
         }
       ],
-      "productID" : "com.bytepocket.studio.export",
+      "productID" : "exportunlock",
       "referenceName" : "Export Pack",
       "type" : "NonConsumable"
     }
