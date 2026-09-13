@@ -234,11 +234,143 @@ final class BeatboiTests: XCTestCase {
         XCTAssertGreaterThan(data.count, 44)
     }
 
+    /// The WAV writer appends its PCM payload in bulk chunks for speed, which must
+    /// not change a single byte of the file. Rebuild the same file with a naive
+    /// per-sample little-endian loop and require the two to be identical, so the
+    /// encoder can keep being optimized without silently altering exports.
+    func testWAVPayloadMatchesNaiveReferenceEncoding() {
+        let project = ByteProject.starter
+        let samples = ByteRenderer.render(project: project, sampleRate: 8_000)
+        let optimized = ByteRenderer.wavData(project: project, sampleRate: 8_000)
+
+        var reference = Data()
+        func appendLittleEndian<T: FixedWidthInteger>(_ value: T) {
+            var little = value.littleEndian
+            withUnsafeBytes(of: &little) { reference.append(contentsOf: $0) }
+        }
+
+        let channels: UInt16 = 2
+        let bits: UInt16 = 16
+        let bytesPerSample = Int(bits / 8)
+        let dataSize = UInt32(samples.count * bytesPerSample)
+        reference.append(contentsOf: Array("RIFF".utf8))
+        appendLittleEndian(36 + dataSize)
+        reference.append(contentsOf: Array("WAVEfmt ".utf8))
+        appendLittleEndian(UInt32(16))
+        appendLittleEndian(UInt16(1))
+        appendLittleEndian(channels)
+        appendLittleEndian(UInt32(8_000))
+        appendLittleEndian(UInt32(8_000 * Int(channels) * bytesPerSample))
+        appendLittleEndian(UInt16(Int(channels) * bytesPerSample))
+        appendLittleEndian(bits)
+        reference.append(contentsOf: Array("data".utf8))
+        appendLittleEndian(dataSize)
+        for sample in samples {
+            appendLittleEndian(Int16(max(-1, min(1, sample)) * Float(Int16.max)))
+        }
+
+        XCTAssertEqual(optimized.count, reference.count)
+        XCTAssertEqual(optimized, reference)
+    }
+
     func testMIDIHasHeaderAndFiveTracks() {
         let data = ByteMIDI.export(project: ByteProject.starter)
         XCTAssertEqual(String(data: data[0..<4], encoding: .ascii), "MThd")
         XCTAssertEqual(data.readBigEndianForTests(UInt16.self, at: 10), 5)
         XCTAssertEqual(String(data: data[14..<18], encoding: .ascii), "MTrk")
+    }
+
+    /// A step is a sixteenth note, so two hits four steps apart must sit exactly four
+    /// sixteenths apart in the exported ticks. The export used to declare the division as
+    /// though a step were a whole quarter note, which made every file play four times slow in
+    /// a DAW while still round-tripping correctly through this app's own importer.
+    func testMIDITicksPerStepMatchesHeaderDivision() {
+        guard let drumRow = ByteChannel.allCases.firstIndex(of: .drum) else {
+            return XCTFail("expected a drum channel")
+        }
+        var project = ByteProject(name: "TIMING", tempo: 120, patterns: [BytePattern.empty(name: "PATTERN 01")])
+        project.patterns[0].steps[drumRow][0] = ByteDrumVoice.note(voice: .kick)
+        project.patterns[0].steps[drumRow][4] = ByteDrumVoice.note(voice: .kick)
+        project.patterns[0].noteLengths[drumRow][0] = 1
+        project.patterns[0].noteLengths[drumRow][4] = 1
+
+        let data = ByteMIDI.export(project: project)
+
+        let division = Int(data.readBigEndianForTests(UInt16.self, at: 12))
+        XCTAssertGreaterThan(division, 0, "division must be tick-based, not SMPTE")
+        XCTAssertEqual(division % 4, 0, "the division must split evenly into sixteenth notes")
+        let ticksPerStep = division / 4
+
+        // Track 0 is the tempo track, then one track per channel in allCases order.
+        let onsets = noteOnTicks(inTrackAt: trackOffset(drumRow + 1, in: data), of: data)
+        XCTAssertEqual(onsets.count, 2, "both drum hits should export")
+        XCTAssertEqual(onsets[0], 0, "the first hit lands on the downbeat")
+        XCTAssertEqual(onsets[1], ticksPerStep * 4, "four steps must span four sixteenth notes")
+
+        // The importer reads the same file at the same step positions.
+        let imported = ByteMIDI.importIntoProject(data, project: project)
+        XCTAssertNotNil(imported?.patterns[0].steps[drumRow][0])
+        XCTAssertNotNil(imported?.patterns[0].steps[drumRow][4])
+    }
+
+    /// Byte offset of the nth `MTrk` chunk in an exported file; 0 is the tempo track.
+    private func trackOffset(_ index: Int, in data: Data) -> Int {
+        var offset = 14  // "MThd" + length + 6 bytes of header
+        for _ in 0..<index {
+            offset += 8 + Int(data.readBigEndianForTests(UInt32.self, at: offset + 4))
+        }
+        return offset
+    }
+
+    /// Absolute ticks of every note-on in one track.
+    private func noteOnTicks(inTrackAt offset: Int, of data: Data) -> [Int] {
+        let end = min(data.count, offset + 8 + Int(data.readBigEndianForTests(UInt32.self, at: offset + 4)))
+        var position = offset + 8
+        var tick = 0
+        var runningStatus: UInt8 = 0
+        var onsets: [Int] = []
+
+        while position < end {
+            var delta = 0
+            while position < end {
+                let byte = data[position]
+                position += 1
+                delta = (delta << 7) | Int(byte & 0x7F)
+                if byte & 0x80 == 0 { break }
+            }
+            tick += delta
+            guard position < end else { break }
+
+            var status = data[position]
+            if status < 0x80 { status = runningStatus } else { position += 1 }
+            if status == 0xFF {
+                position += 1                                  // meta event type
+                var metaLength = 0
+                while position < end {
+                    let byte = data[position]
+                    position += 1
+                    metaLength = (metaLength << 7) | Int(byte & 0x7F)
+                    if byte & 0x80 == 0 { break }
+                }
+                position = min(end, position + metaLength)
+                continue
+            }
+            runningStatus = status
+
+            let kind = status & 0xF0
+            switch kind {
+            case 0x80, 0x90:
+                guard position + 1 < end else { return onsets }
+                let velocity = data[position + 1]
+                position += 2
+                if kind == 0x90, velocity > 0 { onsets.append(tick) }
+            case 0xC0, 0xD0:
+                position += 1
+            default:
+                position += 2
+            }
+        }
+        return onsets
     }
 
     func testMIDIImportCreatesProject() {
@@ -859,6 +991,1455 @@ final class BeatboiTests: XCTestCase {
         XCTAssertEqual(recovered.songArrangement.count, 16)
     }
 
+    /// One unreadable project used to fail the whole library decode, and the next save then
+    /// overwrote every project with a blank one. The readable projects must survive it.
+    func testUnreadableProjectIsSkippedWithoutLosingTheRest() throws {
+        let suite = "BeatboiLenientLoadTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let keeper = ByteProject(name: "KEEPER", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        var payload = try JSONEncoder.bytePocketEncoder.encode([keeper])
+        payload.removeLast()  // drop the closing bracket so another entry can be appended
+        payload.append(contentsOf: Data(#",{"id":"not-a-uuid","name":42}"#.utf8))
+        payload.append(contentsOf: Data("]".utf8))
+        defaults.set(payload, forKey: "bytePocket.projects")
+
+        let store = GameStore(defaults: defaults)
+
+        XCTAssertEqual(store.projects.count, 1, "the readable project must survive")
+        XCTAssertEqual(store.projects[0].name, "KEEPER")
+        XCTAssertEqual(store.libraryRecovery?.droppedProjects, 1)
+        XCTAssertEqual(store.libraryRecovery?.usedBackup, false)
+        // The payload holding the unreadable entry is preserved, not thrown away.
+        XCTAssertNotNil(defaults.data(forKey: "bytePocket.projects.unreadable"))
+    }
+
+    /// The primary payload is mirrored into a rolling backup once it reads back cleanly, and an
+    /// unreadable primary falls back to it instead of starting the user over from silence.
+    func testUnreadableLibraryFallsBackToTheRollingBackup() {
+        let suite = "BeatboiRollingBackupTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let first = GameStore(defaults: defaults)
+        first.renameProject("KEEPER")
+        XCTAssertEqual(first.projects[0].name, "KEEPER")
+
+        // A second launch mirrors the payload it just read into the backup.
+        _ = GameStore(defaults: defaults)
+        XCTAssertNotNil(defaults.data(forKey: "bytePocket.projects.backup"))
+
+        // Now the primary is unusable, the way a torn write would leave it.
+        let corrupt = Data("{ not json".utf8)
+        defaults.set(corrupt, forKey: "bytePocket.projects")
+        let recovered = GameStore(defaults: defaults)
+
+        XCTAssertEqual(recovered.projects.count, 1)
+        XCTAssertEqual(recovered.projects[0].name, "KEEPER")
+        XCTAssertEqual(recovered.libraryRecovery?.usedBackup, true)
+        // The corrupt bytes are still preserved...
+        XCTAssertEqual(defaults.data(forKey: "bytePocket.projects.unreadable"), corrupt)
+        // ...and the primary has already been healed from the backup.
+        XCTAssertNotEqual(defaults.data(forKey: "bytePocket.projects"), corrupt)
+    }
+
+    /// Recovering from the backup must leave the primary readable again. Otherwise the next
+    /// launch repeats the recovery, and the user is told their library was restored every single
+    /// time they open the app — a scare that never resolves.
+    func testRecoveryHealsThePrimarySoLaterLaunchesLoadCleanly() {
+        let suite = "BeatboiPrimaryHealingTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let first = GameStore(defaults: defaults)
+        first.renameProject("KEEPER")
+        _ = GameStore(defaults: defaults)   // mirror a clean read into the backup
+        XCTAssertNotNil(defaults.data(forKey: "bytePocket.projects.backup"))
+
+        let corrupt = Data("\u{0}\u{1}torn write".utf8)
+        defaults.set(corrupt, forKey: "bytePocket.projects")
+        let recovered = GameStore(defaults: defaults)
+        XCTAssertEqual(recovered.libraryRecovery?.usedBackup, true, "precondition: this launch must actually recover")
+
+        // The next launch must be a normal one, not a second recovery.
+        let secondLaunch = GameStore(defaults: defaults)
+        XCTAssertEqual(secondLaunch.projects.map(\.name), ["KEEPER"])
+        XCTAssertNil(secondLaunch.libraryRecovery, "a healed primary must load without reporting recovery")
+
+        // Prove the healing lives in the primary itself, not in the backup we keep reading from:
+        // remove the backup and the library must still load cleanly.
+        defaults.removeObject(forKey: "bytePocket.projects.backup")
+        let withoutBackup = GameStore(defaults: defaults)
+        XCTAssertEqual(withoutBackup.projects.map(\.name), ["KEEPER"])
+        XCTAssertNil(withoutBackup.libraryRecovery, "the primary itself must now be readable")
+        // Healing is a relocation: the torn bytes stay quarantined rather than vanishing.
+        XCTAssertEqual(defaults.data(forKey: "bytePocket.projects.unreadable"), corrupt)
+    }
+
+    /// Healing applies only to a library rebuilt from the backup. A payload that was partly
+    /// readable is left byte-for-byte intact, because its unreadable entries are the very bytes a
+    /// future build might be able to recover.
+    func testPartlyReadablePrimaryIsNotRewrittenToLookClean() throws {
+        let suite = "BeatboiNoRewriteTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let keeper = ByteProject(name: "KEEPER", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        let good = try JSONSerialization.jsonObject(with: try JSONEncoder.bytePocketEncoder.encode(keeper)) as? [String: Any]
+        let payload = try JSONSerialization.data(withJSONObject: [good as Any, ["id": "nope"]])
+        defaults.set(payload, forKey: "bytePocket.projects")
+
+        let store = GameStore(defaults: defaults)
+        XCTAssertEqual(store.libraryRecovery?.droppedProjects, 1)
+        XCTAssertEqual(store.libraryRecovery?.usedBackup, false, "a partly readable primary must not be treated as a backup recovery")
+        // The unreadable entry is still in the stored payload, untouched.
+        XCTAssertEqual(defaults.data(forKey: "bytePocket.projects"), payload)
+        // And it was quarantined, so the bytes survive either way.
+        XCTAssertEqual(defaults.data(forKey: "bytePocket.projects.unreadable"), payload)
+    }
+
+    /// A project deleted in an earlier session is still in the rolling backup, which is rotated at
+    /// launch — so the backup is snapshotted before the rotation and offered back in the cart.
+    /// Otherwise preserved work would only ever be reachable by reading the raw defaults plist.
+    func testProjectDeletedInAnEarlierSessionIsOfferedBackFromTheBackup() {
+        let suite = "BeatboiPreservedBackupTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let first = GameStore(defaults: defaults)
+        first.renameProject("KEEPER")
+        first.newProject()                       // cart: [NEW QUEST 02, KEEPER]
+        XCTAssertEqual(first.projects.count, 2)
+
+        // The next launch mirrors the two-project library into the rolling backup.
+        let second = GameStore(defaults: defaults)
+        XCTAssertNotNil(defaults.data(forKey: "bytePocket.projects.backup"))
+
+        // Then the user deletes one project; the backup still holds a copy of it.
+        second.deleteProject(second.projects.first { $0.name.hasPrefix("NEW QUEST") }!)
+        XCTAssertEqual(second.projects.map(\.name), ["KEEPER"])
+        // This exercises the backup as the only way back, which is what an install that deleted
+        // the project before the deleted-project payload existed looks like. With that payload
+        // present the same project is offered through the delete path instead.
+        defaults.removeObject(forKey: "bytePocket.projects.deleted")
+
+        let third = GameStore(defaults: defaults)
+        XCTAssertEqual(third.projects.map(\.name), ["KEEPER"], "the live cart must not change")
+        XCTAssertEqual(third.recoveryCandidates.map(\.project.name), ["NEW QUEST 02"])
+        XCTAssertEqual(third.recoveryCandidates.map(\.source), [.backup])
+        XCTAssertTrue(third.hasRecoverableProjects)
+
+        let recovered = third.recoveryCandidates[0]
+        XCTAssertTrue(third.restoreRecoveredProject(recovered))
+        XCTAssertEqual(Set(third.projects.map(\.name)), ["KEEPER", "NEW QUEST 02"])
+        XCTAssertEqual(third.project.name, "NEW QUEST 02", "a restored project becomes the selection")
+        XCTAssertTrue(third.recoveryCandidates.isEmpty, "a restored project is no longer offered")
+        XCTAssertFalse(third.restoreRecoveredProject(recovered), "restoring a project already in the cart is refused")
+
+        // Restoring writes the cart, so the next launch is an ordinary one.
+        let relaunch = GameStore(defaults: defaults)
+        XCTAssertEqual(Set(relaunch.projects.map(\.name)), ["KEEPER", "NEW QUEST 02"])
+        XCTAssertTrue(relaunch.recoveryCandidates.isEmpty)
+    }
+
+    /// Projects kept in the quarantine payload are offered back too, which is the difference
+    /// between bytes being preserved and bytes being reachable.
+    func testQuarantinedProjectsAreOfferedBackAndSurviveRestoring() throws {
+        let suite = "BeatboiQuarantineRestoreTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let keeper = ByteProject(name: "KEEPER", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        let orphan = ByteProject(name: "ORPHAN", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        let quarantined = try JSONEncoder.bytePocketEncoder.encode([orphan])
+        defaults.set(try JSONEncoder.bytePocketEncoder.encode([keeper]), forKey: "bytePocket.projects")
+        defaults.set(quarantined, forKey: "bytePocket.projects.unreadable")
+
+        let store = GameStore(defaults: defaults)
+        XCTAssertEqual(store.projects.map(\.name), ["KEEPER"])
+        XCTAssertEqual(store.recoveryCandidates.map(\.project.name), ["ORPHAN"])
+        XCTAssertEqual(store.recoveryCandidates.map(\.source), [.quarantine])
+
+        XCTAssertTrue(store.restoreRecoveredProject(store.recoveryCandidates[0]))
+        XCTAssertEqual(Set(store.projects.map(\.name)), ["KEEPER", "ORPHAN"])
+        // Restoring is additive: the preserved bytes stay put rather than being consumed.
+        XCTAssertEqual(defaults.data(forKey: "bytePocket.projects.unreadable"), quarantined)
+
+        let relaunch = GameStore(defaults: defaults)
+        XCTAssertEqual(Set(relaunch.projects.map(\.name)), ["KEEPER", "ORPHAN"])
+        XCTAssertTrue(relaunch.recoveryCandidates.isEmpty)
+    }
+
+    /// Preserved bytes that cannot be decoded are reported rather than silently dropped, and they
+    /// are not offered as restorable projects the app could not actually produce.
+    func testPreservedBytesThatCannotBeDecodedAreReportedNotOffered() throws {
+        let suite = "BeatboiPreservedUnreadableTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let keeper = ByteProject(name: "KEEPER", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        let encoded = try JSONEncoder.bytePocketEncoder.encode([keeper])
+        let keeperObject = try XCTUnwrap((JSONSerialization.jsonObject(with: encoded) as? [[String: Any]])?.first)
+        defaults.set(encoded, forKey: "bytePocket.projects")
+        defaults.set(try JSONSerialization.data(withJSONObject: [keeperObject, ["id": "nope"]]), forKey: "bytePocket.projects.unreadable")
+
+        let store = GameStore(defaults: defaults)
+        XCTAssertTrue(store.recoveryCandidates.isEmpty, "the preserved KEEPER matches the cart exactly, so nothing is offered")
+        XCTAssertEqual(store.preservedLibrary.unreadableEntries, 1)
+        XCTAssertTrue(store.hasRecoverableProjects, "bytes that could not be read must still be surfaced")
+
+        // A payload that cannot be read at all counts as a whole preserved copy, not as an entry.
+        defaults.removePersistentDomain(forName: suite)
+        defaults.set(encoded, forKey: "bytePocket.projects")
+        defaults.set(Data("not json at all".utf8), forKey: "bytePocket.projects.unreadable")
+        let garbage = GameStore(defaults: defaults)
+        XCTAssertEqual(garbage.preservedLibrary.unreadableCopies, 1)
+        XCTAssertEqual(garbage.preservedLibrary.unreadableEntries, 0)
+        XCTAssertTrue(garbage.hasRecoverableProjects)
+    }
+
+    /// The rolling backup also holds each project as it stood before the last session's edits. That
+    /// copy is offered back as an earlier version, and restoring it must keep both: the older copy
+    /// arrives as a project of its own instead of replacing the newer one in the cart.
+    func testEarlierVersionOfAProjectInTheCartRestoresAsASeparateCopy() {
+        let suite = "BeatboiEarlierVersionTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let first = GameStore(defaults: defaults)
+        first.renameProject("KEEPER")
+        let originalTempo = first.project.tempo
+
+        // The next launch mirrors the project as it stood into the rolling backup, and the edit
+        // after that is what makes the preserved copy an older version.
+        let second = GameStore(defaults: defaults)
+        let keeperID = second.project.id
+        let editedTempo = originalTempo + 30
+        second.updateTempo(editedTempo)
+        XCTAssertEqual(second.project.tempo, editedTempo, "precondition: the edit must not be clamped away")
+
+        let third = GameStore(defaults: defaults)
+        XCTAssertEqual(third.projects.map(\.name), ["KEEPER"], "the live cart must not gain anything yet")
+        XCTAssertEqual(third.recoveryCandidates.count, 1)
+        let candidate = third.recoveryCandidates[0]
+        XCTAssertEqual(candidate.kind, .earlierVersion)
+        XCTAssertEqual(candidate.id, keeperID, "the copy is recognised by the id it shares with the cart")
+        XCTAssertEqual(candidate.project.tempo, originalTempo, "the candidate holds the older content")
+        XCTAssertTrue(third.missingRecoverableProjects.isEmpty, "nothing was lost, so the launch is not interrupted")
+
+        XCTAssertTrue(third.restoreRecoveredProject(candidate))
+        XCTAssertEqual(third.projects.count, 2, "restoring an earlier version keeps both copies")
+        XCTAssertEqual(third.project.name, "KEEPER COPY")
+        XCTAssertEqual(third.project.tempo, originalTempo, "the copy arrives with the content it was preserved with")
+        XCTAssertNotEqual(third.project.id, keeperID, "the copy gets its own identity")
+        XCTAssertEqual(
+            third.projects.first { $0.id == keeperID }?.tempo, editedTempo,
+            "the newer version already in the cart is untouched"
+        )
+        XCTAssertTrue(third.recoveryCandidates.isEmpty, "a copy is not offered twice")
+        XCTAssertFalse(third.restoreRecoveredProject(candidate), "the same copy cannot be restored twice")
+
+        // Both copies persist, and neither reads as a preserved duplicate of the other.
+        let relaunch = GameStore(defaults: defaults)
+        XCTAssertEqual(relaunch.projects.count, 2)
+        XCTAssertTrue(relaunch.recoveryCandidates.isEmpty)
+    }
+
+    /// Two projects in the cart must never read the same, so a restored copy takes a name that is
+    /// still free.
+    func testRestoredCopyTakesANameThatIsStillFree() {
+        let suite = "BeatboiCopyNameTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let first = GameStore(defaults: defaults)
+        first.renameProject("KEEPER")
+        first.newProject()
+        first.renameProject("KEEPER COPY")     // the obvious name for the copy is already taken
+
+        let second = GameStore(defaults: defaults)
+        second.selectProject(second.projects.first { $0.name == "KEEPER" }!)
+        second.updateTempo(200)
+
+        let third = GameStore(defaults: defaults)
+        // "KEEPER COPY" is untouched since the last launch, so only the edited KEEPER is offered.
+        XCTAssertEqual(third.recoveryCandidates.map(\.project.name), ["KEEPER"])
+        XCTAssertTrue(third.restoreRecoveredProject(third.recoveryCandidates[0]))
+
+        XCTAssertEqual(Set(third.projects.map(\.name)), ["KEEPER", "KEEPER COPY", "KEEPER COPY 2"])
+    }
+
+    /// Restoring used to clear the undo history the way selecting a project does, so a restore made
+    /// by accident could only be cleaned up by hand. It is now a step on the stack like any other.
+    func testRestoringAPreservedProjectIsUndoable() throws {
+        let suite = "BeatboiUndoRestoreTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let first = GameStore(defaults: defaults)
+        first.renameProject("KEEPER")
+
+        // The lost project is planted as a preserved payload rather than produced by deleting one,
+        // so this stays a test of restoring a *preserved* project. A deleted project is offered by
+        // the delete path instead, which its own tests cover.
+        let lost = ByteProject(name: "LOST TAKE", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        defaults.set(try JSONEncoder.bytePocketEncoder.encode([lost]), forKey: "bytePocket.projects.unreadable")
+
+        let third = GameStore(defaults: defaults)
+        let originalTempo = third.project.tempo
+        let editedTempo = originalTempo + 20
+        third.updateTempo(editedTempo)
+        XCTAssertTrue(third.canUndo, "precondition: the ordinary edit is undoable")
+
+        let candidate = third.recoveryCandidates[0]
+        XCTAssertEqual(candidate.project.name, "LOST TAKE", "precondition: the lost project is the row")
+        XCTAssertTrue(third.restoreRecoveredProject(candidate))
+        XCTAssertEqual(Set(third.projects.map(\.name)), ["KEEPER", "LOST TAKE"])
+        XCTAssertEqual(third.project.name, "LOST TAKE", "a restored project becomes the selection")
+        XCTAssertFalse(third.offersRecovery(candidate), "the restored project stops being a missing one")
+
+        third.undo()
+        XCTAssertEqual(third.projects.map(\.name), ["KEEPER"], "undo must take the restored project back out")
+        XCTAssertEqual(third.project.name, "KEEPER", "undo must put the selection back where it was")
+        XCTAssertEqual(third.project.tempo, editedTempo, "undoing a restore must not undo the edit beneath it")
+        XCTAssertTrue(third.offersRecovery(candidate), "the preserved row comes back")
+
+        // The restore went on top of the existing stack rather than clearing it.
+        third.undo()
+        XCTAssertEqual(third.project.tempo, originalTempo, "the edit underneath is still undoable")
+        third.redo()
+        third.redo()
+        XCTAssertEqual(Set(third.projects.map(\.name)), ["KEEPER", "LOST TAKE"], "redo must put the restore back")
+        XCTAssertFalse(third.offersRecovery(candidate), "the restored row is consumed again")
+    }
+
+    /// NEW PROJECT adds a project, so it is a membership change like a restore and is taken back the
+    /// same way: the project leaves the cart and the previous selection returns.
+    func testCreatingANewProjectIsUndoable() {
+        let suite = "BeatboiUndoNewProjectTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = GameStore(defaults: defaults)
+        store.renameProject("KEEPER")
+        let keeperID = store.project.id
+
+        store.newProject()
+        XCTAssertEqual(store.projects.count, 2)
+        XCTAssertEqual(store.project.name, "NEW QUEST 02", "a new project becomes the selection")
+
+        store.undo()
+        XCTAssertEqual(store.projects.map(\.name), ["KEEPER"], "undo must take the new project back out")
+        XCTAssertEqual(store.project.id, keeperID, "undo must put the selection back where it was")
+        // The new-project step sat on top of the rename rather than clearing it.
+        XCTAssertTrue(store.canUndo, "the edit underneath is still undoable")
+
+        store.redo()
+        XCTAssertEqual(store.projects.count, 2, "redo must put the new project back")
+        XCTAssertEqual(store.project.name, "NEW QUEST 02")
+    }
+
+    /// Importing adds a project when the file is new to the cart and replaces one when it is not.
+    /// Both are membership changes, and undo has to reverse each in the matching way.
+    func testImportingAProjectIsUndoable() {
+        let suite = "BeatboiUndoImportTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = GameStore(defaults: defaults)
+        store.renameProject("KEEPER")
+        let keeperID = store.project.id
+
+        let incoming = ByteProject(name: "IMPORTED", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        store.importProject(incoming)
+        XCTAssertEqual(store.projects.map(\.name), ["IMPORTED", "KEEPER"])
+        XCTAssertEqual(store.project.name, "IMPORTED", "an imported project becomes the selection")
+
+        store.undo()
+        XCTAssertEqual(store.projects.map(\.name), ["KEEPER"], "undo must take an imported project back out")
+        XCTAssertEqual(store.project.id, keeperID, "undo must put the selection back")
+        XCTAssertTrue(store.canUndo, "the rename underneath is still undoable")
+
+        store.redo()
+        XCTAssertEqual(store.projects.map(\.name), ["IMPORTED", "KEEPER"])
+
+        // Reopening a file already in the cart replaces that project, so undo has to bring the
+        // replaced content back — not merely drop a project, which would silently lose the edit.
+        var reopened = incoming
+        reopened.tempo = incoming.tempo + 40
+        XCTAssertEqual(reopened.id, incoming.id, "precondition: the file keeps its own identity")
+        store.importProject(reopened)
+        XCTAssertEqual(store.projects.count, 2)
+        XCTAssertEqual(store.projects.first { $0.id == incoming.id }?.tempo, incoming.tempo + 40)
+
+        store.undo()
+        XCTAssertEqual(store.projects.count, 2, "a replace must not change the size of the cart")
+        XCTAssertEqual(
+            store.projects.first { $0.id == incoming.id }?.tempo, incoming.tempo,
+            "undo must restore the content the import replaced"
+        )
+    }
+
+    /// Undoing a copy has to free the preserved row again as well as remove the copy, which is
+    /// exactly what the consumed bookkeeping would otherwise keep hidden.
+    func testRestoringAnEarlierVersionCopyIsUndoable() {
+        let suite = "BeatboiUndoCopyTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let first = GameStore(defaults: defaults)
+        first.renameProject("KEEPER")
+        let originalTempo = first.project.tempo
+
+        let second = GameStore(defaults: defaults)
+        second.updateTempo(originalTempo + 30)
+
+        let third = GameStore(defaults: defaults)
+        XCTAssertEqual(third.recoveryCandidates.count, 1, "precondition: the earlier version is offered")
+
+        XCTAssertTrue(third.restoreRecoveredProject(third.recoveryCandidates[0]))
+        XCTAssertEqual(third.projects.map(\.name), ["KEEPER COPY", "KEEPER"])
+        XCTAssertTrue(third.recoveryCandidates.isEmpty, "a restored copy is consumed")
+
+        third.undo()
+        XCTAssertEqual(third.projects.map(\.name), ["KEEPER"], "undo must remove the copy")
+        XCTAssertEqual(third.projects[0].tempo, originalTempo + 30, "the project in the cart is untouched")
+        XCTAssertEqual(third.recoveryCandidates.map(\.project.name), ["KEEPER"], "the earlier version is offered again")
+
+        third.redo()
+        XCTAssertEqual(third.projects.map(\.name), ["KEEPER COPY", "KEEPER"], "redo must put the copy back")
+        XCTAssertTrue(third.recoveryCandidates.isEmpty)
+    }
+
+    /// Deleting a project used to wipe the undo history and lean on a single "restore last deleted"
+    /// slot, which made it the one action in the cart with no reliable way back.
+    func testDeletingAProjectIsUndoable() {
+        let suite = "BeatboiUndoDeleteTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = GameStore(defaults: defaults)
+        store.renameProject("KEEPER")
+        store.newProject()
+        XCTAssertEqual(store.projects.map(\.name), ["NEW QUEST 02", "KEEPER"])
+        let doomedID = store.project.id
+
+        store.deleteProject(store.project)
+        XCTAssertEqual(store.projects.map(\.name), ["KEEPER"], "the deleted project leaves the cart")
+        XCTAssertEqual(store.project.name, "KEEPER", "the remaining project becomes the selection")
+        XCTAssertTrue(store.canRestoreDeletedProject)
+
+        store.undo()
+        XCTAssertEqual(store.projects.map(\.name), ["NEW QUEST 02", "KEEPER"], "undo must put the project back")
+        XCTAssertEqual(store.project.id, doomedID, "undo must put the selection back where it was")
+        XCTAssertFalse(store.canRestoreDeletedProject, "nothing is pending a restore once the project is back")
+
+        store.redo()
+        XCTAssertEqual(store.projects.map(\.name), ["KEEPER"], "redo must delete it again")
+        XCTAssertTrue(store.canRestoreDeletedProject, "redo must fill the slot again")
+    }
+
+    /// The rollback used to be one slot, so deleting twice in a row left the first project with no
+    /// way back. Each deletion is now its own step, and they unwind in order.
+    func testRepeatedDeletionsCanAllBeUndone() {
+        let suite = "BeatboiUndoRepeatedDeleteTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = GameStore(defaults: defaults)
+        store.renameProject("FIRST")
+        store.newProject()
+        store.renameProject("SECOND")
+        store.newProject()
+        store.renameProject("THIRD")
+        XCTAssertEqual(store.projects.map(\.name), ["THIRD", "SECOND", "FIRST"])
+
+        store.deleteProject(store.projects.first { $0.name == "SECOND" }!)
+        store.deleteProject(store.projects.first { $0.name == "FIRST" }!)
+        XCTAssertEqual(store.projects.map(\.name), ["THIRD"])
+
+        store.undo()
+        XCTAssertEqual(store.projects.map(\.name), ["THIRD", "FIRST"], "the later deletion comes back first")
+        store.undo()
+        XCTAssertEqual(store.projects.map(\.name), ["THIRD", "SECOND", "FIRST"], "then the earlier one")
+    }
+
+    /// The single slot is why an undoable restore could not simply be bolted on: restoring cleared
+    /// it, so taking the restore back would have left the project in neither the cart nor the slot —
+    /// gone for good. The slot travels in the snapshot so undo puts both back.
+    func testRestoringADeletedProjectIsUndoableWithoutLosingTheSlot() {
+        let suite = "BeatboiUndoRestoreDeletedTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = GameStore(defaults: defaults)
+        store.renameProject("KEEPER")
+        store.newProject()
+        store.deleteProject(store.projects.first { $0.name == "NEW QUEST 02" }!)
+        XCTAssertEqual(store.projects.map(\.name), ["KEEPER"])
+
+        store.restoreDeletedProject()
+        XCTAssertEqual(Set(store.projects.map(\.name)), ["KEEPER", "NEW QUEST 02"])
+        XCTAssertFalse(store.canRestoreDeletedProject, "restoring consumes the slot")
+
+        store.undo()
+        XCTAssertEqual(store.projects.map(\.name), ["KEEPER"], "undo must take the restored project back out")
+        XCTAssertTrue(store.canRestoreDeletedProject, "the slot has to come back, or the project is gone for good")
+
+        // The affordance still works after being taken back.
+        store.restoreDeletedProject()
+        XCTAssertEqual(Set(store.projects.map(\.name)), ["KEEPER", "NEW QUEST 02"])
+    }
+
+    /// A deletion used to live only in memory, so quitting the app threw away the only copy of a
+    /// project the user had removed. The stack is written to disk now, and this is the contract:
+    /// the deletion is still offered after a relaunch, and restoring it puts it back.
+    func testDeletedProjectSurvivesRelaunchAndCanBeRestored() {
+        let suite = "BeatboiDeletedPersistenceTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = GameStore(defaults: defaults)
+        store.renameProject("KEEPER")
+        store.newProject()
+        XCTAssertEqual(store.projects.map(\.name), ["NEW QUEST 02", "KEEPER"])
+        store.deleteProject(store.projects.first { $0.name == "NEW QUEST 02" }!)
+        XCTAssertEqual(store.projects.map(\.name), ["KEEPER"])
+        XCTAssertNotNil(defaults.data(forKey: "bytePocket.projects.deleted"), "the deletion must land on disk")
+
+        // A fresh store against the same defaults stands in for the next launch of the app.
+        let relaunch = GameStore(defaults: defaults)
+        XCTAssertEqual(relaunch.projects.map(\.name), ["KEEPER"], "the live cart must not change")
+        XCTAssertTrue(relaunch.canRestoreDeletedProject, "a persisted deletion is still offered")
+
+        relaunch.restoreDeletedProject()
+        XCTAssertEqual(Set(relaunch.projects.map(\.name)), ["KEEPER", "NEW QUEST 02"])
+        XCTAssertEqual(relaunch.project.name, "NEW QUEST 02", "a restored project becomes the selection")
+        XCTAssertFalse(relaunch.canRestoreDeletedProject, "restoring empties the stack")
+        XCTAssertNil(defaults.data(forKey: "bytePocket.projects.deleted"), "an empty stack clears the payload")
+
+        // Restoring wrote the cart, so this launch is an ordinary one.
+        let third = GameStore(defaults: defaults)
+        XCTAssertEqual(Set(third.projects.map(\.name)), ["KEEPER", "NEW QUEST 02"])
+        XCTAssertFalse(third.canRestoreDeletedProject)
+    }
+
+    /// The stack keeps every deletion, so a session that removes several projects can still bring
+    /// them back after a relaunch, newest first.
+    func testDeletedProjectsStackAcrossLaunches() {
+        let suite = "BeatboiDeletedStackTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = GameStore(defaults: defaults)
+        store.renameProject("FIRST")
+        store.newProject()
+        store.renameProject("SECOND")
+        store.newProject()
+        store.renameProject("THIRD")
+        XCTAssertEqual(store.projects.map(\.name), ["THIRD", "SECOND", "FIRST"])
+
+        store.deleteProject(store.projects.first { $0.name == "SECOND" }!)
+        store.deleteProject(store.projects.first { $0.name == "FIRST" }!)
+        XCTAssertEqual(store.projects.map(\.name), ["THIRD"])
+
+        let relaunch = GameStore(defaults: defaults)
+        XCTAssertTrue(relaunch.canRestoreDeletedProject)
+        XCTAssertEqual(relaunch.projects.map(\.name), ["THIRD"])
+
+        relaunch.restoreDeletedProject()
+        XCTAssertEqual(relaunch.projects.map(\.name), ["FIRST", "THIRD"], "the later deletion comes back first")
+        XCTAssertTrue(relaunch.canRestoreDeletedProject, "the earlier deletion is still pending")
+
+        relaunch.restoreDeletedProject()
+        XCTAssertEqual(Set(relaunch.projects.map(\.name)), ["FIRST", "SECOND", "THIRD"])
+        XCTAssertFalse(relaunch.canRestoreDeletedProject)
+
+        // Both restores wrote their progress, so a third launch still has nothing pending.
+        let third = GameStore(defaults: defaults)
+        XCTAssertFalse(third.canRestoreDeletedProject)
+    }
+
+    /// A deleted project is also still inside the rolling backup for one generation, so without
+    /// suppression the cart would list it twice: once as "last launch" and once as deleted.
+    func testDeletedProjectIsNotOfferedTwiceAfterRelaunch() {
+        let suite = "BeatboiDeletedNoDuplicateTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = GameStore(defaults: defaults)
+        store.renameProject("KEEPER")
+        store.newProject()
+        _ = GameStore(defaults: defaults)   // mirror the two-project library into the backup
+        store.deleteProject(store.projects.first { $0.name.hasPrefix("NEW QUEST") }!)
+        XCTAssertNotNil(defaults.data(forKey: "bytePocket.projects.backup"), "precondition: the backup holds the deleted project")
+
+        let relaunch = GameStore(defaults: defaults)
+        XCTAssertTrue(relaunch.canRestoreDeletedProject, "the deleted project is offered")
+        XCTAssertEqual(relaunch.recoveryCandidates.map(\.project.name), ["NEW QUEST 02"])
+        XCTAssertEqual(
+            relaunch.recoveryCandidates.map(\.source), [.deleted],
+            "one row, under the deleted label, not also as a preserved copy"
+        )
+
+        // The backup still covers work that was not deleted; only the deleted copy is suppressed.
+        relaunch.restoreDeletedProject()
+        XCTAssertEqual(Set(relaunch.projects.map(\.name)), ["KEEPER", "NEW QUEST 02"])
+    }
+
+    /// The cart has one recovery list now, and a deleted project is a row in it. It carries the
+    /// DELETED label rather than being reached through a separate affordance.
+    func testDeletedProjectsAppearInTheRecoveryListUnderTheirOwnLabel() throws {
+        let suite = "BeatboiDeletedInRecoveryListTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = GameStore(defaults: defaults)
+        store.renameProject("KEEPER")
+        store.newProject()
+        store.deleteProject(store.projects.first { $0.name.hasPrefix("NEW QUEST") }!)
+
+        // Plant a preserved copy the cart has lost, so one launch holds both kinds of row.
+        let orphan = ByteProject(name: "ORPHAN", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        defaults.set(try JSONEncoder.bytePocketEncoder.encode([orphan]), forKey: "bytePocket.projects.unreadable")
+
+        let relaunch = GameStore(defaults: defaults)
+        XCTAssertEqual(relaunch.recoveryCandidates.map(\.project.name), ["NEW QUEST 02", "ORPHAN"], "deletions lead the list")
+        XCTAssertEqual(relaunch.recoveryCandidates.map(\.source), [.deleted, .quarantine])
+
+        // A deletion is the user's own doing, so it does not interrupt the launch the way a lost
+        // project does.
+        XCTAssertEqual(relaunch.missingRecoverableProjects.map(\.project.name), ["ORPHAN"])
+
+        // Restoring the deleted row consumes its stack entry, so the row goes and the preserved
+        // copy is left alone.
+        let deletedRow = relaunch.recoveryCandidates.first { $0.source == .deleted }!
+        XCTAssertTrue(relaunch.restoreRecoveredProject(deletedRow))
+        XCTAssertEqual(Set(relaunch.projects.map(\.name)), ["KEEPER", "NEW QUEST 02"])
+        XCTAssertEqual(relaunch.recoveryCandidates.map(\.project.name), ["ORPHAN"])
+
+        relaunch.undo()
+        XCTAssertEqual(relaunch.recoveryCandidates.map(\.project.name), ["NEW QUEST 02", "ORPHAN"], "undo puts the row back")
+    }
+
+    /// A project can be in both the rolling backup and the delete stack at once — deleting it this
+    /// session does not remove it from the payload the launch already read. The list must still
+    /// show it once, under the stronger label.
+    func testDeletedProjectSupersedesAPreservedCopyOfTheSameProject() {
+        let suite = "BeatboiDeletedSupersedesPreservedTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let first = GameStore(defaults: defaults)
+        first.renameProject("KEEPER")
+        first.newProject()
+        _ = GameStore(defaults: defaults)          // rotates the library into the backup
+        let third = GameStore(defaults: defaults)  // reads that backup, so it is preserved here
+        XCTAssertTrue(third.recoveryCandidates.isEmpty, "precondition: the preserved backup mirrors the cart")
+
+        third.deleteProject(third.projects.first { $0.name.hasPrefix("NEW QUEST") }!)
+        XCTAssertEqual(third.recoveryCandidates.map(\.project.name), ["NEW QUEST 02"])
+        XCTAssertEqual(third.recoveryCandidates.map(\.source), [.deleted], "one row, under the deleted label")
+
+        // The deleted row is what puts the section on screen, and it is what the one discard
+        // control clears, so the cart is not offering a control over work it would not touch.
+        XCTAssertTrue(third.hasRecoverableProjects)
+    }
+
+    /// Undo has to move the persisted payload as well as the in-memory stack, or a relaunch would
+    /// resurrect a deletion the user just took back.
+    func testUndoingADeleteClearsThePersistedDeletion() {
+        let suite = "BeatboiDeletedUndoPersistTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = GameStore(defaults: defaults)
+        store.renameProject("KEEPER")
+        store.newProject()
+        store.deleteProject(store.projects.first { $0.name.hasPrefix("NEW QUEST") }!)
+        XCTAssertNotNil(defaults.data(forKey: "bytePocket.projects.deleted"))
+
+        store.undo()
+        XCTAssertEqual(store.projects.map(\.name), ["NEW QUEST 02", "KEEPER"])
+        XCTAssertFalse(store.canRestoreDeletedProject)
+        XCTAssertNil(defaults.data(forKey: "bytePocket.projects.deleted"), "undo must take the entry off disk too")
+        let afterUndo = GameStore(defaults: defaults)
+        XCTAssertFalse(afterUndo.canRestoreDeletedProject, "a taken-back deletion must not come back on relaunch")
+
+        // Redo puts it back on disk, so the two directions stay symmetric.
+        store.redo()
+        XCTAssertEqual(store.projects.map(\.name), ["KEEPER"])
+        XCTAssertNotNil(defaults.data(forKey: "bytePocket.projects.deleted"))
+        XCTAssertTrue(GameStore(defaults: defaults).canRestoreDeletedProject)
+    }
+
+    /// A deleted payload that cannot be decoded must not stop the cart from loading, and its bytes
+    /// are kept rather than abandoned.
+    func testUnreadableDeletedPayloadIsIgnoredAndItsBytesPreserved() throws {
+        let suite = "BeatboiDeletedCorruptTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let keeper = ByteProject(name: "KEEPER", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        defaults.set(try JSONEncoder.bytePocketEncoder.encode([keeper]), forKey: "bytePocket.projects")
+        let garbage = Data("not a deleted payload".utf8)
+        defaults.set(garbage, forKey: "bytePocket.projects.deleted")
+
+        let store = GameStore(defaults: defaults)
+        XCTAssertEqual(store.projects.map(\.name), ["KEEPER"], "a bad deleted payload must not affect the cart")
+        XCTAssertFalse(store.canRestoreDeletedProject)
+        XCTAssertEqual(defaults.data(forKey: "bytePocket.projects.unreadable"), garbage, "the bytes are kept")
+    }
+
+    /// A normal launch must offer nothing. The rolling backup mirrors the live cart, and the
+    /// recovery surface would be permanent noise if it mistook that mirror for recoverable work.
+    func testCleanLaunchOffersNothingToRecover() {
+        let suite = "BeatboiNoRecoveryNoiseTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let first = GameStore(defaults: defaults)
+        first.renameProject("KEEPER")
+
+        let second = GameStore(defaults: defaults)
+        XCTAssertNotNil(defaults.data(forKey: "bytePocket.projects.backup"), "precondition: a backup exists")
+        XCTAssertTrue(second.recoveryCandidates.isEmpty)
+        XCTAssertFalse(second.hasRecoverableProjects)
+        XCTAssertNil(second.libraryRecovery)
+
+        // The third launch is the case that actually compares: the backup is now a mirror of the
+        // cart, and a mirror must not be offered as an earlier version of every project.
+        let third = GameStore(defaults: defaults)
+        XCTAssertTrue(third.recoveryCandidates.isEmpty, "a backup that mirrors the cart is not earlier work")
+        XCTAssertFalse(third.hasRecoverableProjects)
+    }
+
+    /// Discarding the recoverable copies is durable — they must not come back on the next launch —
+    /// and it must not take the rolling safety net down with them.
+    func testDiscardingRecoverableProjectsIsDurableAndKeepsTheRollingBackup() throws {
+        let suite = "BeatboiDiscardPreservedTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let first = GameStore(defaults: defaults)
+        first.renameProject("KEEPER")
+        // A preserved copy the cart has lost, which is a row the one discard control clears.
+        let orphan = ByteProject(name: "ORPHAN", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        defaults.set(try JSONEncoder.bytePocketEncoder.encode([orphan]), forKey: "bytePocket.projects.unreadable")
+        let third = GameStore(defaults: defaults)
+        XCTAssertFalse(third.recoveryCandidates.isEmpty, "precondition: there is something to discard")
+        XCTAssertTrue(third.hasRecoverableProjects, "there is something to discard")
+
+        third.discardRecoverableProjects()
+        XCTAssertTrue(third.recoveryCandidates.isEmpty)
+        XCTAssertFalse(third.hasRecoverableProjects, "nothing recoverable is left")
+        XCTAssertNil(defaults.data(forKey: "bytePocket.projects.unreadable"))
+        // The safety net now mirrors the live cart instead of being left empty.
+        XCTAssertEqual(defaults.data(forKey: "bytePocket.projects.backup"), defaults.data(forKey: "bytePocket.projects"))
+
+        let relaunch = GameStore(defaults: defaults)
+        XCTAssertEqual(relaunch.projects.map(\.name), ["KEEPER"])
+        XCTAssertFalse(relaunch.hasRecoverableProjects, "a discarded copy must not come back on the next launch")
+
+        // Discarding the old copies did not discard the protection for the current cart.
+        defaults.set(Data("{ not json".utf8), forKey: "bytePocket.projects")
+        let afterCorruption = GameStore(defaults: defaults)
+        XCTAssertEqual(afterCorruption.projects.map(\.name), ["KEEPER"])
+        XCTAssertEqual(afterCorruption.libraryRecovery?.usedBackup, true)
+    }
+
+    /// The cart has one recovery list, so the one discard control clears all of it: a deletion is
+    /// dropped along with the preserved payloads rather than outliving the control that sits over
+    /// it. This is the destructive side of the unification, so it is pinned in both the live store
+    /// and on the next launch.
+    func testDiscardingRecoverableProjectsAlsoClearsDeletedProjects() {
+        let suite = "BeatboiDiscardClearsDeletedTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = GameStore(defaults: defaults)
+        store.renameProject("KEEPER")
+        store.newProject()
+        store.deleteProject(store.projects.first { $0.name.hasPrefix("NEW QUEST") }!)
+        XCTAssertEqual(store.recoveryCandidates.map(\.source), [.deleted], "precondition: the deletion is offered")
+
+        store.discardRecoverableProjects()
+        XCTAssertFalse(store.canRestoreDeletedProject, "discarding clears the delete stack too")
+        XCTAssertTrue(store.recoveryCandidates.isEmpty)
+        XCTAssertFalse(store.hasRecoverableProjects)
+        XCTAssertNil(defaults.data(forKey: "bytePocket.projects.deleted"), "the deleted payload goes with it")
+        XCTAssertEqual(store.projects.map(\.name), ["KEEPER"], "the live cart is untouched")
+
+        // A discarded deletion must not come back as a row on the next launch.
+        let relaunch = GameStore(defaults: defaults)
+        XCTAssertFalse(relaunch.canRestoreDeletedProject)
+        XCTAssertTrue(relaunch.recoveryCandidates.isEmpty)
+        XCTAssertEqual(relaunch.projects.map(\.name), ["KEEPER"])
+    }
+
+    /// Discarding clears the delete stack, but the undo history holds snapshots taken *before* the
+    /// purge, and those still carry the deleted project. Without dropping the history a leftover
+    /// step can put back exactly what the user confirmed discarding, so the purge also clears it.
+    func testUndoAfterDiscardingCannotResurrectADeletedProject() {
+        let suite = "BeatboiDiscardUndoTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = GameStore(defaults: defaults)
+        store.renameProject("KEEPER")
+        store.newProject()
+        store.deleteProject(store.projects.first { $0.name.hasPrefix("NEW QUEST") }!)
+        XCTAssertTrue(store.canRestoreDeletedProject, "precondition: the deletion is still recoverable")
+
+        store.discardRecoverableProjects()
+        XCTAssertFalse(store.canRestoreDeletedProject)
+
+        store.undo()
+        XCTAssertEqual(store.projects.map(\.name), ["KEEPER"], "undo must not put back what was discarded")
+        XCTAssertFalse(store.canRestoreDeletedProject, "the deleted row must not come back either")
+        XCTAssertNil(defaults.data(forKey: "bytePocket.projects.deleted"), "and nothing may land back on disk")
+        XCTAssertFalse(GameStore(defaults: defaults).canRestoreDeletedProject)
+    }
+
+    /// A single row can be cleared without erasing the payload it came from, and it stays cleared
+    /// on the next launch instead of coming back with the bytes.
+    func testDismissingOnePreservedRowLeavesTheOthersAndSurvivesRelaunch() throws {
+        let suite = "BeatboiDismissRowTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let first = GameStore(defaults: defaults)
+        first.renameProject("KEEPER")
+        let alpha = ByteProject(name: "ALPHA", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        let beta = ByteProject(name: "BETA", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        let payload = try JSONEncoder.bytePocketEncoder.encode([alpha, beta])
+        defaults.set(payload, forKey: "bytePocket.projects.unreadable")
+
+        let second = GameStore(defaults: defaults)
+        XCTAssertEqual(second.recoveryCandidates.map(\.project.name), ["ALPHA", "BETA"], "precondition")
+
+        let alphaRow = second.recoveryCandidates.first { $0.project.name == "ALPHA" }!
+        XCTAssertTrue(second.dismissRecoverableProject(alphaRow))
+        XCTAssertFalse(second.dismissRecoverableProject(alphaRow), "the same row cannot be dismissed twice")
+        XCTAssertEqual(second.recoveryCandidates.map(\.project.name), ["BETA"], "only the dismissed row goes")
+        XCTAssertTrue(second.hasRecoverableProjects, "the section stays while a row is left")
+        // Removing a row is not erasing it: the payload the row came from is never rewritten.
+        XCTAssertEqual(defaults.data(forKey: "bytePocket.projects.unreadable"), payload)
+        XCTAssertNotNil(defaults.data(forKey: "bytePocket.projects.dismissed"), "the dismissal is on disk")
+
+        let third = GameStore(defaults: defaults)
+        XCTAssertEqual(third.recoveryCandidates.map(\.project.name), ["BETA"], "a dismissed row stays gone")
+
+        // Clearing the last row takes the section with it.
+        XCTAssertTrue(third.dismissRecoverableProject(third.recoveryCandidates[0]))
+        XCTAssertTrue(third.recoveryCandidates.isEmpty)
+        XCTAssertFalse(third.hasRecoverableProjects, "the section goes when the last row does")
+        // Clearing rows is not the bulk discard: the bytes are still there, just not offered.
+        XCTAssertEqual(defaults.data(forKey: "bytePocket.projects.unreadable"), payload)
+    }
+
+    /// Clearing a deleted row has to remember the id, not just drop the stack entry: the project is
+    /// still inside the rolling backup for a generation, so without the id the row would reappear on
+    /// the next launch wearing a "last launch" label.
+    func testDismissingADeletedRowDoesNotReappearAsAPreservedCopy() {
+        let suite = "BeatboiDismissDeletedTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let first = GameStore(defaults: defaults)
+        first.renameProject("KEEPER")
+        first.newProject()
+        _ = GameStore(defaults: defaults)          // rotates the library into the backup
+        let third = GameStore(defaults: defaults)  // reads that backup, so the project is preserved here
+        third.deleteProject(third.projects.first { $0.name.hasPrefix("NEW QUEST") }!)
+        XCTAssertEqual(third.recoveryCandidates.map(\.source), [.deleted], "precondition")
+
+        XCTAssertTrue(third.dismissRecoverableProject(third.recoveryCandidates[0]))
+        XCTAssertTrue(third.recoveryCandidates.isEmpty)
+        XCTAssertFalse(third.hasRecoverableProjects)
+        XCTAssertNil(defaults.data(forKey: "bytePocket.projects.deleted"), "the stack entry is gone")
+
+        let relaunch = GameStore(defaults: defaults)
+        XCTAssertTrue(relaunch.recoveryCandidates.isEmpty, "the backup must not offer it back")
+        XCTAssertFalse(relaunch.canRestoreDeletedProject)
+    }
+
+    /// Clearing a deletion is only durable because the id is written to disk, which is the record
+    /// that stops the rolling backup offering the project again under a different label. This pins
+    /// that record directly and by content, so the chain does not rest on the UI fixture, which now
+    /// plants its own dismissal rather than earning one by clearing a row.
+    func testClearingDeletionsRecordsEachDismissedIDOnDisk() throws {
+        let suite = "BeatboiDismissRecordsIDTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = GameStore(defaults: defaults)
+        store.renameProject("KEEPER")
+        store.newProject()
+        store.renameProject("NEW QUEST 02")
+        store.newProject()
+        store.renameProject("NEW QUEST 03")
+        XCTAssertEqual(store.projects.map(\.name), ["NEW QUEST 03", "NEW QUEST 02", "KEEPER"])
+
+        // Rotate the three-project library into the rolling backup, then delete two of them, so the
+        // backup holds both projects the clearing below is meant to keep from coming back.
+        _ = GameStore(defaults: defaults)
+        let third = GameStore(defaults: defaults)
+        third.deleteProject(third.projects.first { $0.name == "NEW QUEST 02" }!)
+        third.deleteProject(third.projects.first { $0.name == "NEW QUEST 03" }!)
+        XCTAssertEqual(third.recoveryCandidates.map(\.project.name), ["NEW QUEST 03", "NEW QUEST 02"], "newest first")
+
+        let firstCleared = third.recoveryCandidates[0]
+        XCTAssertTrue(third.dismissRecoverableProject(firstCleared))
+        let secondCleared = third.recoveryCandidates[0]
+        XCTAssertNotEqual(secondCleared.id, firstCleared.id, "clearing one row leaves the other")
+        XCTAssertTrue(third.dismissRecoverableProject(secondCleared))
+
+        let recorded = try XCTUnwrap(defaults.data(forKey: "bytePocket.projects.dismissed"))
+        XCTAssertEqual(
+            try JSONDecoder.bytePocketDecoder.decode([UUID].self, from: recorded),
+            [secondCleared.id, firstCleared.id],
+            "each cleared deletion is recorded, most recently cleared first"
+        )
+        XCTAssertNil(defaults.data(forKey: "bytePocket.projects.deleted"), "the stack entry goes with it")
+
+        // The record is what the next launch reads, and the backup holds both projects.
+        let relaunch = GameStore(defaults: defaults)
+        XCTAssertTrue(relaunch.recoveryCandidates.isEmpty, "neither cleared project may come back from the backup")
+        XCTAssertEqual(relaunch.projects.map(\.name), ["KEEPER"], "the cart is untouched")
+    }
+
+    /// Pins both recovery bounds and says what each one costs to exceed, because they fail in
+    /// opposite directions: ageing out a deletion destroys the only remaining copy of that project,
+    /// while ageing out a dismissal loses nothing and merely offers the row again. Every other
+    /// fixture is built from these constants, so without this a change to either would quietly
+    /// retune the tests that exist to pin it.
+    func testRecoveryBoundsArePinned() {
+        XCTAssertEqual(GameStore.deletedProjectsLimit, 20, "how many deletions can still be taken back")
+        XCTAssertEqual(GameStore.dismissedRecoverableLimit, 50, "how many cleared rows stay cleared")
+    }
+
+    /// The remembered ids are bounded, so a cart that keeps clearing rows eventually forgets the
+    /// oldest dismissal and the project it was hiding is offered again. That is the deliberate cost
+    /// of not letting the payload grow without limit, so it is pinned rather than left implicit —
+    /// including the part where the forgotten project comes back, which is easy to read as a bug.
+    func testDismissedIDRecordIsBoundedAndForgetsTheOldestClear() throws {
+        let suite = "BeatboiDismissCapTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let oldest = ByteProject(name: "OLD TAKE", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        let newest = ByteProject(name: "NEW TAKE", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        let keeper = ByteProject(name: "KEEPER", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        defaults.set(try JSONEncoder.bytePocketEncoder.encode([keeper]), forKey: "bytePocket.projects")
+        defaults.set(try JSONEncoder.bytePocketEncoder.encode([oldest, newest]), forKey: "bytePocket.projects.unreadable")
+
+        // A full record with the project we want aged out at the oldest end: the list is written
+        // most-recently-cleared first, so the last entry is the one the bound drops. The fixture is
+        // built from the bound itself rather than a copied number, so this test keeps testing
+        // whatever the bound is; `testRecoveryBoundsArePinned` is what makes changing it deliberate.
+        let bound = GameStore.dismissedRecoverableLimit
+        let fillers = (0..<(bound - 1)).map { _ in UUID() }
+        defaults.set(
+            try JSONEncoder.bytePocketEncoder.encode(fillers + [oldest.id]),
+            forKey: "bytePocket.projects.dismissed"
+        )
+
+        let store = GameStore(defaults: defaults)
+        XCTAssertEqual(store.recoveryCandidates.map(\.project.name), ["NEW TAKE"], "the planted dismissal hides the oldest")
+
+        XCTAssertTrue(store.dismissRecoverableProject(store.recoveryCandidates[0]))
+
+        let recorded = try XCTUnwrap(defaults.data(forKey: "bytePocket.projects.dismissed"))
+        let ids = try JSONDecoder.bytePocketDecoder.decode([UUID].self, from: recorded)
+        XCTAssertEqual(ids.count, bound, "the record stays at its bound")
+        XCTAssertEqual(ids.first, newest.id, "the newest clear leads")
+        XCTAssertEqual(ids.filter { $0 == newest.id }.count, 1, "and is recorded once")
+        XCTAssertFalse(ids.contains(oldest.id), "the oldest clear ages out")
+
+        // The aged-out project is offered again — the cost of the bound, stated rather than hidden.
+        XCTAssertEqual(store.recoveryCandidates.map(\.project.name), ["OLD TAKE"])
+
+        // And the record is what the next launch reads, so the same swap persists.
+        let relaunch = GameStore(defaults: defaults)
+        XCTAssertEqual(relaunch.recoveryCandidates.map(\.project.name), ["OLD TAKE"])
+    }
+
+    /// A minimal view of a stored payload, so this test can assert what is actually on disk without
+    /// reaching into the store's private envelope type.
+    private struct StoredPayload: Decodable {
+        struct Entry: Decodable {
+            let name: String
+        }
+
+        let projects: [Entry]
+    }
+
+    /// The envelope a stored library is meant to be, written as a plain `Encodable` so a test can
+    /// reproduce it without reaching into the store's private type.
+    private struct ReferenceEnvelope: Encodable {
+        let schemaVersion: Int
+        let projects: [ByteProject]
+    }
+
+    /// Re-serializes JSON with its members in sorted order, so two encodings can be compared for
+    /// the value they carry rather than for the order they happen to write it in.
+    private func canonicalJSON(_ data: Data) throws -> Data {
+        let object = try JSONSerialization.jsonObject(with: data)
+        return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    }
+
+    /// The library as storage can actually represent it. Dates are stored with second precision, so
+    /// a live project and its reloaded self are equal only after both have been through the
+    /// encoder — comparing a live project to a decoded one directly would fail on sub-second
+    /// `modifiedAt`, which is a property of the date format rather than of what was written.
+    private func storedForm(_ projects: [ByteProject]) throws -> [ByteProject] {
+        let data = try JSONEncoder.bytePocketStorageEncoder.encode(projects)
+        return try JSONDecoder.bytePocketDecoder.decode([ByteProject].self, from: data)
+    }
+
+    /// The stored library is assembled by splicing each project's own cached JSON into a
+    /// hand-written container, so an edit does not re-encode every project the user owns. This
+    /// pins that container to the envelope it replaced: same members, projects written inline, and
+    /// the same value on the way out.
+    func testSplicedLibraryPayloadEncodesTheSameValueAsTheEnvelope() throws {
+        let suite = "BeatboiSpliceTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = GameStore(defaults: defaults)
+        store.renameProject("FIRST")
+        store.newProject()
+        store.renameProject("SECOND")
+        // Edit *after* the projects have been saved once, so the save under test has to re-encode
+        // one project while reusing the other straight from the cache — which is the splice.
+        store.setPatchValue(channel: .pulseA, parameter: .tone, value: 2)
+        store.setNote(channel: .pulseA, step: 0, note: 64)
+
+        XCTAssertEqual(store.projects.map(\.name), ["SECOND", "FIRST"], "the newest project leads the cart")
+
+        let stored = try XCTUnwrap(defaults.data(forKey: "bytePocket.projects"))
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: stored) as? [String: Any])
+        XCTAssertEqual(Set(object.keys), ["schemaVersion", "projects"], "the container keeps the envelope's members")
+        XCTAssertEqual((object["projects"] as? [Any])?.count, store.projects.count)
+
+        // The projects are written inline, not wrapped in the per-entry container that makes a
+        // single unreadable entry survivable — reading is lenient, writing is not.
+        let entries = try XCTUnwrap(object["projects"] as? [[String: Any]])
+        XCTAssertEqual(entries.first?["name"] as? String, "SECOND")
+        XCTAssertNil(entries.first?["project"], "a project must not gain a wrapper just because it was spliced")
+
+        // And it carries exactly the value the reference envelope would, member order aside, which
+        // is what makes this a re-encoding of the same format rather than a second one.
+        let version = try XCTUnwrap(object["schemaVersion"] as? Int)
+        let reference = try JSONEncoder.bytePocketStorageEncoder.encode(
+            ReferenceEnvelope(schemaVersion: version, projects: store.projects)
+        )
+        XCTAssertEqual(try canonicalJSON(stored), try canonicalJSON(reference))
+
+        // A relaunch reads it back as the live library, so the splice is loadable, not merely equal.
+        let relaunch = GameStore(defaults: defaults)
+        XCTAssertEqual(relaunch.projects, try storedForm(store.projects))
+        XCTAssertEqual(relaunch.projects.map(\.name), ["SECOND", "FIRST"])
+    }
+
+    /// The cache exists to skip work, so the risk it carries is skipping work it should have done.
+    /// A project that changed since it was cached must be re-encoded, not served from the copy on
+    /// file, or an edit would be silently lost the next time the library is written.
+    func testAnEditAfterACachedSaveStillReachesTheStoredPayload() throws {
+        let suite = "BeatboiStaleCacheTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = GameStore(defaults: defaults)
+        store.renameProject("BEFORE")
+        // Saving the name above warmed the cache with that name's encoding; this edit has to
+        // invalidate it.
+        store.renameProject("AFTER")
+        store.setNote(channel: .pulseA, step: 3, note: 67)
+
+        let stored = try XCTUnwrap(defaults.data(forKey: "bytePocket.projects"))
+        let payload = try JSONDecoder.bytePocketDecoder.decode(StoredPayload.self, from: stored)
+        XCTAssertEqual(payload.projects.map(\.name), ["AFTER"], "an edit must not be served from the cache")
+
+        // The whole project round-trips, not just the field that was edited. If the cache had
+        // served the pre-rename bytes, the name would read "BEFORE" here while the note survived —
+        // which is exactly the shape of the failure this guards against.
+        let relaunch = GameStore(defaults: defaults)
+        XCTAssertEqual(relaunch.projects, try storedForm(store.projects))
+        XCTAssertEqual(relaunch.projects.map(\.name), ["AFTER"])
+        XCTAssertEqual(
+            relaunch.projects.first?.patterns.first?.steps.first?[3],
+            67,
+            "the edit made after the first save must be on disk"
+        )
+    }
+
+    /// The delete stack has a bound of its own, and passing it is the one cap in the recovery layer
+    /// that destroys something: each entry is a whole project and the stack is the only copy once the
+    /// rolling backup has rotated past. So the oldest deletion ages out — its bytes leave the payload
+    /// rather than merely stopping being offered — while the newer ones stay restorable.
+    func testDeletingPastTheBoundAgesOutTheOldestRecoveryCopy() throws {
+        let suite = "BeatboiDeletedBoundTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let bound = GameStore.deletedProjectsLimit
+        let store = GameStore(defaults: defaults)
+        store.renameProject("KEEP")
+
+        // One more project than the bound, so the final deletion is the one that pushes a copy out.
+        var deletedNames: [String] = []
+        for index in 1...(bound + 1) {
+            store.newProject()
+            let name = "TAKE \(index)"
+            store.renameProject(name)
+            deletedNames.append(name)
+        }
+        XCTAssertEqual(store.projects.count, bound + 2, "precondition: enough projects to delete past the bound")
+
+        // Oldest deleted first, so the copy that ages out is the first one removed.
+        for name in deletedNames {
+            store.deleteProject(store.projects.first { $0.name == name }!)
+        }
+
+        let survivingNames = stride(from: bound + 1, through: 2, by: -1).map { "TAKE \($0)" }
+        XCTAssertEqual(store.recoveryCandidates.map(\.project.name), survivingNames, "the newer deletions survive, newest first")
+        XCTAssertEqual(store.recoveryCandidates.count, bound, "the stack stops at its bound")
+        XCTAssertEqual(store.recoveryCandidates.map(\.source), Array(repeating: .deleted, count: bound))
+        XCTAssertFalse(
+            store.recoveryCandidates.contains { $0.project.name == deletedNames[0] },
+            "the oldest deletion ages out"
+        )
+        XCTAssertEqual(store.projects.map(\.name), ["KEEP"], "only the kept project is left in the cart")
+
+        // Aged out means gone from the payload, not merely hidden: this is the one cap that eats bytes.
+        let payload = try XCTUnwrap(defaults.data(forKey: "bytePocket.projects.deleted"))
+        let stored = try JSONDecoder.bytePocketDecoder.decode(StoredPayload.self, from: payload)
+        XCTAssertEqual(stored.projects.count, bound)
+        XCTAssertFalse(stored.projects.contains { $0.name == deletedNames[0] }, "its bytes went with it")
+
+        // A relaunch agrees — no backup was rotated to hold the aged-out copy, so nothing offers it.
+        let relaunch = GameStore(defaults: defaults)
+        XCTAssertEqual(relaunch.recoveryCandidates.map(\.project.name), survivingNames)
+        XCTAssertFalse(relaunch.recoveryCandidates.contains { $0.project.name == deletedNames[0] })
+
+        // And the trimmed stack is still usable: the newest surviving deletion comes back.
+        relaunch.restoreDeletedProject()
+        XCTAssertEqual(relaunch.projects.map(\.name), ["TAKE \(bound + 1)", "KEEP"])
+    }
+
+#if DEBUG
+    /// The diagnostics dump is what a written-up report gets read from, so its facts are pinned here
+    /// rather than left to whoever reads it next. It is built only in debug builds, which is what the
+    /// test targets build, so this is gated the same way it is.
+    func testRecoveryDiagnosticsReportDescribesTheRecoveryState() throws {
+        let suite = "BeatboiDiagnosticsTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = GameStore(defaults: defaults)
+        let quiet = store.recoveryDiagnosticsReport()
+
+        // A pasted report has to identify itself, so the build and OS lead it. Both values are read
+        // from the runtime here too, which is what pins which bundle keys the dump reads.
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "unknown"
+        let build = info?["CFBundleVersion"] as? String ?? "unknown"
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        let header = quiet.split(separator: "\n").map(String.init)
+        XCTAssertEqual(header.first, "RECOVERY DIAGNOSTICS")
+        XCTAssertEqual(header.dropFirst().first, "app: \(version) (build \(build))")
+        XCTAssertEqual(header.dropFirst(2).first, "os: \(os.majorVersion).\(os.minorVersion).\(os.patchVersion)")
+        XCTAssertFalse(version.isEmpty, "precondition: the bundle declares a version")
+        XCTAssertFalse(build.isEmpty, "precondition: the bundle declares a build")
+
+        XCTAssertTrue(quiet.contains("deleted stack: 0 of \(GameStore.deletedProjectsLimit)"))
+        XCTAssertTrue(quiet.contains("dismissed ids: 0 of \(GameStore.dismissedRecoverableLimit)"))
+        XCTAssertTrue(quiet.contains("dismissed: absent"), "an absent payload is named, not omitted")
+        XCTAssertTrue(quiet.contains("recoverable rows: 0 (missing 0, earlier version 0)"))
+        XCTAssertTrue(quiet.contains("last load: clean"))
+
+        // A deleted project shows up as a row, as stack depth, and as a payload that is now present.
+        store.renameProject("KEEPER")
+        store.newProject()
+        store.renameProject("NEW QUEST 02")
+        store.deleteProject(store.projects.first { $0.name.hasPrefix("NEW QUEST") }!)
+
+        let deleted = store.recoveryDiagnosticsReport()
+        XCTAssertTrue(deleted.contains("deleted stack: 1 of \(GameStore.deletedProjectsLimit)"))
+        XCTAssertTrue(deleted.contains("recoverable rows: 1 (missing 1, earlier version 0)"))
+        XCTAssertTrue(deleted.contains("from deleted: 1"))
+        XCTAssertTrue(deleted.contains("NEW QUEST 02 [deleted, missing]"), "the report names what can be brought back")
+        XCTAssertFalse(deleted.contains("deleted: absent"), "and carries the payload size once the stack has an entry")
+
+        // Clearing that row moves it from the stack to the dismissed record.
+        XCTAssertTrue(store.dismissRecoverableProject(store.recoveryCandidates[0]))
+        let cleared = store.recoveryDiagnosticsReport()
+        XCTAssertTrue(cleared.contains("deleted stack: 0 of \(GameStore.deletedProjectsLimit)"))
+        XCTAssertTrue(cleared.contains("dismissed ids: 1 of \(GameStore.dismissedRecoverableLimit)"))
+        XCTAssertTrue(cleared.contains("recoverable rows: 0 (missing 0, earlier version 0)"))
+
+        // A payload that cannot be read at all is the case a report most needs to show, and its size
+        // is all the dump reports — never an attempt to print what could not be decoded.
+        let garbage = Data("not a library".utf8)
+        defaults.set(garbage, forKey: "bytePocket.projects.unreadable")
+        let damaged = GameStore(defaults: defaults).recoveryDiagnosticsReport()
+        XCTAssertTrue(damaged.contains("quarantine: \(garbage.count) bytes"))
+        XCTAssertTrue(damaged.contains("unreadable copies: 1"))
+        XCTAssertTrue(damaged.contains("unreadable entries: 0"))
+    }
+#endif
+
+    /// Clearing a row is an ordinary undoable step, so removing the wrong one is a tap away from
+    /// coming back — and the dismissal has to travel back off disk too.
+    func testDismissingARowIsUndoable() throws {
+        let suite = "BeatboiDismissUndoTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let first = GameStore(defaults: defaults)
+        first.renameProject("KEEPER")
+        let alpha = ByteProject(name: "ALPHA", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        let beta = ByteProject(name: "BETA", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        defaults.set(try JSONEncoder.bytePocketEncoder.encode([alpha, beta]), forKey: "bytePocket.projects.unreadable")
+
+        let second = GameStore(defaults: defaults)
+        let alphaRow = second.recoveryCandidates.first { $0.project.name == "ALPHA" }!
+        second.dismissRecoverableProject(alphaRow)
+        XCTAssertEqual(second.recoveryCandidates.map(\.project.name), ["BETA"])
+        XCTAssertNotNil(defaults.data(forKey: "bytePocket.projects.dismissed"))
+
+        second.undo()
+        XCTAssertEqual(second.recoveryCandidates.map(\.project.name), ["ALPHA", "BETA"], "undo brings the row back")
+        XCTAssertNil(defaults.data(forKey: "bytePocket.projects.dismissed"), "and takes it off disk")
+        XCTAssertEqual(GameStore(defaults: defaults).recoveryCandidates.map(\.project.name), ["ALPHA", "BETA"])
+
+        second.redo()
+        XCTAssertEqual(second.recoveryCandidates.map(\.project.name), ["BETA"])
+        XCTAssertNotNil(defaults.data(forKey: "bytePocket.projects.dismissed"))
+        XCTAssertEqual(GameStore(defaults: defaults).recoveryCandidates.map(\.project.name), ["BETA"])
+    }
+
+    /// The bulk discard erases everything, so it also forgets the individual dismissals: otherwise
+    /// a later payload holding the same project would stay hidden by a rule about a copy that no
+    /// longer exists.
+    func testDiscardingRecoverableProjectsForgetsIndividualDismissals() throws {
+        let suite = "BeatboiDiscardForgetsDismissalsTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let first = GameStore(defaults: defaults)
+        first.renameProject("KEEPER")
+        let orphan = ByteProject(name: "ORPHAN", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        let payload = try JSONEncoder.bytePocketEncoder.encode([orphan])
+        defaults.set(payload, forKey: "bytePocket.projects.unreadable")
+
+        let second = GameStore(defaults: defaults)
+        XCTAssertEqual(second.recoveryCandidates.map(\.project.name), ["ORPHAN"], "precondition")
+        second.dismissRecoverableProject(second.recoveryCandidates[0])
+        XCTAssertTrue(second.recoveryCandidates.isEmpty)
+
+        second.discardRecoverableProjects()
+        XCTAssertNil(defaults.data(forKey: "bytePocket.projects.dismissed"), "discarding clears the dismissals")
+
+        // A later payload holding the same project is offered again rather than hidden forever.
+        defaults.set(payload, forKey: "bytePocket.projects.unreadable")
+        XCTAssertEqual(GameStore(defaults: defaults).recoveryCandidates.map(\.project.name), ["ORPHAN"])
+    }
+
+    /// A genuinely empty store still opens on the blank first-launch project, reported as a
+    /// normal start rather than a recovery.
+    func testMissingLibraryStillOpensBlank() {
+        let suite = "BeatboiBlankStartTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = GameStore(defaults: defaults)
+
+        XCTAssertEqual(store.projects.count, 1)
+        XCTAssertEqual(store.projects[0].patterns.count, 1)
+        XCTAssertNil(store.libraryRecovery)
+        XCTAssertNil(defaults.data(forKey: "bytePocket.projects.unreadable"))
+    }
+
+    /// Version 1 stored a bare `[ByteProject]` array. Reading it is the migration: the payload
+    /// still loads, and the next save writes the versioned envelope, so the format change is an
+    /// explicit step instead of something a future reader has to infer from missing fields.
+    func testVersion1BareArrayLibraryMigratesToTheVersionedEnvelope() throws {
+        let suite = "BeatboiSchemaMigrationTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let keeper = ByteProject(name: "KEEPER", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        let legacyPayload = try JSONEncoder.bytePocketEncoder.encode([keeper])
+        // A version 1 payload really is a bare array, so it cannot be mistaken for an envelope.
+        XCTAssertNotNil(try? JSONSerialization.jsonObject(with: legacyPayload) as? [[String: Any]])
+        defaults.set(legacyPayload, forKey: "bytePocket.projects")
+
+        let store = GameStore(defaults: defaults)
+        // Reading legacy data is not a degraded read: everything decoded, so nothing is reported.
+        XCTAssertEqual(store.projects.map(\.name), ["KEEPER"])
+        XCTAssertNil(store.libraryRecovery)
+        XCTAssertEqual(defaults.data(forKey: "bytePocket.projects"), legacyPayload, "loading must not rewrite the v1 payload")
+
+        // The first edit writes the current shape.
+        store.renameProject("RENAMED")
+        let saved = try XCTUnwrap(defaults.data(forKey: "bytePocket.projects"))
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: saved) as? [String: Any])
+        let version = try XCTUnwrap(object["schemaVersion"] as? Int, "the saved payload must declare its schema version")
+        XCTAssertGreaterThan(version, 1, "a migrated payload must not read as the bare-array version")
+        let entries = try XCTUnwrap(object["projects"] as? [[String: Any]])
+        XCTAssertEqual(entries.count, 1)
+        XCTAssertEqual(entries.first?["name"] as? String, "RENAMED", "migration must carry the project across, not drop it")
+        // The migrated project is stamped with the shape this build writes.
+        XCTAssertEqual(entries.first?["schemaVersion"] as? Int, ByteProject.currentSchemaVersion)
+    }
+
+    /// A payload written by a newer build must be identified as such rather than absorbed by the
+    /// per-field decoding defaults, which would silently drop whatever that build added.
+    func testLibraryFromANewerBuildIsDetectedAndItsBytesPreserved() throws {
+        let suite = "BeatboiNewerLibraryTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let good = ByteProject(name: "FUTURE", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        let projectData = try JSONEncoder.bytePocketEncoder.encode(good)
+        let projectObject = try XCTUnwrap(try JSONSerialization.jsonObject(with: projectData) as? [String: Any])
+        let futurePayload = try JSONSerialization.data(withJSONObject: ["schemaVersion": 999, "projects": [projectObject]])
+        defaults.set(futurePayload, forKey: "bytePocket.projects")
+
+        let store = GameStore(defaults: defaults)
+
+        XCTAssertEqual(store.projects.map(\.name), ["FUTURE"], "the project is still read as far as this build understands it")
+        XCTAssertEqual(store.libraryRecovery?.newerFormatFound, true, "a newer container version must be reported")
+        XCTAssertEqual(defaults.data(forKey: "bytePocket.projects.unreadable"), futurePayload, "the original bytes must be preserved")
+    }
+
+    /// The same detection applies one level down, to the project shape itself, so a future field
+    /// added to `ByteProject` is flagged even when the container version still matches.
+    func testProjectFromANewerBuildIsDetected() throws {
+        let suite = "BeatboiNewerProjectTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let good = ByteProject(name: "FUTURE", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        let projectData = try JSONEncoder.bytePocketEncoder.encode(good)
+        var projectObject = try XCTUnwrap(try JSONSerialization.jsonObject(with: projectData) as? [String: Any])
+        projectObject["schemaVersion"] = 999
+        let futurePayload = try JSONSerialization.data(withJSONObject: [projectObject])
+        defaults.set(futurePayload, forKey: "bytePocket.projects")
+
+        let store = GameStore(defaults: defaults)
+
+        XCTAssertEqual(store.projects.map(\.name), ["FUTURE"])
+        XCTAssertEqual(store.libraryRecovery?.newerFormatFound, true)
+        XCTAssertEqual(defaults.data(forKey: "bytePocket.projects.unreadable"), futurePayload)
+    }
+
+    /// Absence of the field is what every pre-versioning file looks like, so it must decode as the
+    /// legacy version specifically — not as whatever this build happens to write. The two are the
+    /// same number today, which is exactly why pinning the distinction now matters.
+    func testAbsentSchemaVersionReadsAsLegacyAndWrittenAsCurrent() throws {
+        let project = ByteProject(name: "LEGACY", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        let encoded = try JSONEncoder.bytePocketEncoder.encode(project)
+        var object = try XCTUnwrap(try JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertEqual(object["schemaVersion"] as? Int, ByteProject.currentSchemaVersion, "a fresh project must be stamped with the current shape")
+
+        object.removeValue(forKey: "schemaVersion")
+        let legacy = try JSONDecoder.bytePocketDecoder.decode(
+            ByteProject.self,
+            from: try JSONSerialization.data(withJSONObject: object)
+        )
+        XCTAssertEqual(legacy.schemaVersion, ByteProject.legacySchemaVersion)
+        XCTAssertLessThanOrEqual(ByteProject.legacySchemaVersion, ByteProject.currentSchemaVersion)
+    }
+
+    /// Corrupt the stored library every way we can think of. Every case must hold two lines:
+    /// loading never rewrites or discards what is on disk, and any project that is still
+    /// readable survives into the library. The first case is a control proving this harness can
+    /// produce a valid project, so the unreadable cases cannot pass for the wrong reason.
+    func testCorruptStoredLibrariesNeverWipeOrLoseData() throws {
+        let suite = "BeatboiCorruptLibraryTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let good = ByteProject(name: "KEEPER", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        let goodPayload = try JSONEncoder.bytePocketEncoder.encode([good])
+        let goodObject = try XCTUnwrap((JSONSerialization.jsonObject(with: goodPayload) as? [[String: Any]])?.first)
+
+        func payload(_ change: (inout [String: Any]) -> Void) throws -> Data {
+            var object = goodObject
+            change(&object)
+            return try JSONSerialization.data(withJSONObject: [object])
+        }
+        func array(_ objects: [[String: Any]]) throws -> Data {
+            try JSONSerialization.data(withJSONObject: objects)
+        }
+
+        let cases: [(name: String, payload: Data, keepsProject: Bool)] = [
+            ("unmodified object (control)", try array([goodObject]), true),
+            ("truncated payload", Data(goodPayload.prefix(goodPayload.count / 2)), false),
+            ("empty payload", Data(), false),
+            ("not json at all", Data("this is not json".utf8), false),
+            ("json object instead of array", Data(#"{"id":"x"}"#.utf8), false),
+            ("array of numbers", Data("[1,2,3]".utf8), false),
+            ("array of empty objects", Data("[{}]".utf8), false),
+            ("array containing null", Data("[null]".utf8), false),
+            ("missing id", try payload { $0.removeValue(forKey: "id") }, false),
+            ("missing name", try payload { $0.removeValue(forKey: "name") }, false),
+            ("missing tempo", try payload { $0.removeValue(forKey: "tempo") }, false),
+            ("missing patterns", try payload { $0.removeValue(forKey: "patterns") }, false),
+            ("missing createdAt", try payload { $0.removeValue(forKey: "createdAt") }, false),
+            ("missing modifiedAt", try payload { $0.removeValue(forKey: "modifiedAt") }, false),
+            ("bogus id", try payload { $0["id"] = "not-a-uuid" }, false),
+            ("tempo wrong type", try payload { $0["tempo"] = "fast" }, false),
+            ("name wrong type", try payload { $0["name"] = 42 }, false),
+            ("patterns wrong type", try payload { $0["patterns"] = 5 }, false),
+            ("effect values wrong type", try payload { $0["effects"] = "loud" }, false),
+            ("good then bad", try array([goodObject, ["id": "nope"]]), true),
+            ("bad then good", try array([["id": "nope"], goodObject]), true),
+            ("three bad then good", try array([["id": "a"], ["id": "b"], ["id": "c"], goodObject]), true),
+        ]
+
+        for testCase in cases {
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(testCase.payload, forKey: "bytePocket.projects")
+            let context = "\(testCase.name): "
+
+            let store = GameStore(defaults: defaults)
+
+            // Loading must never rewrite what is on disk. Rewriting it is the wipe.
+            XCTAssertEqual(
+                defaults.data(forKey: "bytePocket.projects"), testCase.payload,
+                context + "the stored payload was rewritten by loading"
+            )
+
+            if testCase.keepsProject {
+                XCTAssertTrue(store.projects.contains { $0.name == "KEEPER" }, context + "a readable project was lost")
+            } else {
+                XCTAssertNotNil(store.libraryRecovery, context + "an unreadable library was reported as a normal start")
+            }
+
+            // The original bytes are preserved exactly when the read was degraded, and a clean
+            // read must not quarantine anything.
+            let quarantined = defaults.data(forKey: "bytePocket.projects.unreadable")
+            if store.libraryRecovery == nil {
+                XCTAssertNil(quarantined, context + "a clean load should not quarantine anything")
+            } else {
+                XCTAssertEqual(quarantined, testCase.payload, context + "the unreadable payload was not preserved")
+            }
+        }
+
+        // Dropped projects are counted accurately for a mixed payload.
+        defaults.removePersistentDomain(forName: suite)
+        defaults.set(try array([["id": "nope"], goodObject, ["id": "also-nope"]]), forKey: "bytePocket.projects")
+        let mixed = GameStore(defaults: defaults)
+        XCTAssertEqual(mixed.projects.count, 1)
+        XCTAssertEqual(mixed.libraryRecovery?.droppedProjects, 2)
+    }
+
     func testMalformedProjectDecodeRecoversSafeEditorShape() throws {
         let source = try JSONEncoder.bytePocketEncoder.encode(ByteProject.starter)
         var object = try XCTUnwrap(JSONSerialization.jsonObject(with: source) as? [String: Any])
@@ -929,6 +2510,32 @@ final class BeatboiTests: XCTestCase {
         XCTAssertEqual(ByteChannel.drum.title, "DRUM")
     }
 
+    /// The Export Pack product ID lives in two places that must agree: the app
+    /// constant and the checked-in StoreKit config.
+    ///
+    /// They drifted once already. The app asked for `com.bytepocket.studio.export`
+    /// while App Store Connect offered `exportunlock`, so `Product.products(for:)`
+    /// came back empty and the pack was unbuyable in TestFlight — while looking
+    /// perfectly healthy in Xcode, because the local StoreKit config masks exactly
+    /// this class of mistake. This test covers the app-versus-config half; the
+    /// release script checks both of them against live App Store Connect.
+    func testExportPackProductIDMatchesStoreKitConfig() throws {
+        let config = URL(fileURLWithPath: #filePath)   // <repo>/AquaSortTests/WaterLogicTests.swift
+            .deletingLastPathComponent()               // <repo>/AquaSortTests
+            .deletingLastPathComponent()               // <repo>
+            .appendingPathComponent("StoreKitConfig/AquaSort.storekit")
+        let json = try JSONSerialization.jsonObject(with: Data(contentsOf: config)) as? [String: Any]
+        let offered = (json?["products"] as? [[String: Any]] ?? [])
+            .compactMap { $0["productID"] as? String }
+        let requested = StoreKitManager().unlockProductID
+
+        XCTAssertFalse(offered.isEmpty, "AquaSort.storekit lists no products")
+        XCTAssertTrue(
+            offered.contains(requested),
+            "the app requests \(requested) but AquaSort.storekit offers \(offered)"
+        )
+    }
+
     func testUnlockFlagPersistsAcrossStoreInstances() {
         let suite = "BeatboiTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -969,6 +2576,13 @@ final class BeatboiTests: XCTestCase {
 
 private extension ByteProject {
     var projectEffectsForTests: ByteEffects { effects }
+}
+
+private extension GameStore {
+    /// Whether the recovery surface is still offering this exact preserved copy.
+    func offersRecovery(_ candidate: GameStore.RecoveryCandidate) -> Bool {
+        recoveryCandidates.contains { $0.id == candidate.id }
+    }
 }
 
 private extension Data {

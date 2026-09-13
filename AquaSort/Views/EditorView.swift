@@ -260,14 +260,7 @@ struct EditorView: View {
             if let toast = store.toast {
                 VStack {
                     Spacer()
-                    Text(toast)
-                        .font(.custom("Futura-Bold", size: 11))
-                        .foregroundStyle(Color.gbInk)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                        .background(Color.amber)
-                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.gbInk, lineWidth: 2))
+                    PocketToast(message: toast)
                         .padding(.bottom, 78)
                 }
                 .transition(.scale.combined(with: .opacity))
@@ -1368,8 +1361,8 @@ struct EditorView: View {
     }
     private func importFile(_ result: Result<URL, Error>) {
         guard case .success(let url) = result, let data = try? Data(contentsOf: url) else { store.presentToast("IMPORT FAILED"); return }
-        if url.pathExtension.lowercased() == "mid", let imported = ByteMIDI.importIntoProject(data, project: store.project) { store.importProject(imported); store.presentToast("MIDI IMPORTED") }
-        else if let imported = try? JSONDecoder.bytePocketDecoder.decode(ByteProject.self, from: data) { store.importProject(imported); store.presentToast("PROJECT OPENED") }
+        if url.pathExtension.lowercased() == "mid", let imported = ByteMIDI.importIntoProject(data, project: store.project) { store.importProject(imported); store.presentToast("MIDI IMPORTED · UNDO AVAILABLE") }
+        else if let imported = try? JSONDecoder.bytePocketDecoder.decode(ByteProject.self, from: data) { store.importProject(imported); store.presentToast("PROJECT OPENED · UNDO AVAILABLE") }
         else { store.presentToast("UNKNOWN FILE") }
     }
 }
@@ -2506,21 +2499,78 @@ struct ProjectLibraryView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var projectIDToDelete: UUID?
     @State private var showDeleteConfirmation = false
+    @State private var showDiscardRecoverableConfirmation = false
+#if DEBUG
+    @State private var showDiagnostics = false
+#endif
     var body: some View {
         NavigationStack {
             ZStack {
                 PocketBackdrop()
                 List {
-                    if store.canRestoreDeletedProject {
+                    if store.hasRecoverableProjects {
                         Section {
-                            Button {
-                                store.restoreDeletedProject()
-                            } label: {
-                                Label("RESTORE LAST DELETED PROJECT", systemImage: "arrow.uturn.backward.circle.fill")
-                                    .font(.custom("Futura-Bold", size: 12))
-                                    .foregroundStyle(Color.gbInk)
+                            ForEach(store.recoveryCandidates) { candidate in
+                                HStack(spacing: 4) {
+                                    Button {
+                                        store.restoreRecoveredProject(candidate)
+                                    } label: {
+                                        HStack {
+                                            Image(systemName: candidate.iconName)
+                                                .foregroundStyle(Color.amber)
+                                            VStack(alignment: .leading) {
+                                                Text(candidate.project.name).font(.custom("Futura-Bold", size: 14))
+                                                Text("\(candidate.title) · \(candidate.project.patterns.count) PATTERN\(candidate.project.patterns.count == 1 ? "" : "S") · \(candidate.project.tempo) BPM")
+                                                    .font(.custom("Futura-Medium", size: 10))
+                                                    .foregroundStyle(Color.mutedText)
+                                            }
+                                            Spacer()
+                                            Image(systemName: "arrow.uturn.backward.circle")
+                                                .foregroundStyle(Color.gbLight)
+                                        }
+                                        .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .accessibilityIdentifier("projectLibrary.restorePreservedProject")
+                                    .accessibilityHint(candidate.restoreHint)
+
+                                    // Dropping a single row is the quiet counterpart to restoring
+                                    // it, so it gets its own control instead of hiding behind the
+                                    // row's tap, which is already spoken for. The glyph is a cross
+                                    // rather than a bin on purpose: this stops offering a copy, it
+                                    // does not erase it, and the bin is the bulk control.
+                                    Button {
+                                        store.dismissRecoverableProject(candidate)
+                                    } label: {
+                                        Image(systemName: "xmark.circle")
+                                            .font(.system(size: 16, weight: .bold))
+                                            .foregroundStyle(Color.gbLight)
+                                            .frame(width: 44, height: 44)
+                                            .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .accessibilityIdentifier("projectLibrary.dismissRecoverable")
+                                    .accessibilityLabel("Remove \(candidate.project.name) from the recovery list")
+                                    .accessibilityHint("Stops offering this copy without erasing it. Undo brings the row back.")
+                                }
                             }
-                            .accessibilityHint("Restores the most recently deleted project")
+                            if let notice = preservedNotice {
+                                Label(notice, systemImage: "exclamationmark.triangle.fill")
+                                    .font(.custom("Futura-Medium", size: 10))
+                                    .foregroundStyle(Color.mutedText)
+                            }
+                            Button(role: .destructive) {
+                                showDiscardRecoverableConfirmation = true
+                            } label: {
+                                Label("DISCARD RECOVERABLE PROJECTS", systemImage: "trash")
+                                    .font(.custom("Futura-Bold", size: 12))
+                            }
+                            .accessibilityIdentifier("projectLibrary.discardRecoverable")
+                            .accessibilityHint("Deletes the recoverable copies and any deleted project for good")
+                        } header: {
+                            Text("RECOVERABLE PROJECTS")
+                        } footer: {
+                            Text("Kept from an earlier launch, from a library that could not be read in full, or from a project you deleted. Restoring never changes the projects already in your cart.")
                         }
                     }
                     Section {
@@ -2548,9 +2598,31 @@ struct ProjectLibraryView: View {
                 }
                 .scrollContentBackground(.hidden)
                 .foregroundStyle(Color.gbLight)
+                // The editor's toast is behind this sheet, so a message about something done here
+                // has to be repeated here to reach the user at all.
+                if let toast = store.toast {
+                    VStack {
+                        Spacer()
+                        PocketToast(message: toast)
+                            .padding(.bottom, 24)
+                            // The editor draws the same banner behind this sheet, so the cart's own
+                            // copy carries a distinct identifier to stay tellable apart.
+                            .accessibilityIdentifier("pocketToast.cart")
+                    }
+                    .allowsHitTesting(false)
+                    .transition(.scale.combined(with: .opacity))
+                }
             }
             .navigationTitle("PROJECT CART")
-            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("DONE") { dismiss() } } }
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) { Button("DONE") { dismiss() } }
+#if DEBUG
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("REPORT") { showDiagnostics = true }
+                        .accessibilityIdentifier("projectLibrary.diagnostics")
+                }
+#endif
+            }
         }
         .alert("DELETE PROJECT?", isPresented: $showDeleteConfirmation) {
             Button("DELETE", role: .destructive) {
@@ -2561,9 +2633,57 @@ struct ProjectLibraryView: View {
             }
             Button("CANCEL", role: .cancel) { projectIDToDelete = nil }
         } message: {
-            Text("This removes the project from the project cart. You can restore the most recently deleted project from this screen.")
+            Text("This removes the project from the project cart. It is kept here so you can restore it later, even after you close the app.")
+        }
+        .alert("DISCARD RECOVERABLE PROJECTS?", isPresented: $showDiscardRecoverableConfirmation) {
+            Button("DISCARD", role: .destructive) { store.discardRecoverableProjects() }
+            Button("CANCEL", role: .cancel) { }
+        } message: {
+            Text("These are the only copies of that work, including any project you deleted. The projects in your cart are not affected, but this cannot be undone.")
+        }
+#if DEBUG
+        .sheet(isPresented: $showDiagnostics) { diagnosticsSheet }
+#endif
+        .preferredColorScheme(.dark)
+    }
+
+#if DEBUG
+    /// The recovery dump, shown as selectable monospaced text so it can be taken out of the app
+    /// without a pasteboard round trip. Debug builds only, like the report it renders.
+    private var diagnosticsSheet: some View {
+        NavigationStack {
+            ZStack {
+                PocketBackdrop()
+                ScrollView {
+                    Text(store.recoveryDiagnosticsReport())
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundStyle(Color.gbInk)
+                        .textSelection(.enabled)
+                        .accessibilityIdentifier("projectLibrary.diagnosticsReport")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(16)
+                }
+            }
+            .navigationTitle("RECOVERY DIAGNOSTICS")
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("CLOSE") { showDiagnostics = false } } }
         }
         .preferredColorScheme(.dark)
+    }
+#endif
+
+    /// Names what is preserved but cannot be brought back, so the surface never looks like it is
+    /// silently missing a project whose bytes are in fact still on disk.
+    private var preservedNotice: String? {
+        var parts: [String] = []
+        let entries = store.preservedLibrary.unreadableEntries
+        if entries > 0 {
+            parts.append("\(entries) PROJECT\(entries == 1 ? "" : "S") PRESERVED BUT UNREADABLE")
+        }
+        let copies = store.preservedLibrary.unreadableCopies
+        if copies > 0 {
+            parts.append("\(copies) LIBRARY COPY\(copies == 1 ? "" : "IES") PRESERVED BUT UNREADABLE")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 }
 

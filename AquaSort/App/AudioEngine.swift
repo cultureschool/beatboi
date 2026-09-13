@@ -751,18 +751,12 @@ enum ByteRenderer {
         let channels: UInt16 = 2
         let bits: UInt16 = 16
         let bytesPerSample = Int(bits / 8)
-        var pcm = [Int16]()
-        pcm.reserveCapacity(samples.count)
-        let conversionInterval = max(1, samples.count / 20)
-        for (index, sample) in samples.enumerated() {
-            pcm.append(Int16(max(-1, min(1, sample)) * Float(Int16.max)))
-            if index % conversionInterval == 0 {
-                onProgress(0.95 + Double(index) / Double(max(1, samples.count)) * 0.05)
-            }
-        }
-        onProgress(1.0)
-        let dataSize = UInt32(pcm.count * bytesPerSample)
+        let dataSize = UInt32(samples.count * bytesPerSample)
+
+        // RIFF header. Reserving the payload up front keeps the append below from
+        // repeatedly reallocating as the buffer grows.
         var data = Data()
+        data.reserveCapacity(44 + Int(dataSize))
         data.append(contentsOf: Array("RIFF".utf8))
         data.appendLittleEndian(36 + dataSize)
         data.append(contentsOf: Array("WAVEfmt ".utf8))
@@ -775,7 +769,35 @@ enum ByteRenderer {
         data.appendLittleEndian(bits)
         data.append(contentsOf: Array("data".utf8))
         data.appendLittleEndian(dataSize)
-        for sample in pcm { data.appendLittleEndian(sample) }
+
+        // Convert and append the payload in fixed-size chunks. Appending per sample
+        // meant one Data mutation per sample — tens of millions of them for a 64-bar
+        // arrangement — and building the whole [Int16] first held a second buffer the
+        // size of the render alongside `samples`. FixedWidthInteger bytes are
+        // little-endian on every platform this app runs on, which is what RIFF wants.
+        let chunkSize = 65_536
+        let conversionInterval = max(1, samples.count / 20)
+        var nextProgress = 0
+        var scratch = [Int16]()
+        scratch.reserveCapacity(min(chunkSize, samples.count))
+
+        var index = 0
+        while index < samples.count {
+            let end = min(samples.count, index + chunkSize)
+            scratch.removeAll(keepingCapacity: true)
+            for sampleIndex in index..<end {
+                scratch.append(Int16(max(-1, min(1, samples[sampleIndex])) * Float(Int16.max)))
+            }
+            scratch.withUnsafeBytes { data.append(contentsOf: $0) }
+            index = end
+
+            if index >= nextProgress {
+                onProgress(0.95 + Double(index) / Double(max(1, samples.count)) * 0.05)
+                nextProgress = index + conversionInterval
+            }
+        }
+
+        onProgress(1.0)
         return data
     }
 

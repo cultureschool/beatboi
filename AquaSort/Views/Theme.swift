@@ -331,6 +331,24 @@ struct PixelButton: View {
     }
 }
 
+/// The transient message the store publishes. It is drawn by whichever screen the user is looking at
+/// when it fires: a sheet covers the editor, so a message about something done in the project cart
+/// has to be shown in the cart to be seen at all.
+struct PocketToast: View {
+    let message: String
+
+    var body: some View {
+        Text(message)
+            .font(.custom("Futura-Bold", size: 11))
+            .foregroundStyle(Color.gbInk)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(Color.amber)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.gbInk, lineWidth: 2))
+    }
+}
+
 struct LCDText: View {
     let text: String
     let size: CGFloat

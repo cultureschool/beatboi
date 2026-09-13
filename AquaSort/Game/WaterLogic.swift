@@ -1228,6 +1228,13 @@ struct ByteSongSlot: Codable, Hashable, Sendable {
 struct ByteProject: Codable, Hashable, Identifiable, Sendable {
     static let maximumPatternCount = 16
     static let songArrangementLengths = [16, 32, 64]
+    /// Shape version written by this build. Files produced before versioning existed omit the
+    /// field, and their shape is what version 1 describes, so absence decodes as 1 — which is
+    /// also why old data can never be mistaken for something from a newer build.
+    static let currentSchemaVersion = 1
+    /// Shape version of files written before this field existed. Kept separate from
+    /// `currentSchemaVersion` so bumping that constant cannot retroactively relabel legacy data.
+    static let legacySchemaVersion = 1
 
     var id: UUID
     var name: String
@@ -1251,6 +1258,10 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
     var effects: ByteEffects
     var createdAt: Date
     var modifiedAt: Date
+    /// Shape version this project was read from or written as. Carries a value above
+    /// `currentSchemaVersion` only when a newer build produced the data, which is how that is
+    /// detected instead of being silently absorbed by the per-field decoding defaults.
+    var schemaVersion: Int
 
     init(
         id: UUID = UUID(),
@@ -1290,6 +1301,7 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         self.effects = effects
         self.createdAt = createdAt
         self.modifiedAt = modifiedAt
+        self.schemaVersion = Self.currentSchemaVersion
     }
 
     /// Default project: a ready-to-play groove in C major. Two patterns seed a two-bar
@@ -1438,7 +1450,7 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, tempo, loopLength, songArrangementLength, key, mode, patterns, arrangement, songArrangement, songModeEnabled, waveform, channelPatches, effects, createdAt, modifiedAt
+        case id, name, tempo, loopLength, songArrangementLength, key, mode, patterns, arrangement, songArrangement, songModeEnabled, waveform, channelPatches, effects, createdAt, modifiedAt, schemaVersion
     }
 
     init(from decoder: Decoder) throws {
@@ -1477,6 +1489,8 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         effects = try container.decodeIfPresent(ByteEffects.self, forKey: .effects) ?? ByteEffects()
         createdAt = try container.decode(Date.self, forKey: .createdAt)
         modifiedAt = try container.decode(Date.self, forKey: .modifiedAt)
+        // Absent means the file predates versioning, whose shape is version 1.
+        schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? Self.legacySchemaVersion
         waveform = Array(waveform.prefix(32)) + Array(repeating: 8, count: max(0, 32 - waveform.count))
         if channelPatches.count != ByteChannel.allCases.count { channelPatches = ByteChannelPatch.defaults }
     }
@@ -1499,6 +1513,8 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         try container.encode(effects, forKey: .effects)
         try container.encode(createdAt, forKey: .createdAt)
         try container.encode(modifiedAt, forKey: .modifiedAt)
+        // Always the shape this build writes, never a version inherited from the data it read.
+        try container.encode(Self.currentSchemaVersion, forKey: .schemaVersion)
     }
 }
 
@@ -1534,9 +1550,21 @@ struct ByteWaveDocument: FileDocument {
 }
 
 extension JSONEncoder {
+    /// Used for files the user keeps: project, wave and MIDI exports. Pretty printing and key
+    /// sorting cost real time, but they buy a file that opens readably in a text editor and that
+    /// diffs cleanly, which is why exports keep them.
     static var bytePocketEncoder: JSONEncoder {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        return encoder
+    }
+
+    /// Used for the app's own stored payloads, which nothing reads by eye. Same JSON, same decoder,
+    /// minus the formatting that only exists for export files — the library is rewritten on every
+    /// edit, so this is the encoding that runs on the hot path.
+    static var bytePocketStorageEncoder: JSONEncoder {
+        let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         return encoder
     }

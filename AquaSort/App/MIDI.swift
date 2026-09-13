@@ -22,11 +22,18 @@ struct ByteMIDIDocument: FileDocument {
 }
 
 enum ByteMIDI {
+    /// A step is a sixteenth note — `ByteTransportClock.stepDuration` divides a quarter by
+    /// four — while the header division counts ticks per **quarter** note. Deriving both from
+    /// one constant keeps them from drifting apart: declaring the division as if a step were a
+    /// whole quarter note made every exported file play four times slow in a DAW.
+    private static let ticksPerQuarter = 480
+    private static let ticksPerStep = ticksPerQuarter / 4
+
     static func export(project: ByteProject, patterns sourcePatterns: [BytePattern]? = nil) -> Data {
-        let ticksPerStep = 120
+        let ticksPerStep = Self.ticksPerStep
         let patterns = sourcePatterns ?? project.arrangedPatterns
         let totalSteps = patterns.count * 16
-        var tracks: [Data] = [tempoTrack(bpm: project.tempo, ticksPerStep: ticksPerStep)]
+        var tracks: [Data] = [tempoTrack(bpm: project.tempo)]
 
         for (channelIndex, _) in ByteChannel.allCases.enumerated() {
             var events = Data()
@@ -64,7 +71,8 @@ enum ByteMIDI {
         data.appendBigEndian(UInt32(6))
         data.appendBigEndian(UInt16(1))
         data.appendBigEndian(UInt16(tracks.count))
-        data.appendBigEndian(UInt16(ticksPerStep))
+        // Ticks per quarter note. A step spans ticksPerStep of them, making it a sixteenth.
+        data.appendBigEndian(UInt16(Self.ticksPerQuarter))
         for track in tracks { data.append(track) }
         return data
     }
@@ -76,7 +84,11 @@ enum ByteMIDI {
         guard headerLength >= 6, data.count >= 8 + headerLength else { return nil }
         let trackCount = Int(data.readBigEndian(UInt16.self, at: 10))
         let division = Int(data.readBigEndian(UInt16.self, at: 12))
-        guard division > 0 else { return nil }
+        // The division counts ticks per quarter note, and its top bit marks SMPTE frame-based
+        // timing (frames per second rather than ticks). Reject SMPTE rather than dividing by a
+        // frame count, then derive the sixteenth-note step length from ticks per quarter.
+        guard division > 0, division & 0x8000 == 0 else { return nil }
+        let ticksPerStep = max(1, division / 4)
         cursor = 8 + headerLength
 
         var imported = ByteProject(name: project.name, tempo: project.tempo, patterns: [BytePattern.empty(name: "IMPORTED 01")])
@@ -119,7 +131,7 @@ enum ByteMIDI {
                     if kind == 0x90 && velocity > 0 {
                         channelNote = (valueA, tick)
                     } else if let active = channelNote {
-                        let step = min(15, max(0, Int(Double(active.1) / Double(max(1, division)))))
+                        let step = min(15, max(0, Int(Double(active.1) / Double(ticksPerStep))))
                         let channel = min(3, max(0, parsedTracks - 1))
                         noteBuckets[channel][step].append(active.0)
                         channelNote = nil
@@ -142,7 +154,8 @@ enum ByteMIDI {
         return imported
     }
 
-    private static func tempoTrack(bpm: Int, ticksPerStep: Int) -> Data {
+    /// Microseconds per quarter note, which is independent of the tick resolution.
+    private static func tempoTrack(bpm: Int) -> Data {
         let microseconds = UInt32(60_000_000 / max(1, bpm))
         var events = Data()
         appendVariableLength(0, to: &events)
