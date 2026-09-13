@@ -64,6 +64,67 @@ final class BeatboiTests: XCTestCase {
         defaults.removePersistentDomain(forName: suite)
     }
 
+    func testChangingKeyTransposesMelodyInsteadOfRatchetingItDownward() {
+        let suite = "BeatboiVoicingTransposeTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+        store.updateVoicing(key: 0, mode: .major)
+
+        let phrase = [60, 64, 67, 69] // C E G A
+        for (step, note) in phrase.enumerated() {
+            store.setNote(channel: .pulseA, step: step, note: note)
+        }
+
+        store.updateVoicing(key: 2) // D major transposes the phrase up a whole tone
+        XCTAssertEqual((0..<phrase.count).map { store.project.patterns[0].steps[0][$0] }, [62, 66, 69, 71])
+
+        // Returning to C restores the phrase exactly. The old nearest-note snapping moved
+        // notes a semitone lower on every change and could never recover.
+        store.updateVoicing(key: 0)
+        XCTAssertEqual((0..<phrase.count).map { store.project.patterns[0].steps[0][$0] }, phrase)
+
+        // Cycling keys repeatedly stays stable in both directions.
+        for _ in 0..<8 {
+            store.updateVoicing(key: 7) // G
+            store.updateVoicing(key: 0)
+        }
+        XCTAssertEqual((0..<phrase.count).map { store.project.patterns[0].steps[0][$0] }, phrase)
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    func testKeyChangeTakesTheShortestIntervalAndKeepsNotesInRegister() {
+        let suite = "BeatboiVoicingRegisterTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+        store.updateVoicing(key: 0, mode: .chromatic)
+
+        store.setNote(channel: .wave, step: 0, note: 36)
+        store.setNote(channel: .wave, step: 1, note: 24) // bottom edge of the register
+
+        store.updateVoicing(key: 11) // C to B moves down a semitone rather than up eleven
+        XCTAssertEqual(store.project.patterns[0].steps[2][0], 35)
+        XCTAssertEqual(store.project.patterns[0].steps[2][1], 24) // held at the register edge
+
+        store.updateVoicing(key: 0)
+        XCTAssertEqual(store.project.patterns[0].steps[2][0], 36)
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    func testModeChangeStillSnapsMelodicRowsWithoutTouchingDrums() {
+        let suite = "BeatboiVoicingModeSnapTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+
+        store.updateVoicing(key: 0, mode: .chromatic)
+        store.setNote(channel: .pulseA, step: 0, note: 63) // out of C major
+        store.setNote(channel: .drum, step: 0, note: ByteDrumVoice.snare.baseNote)
+
+        store.updateVoicing(mode: .major)
+        XCTAssertEqual(store.project.patterns[0].steps[0][0]!, ByteScaleMode.major.quantize(63, key: 0))
+        XCTAssertEqual(store.project.patterns[0].steps[3][0], ByteDrumVoice.snare.baseNote)
+        defaults.removePersistentDomain(forName: suite)
+    }
+
     func testNewMelodicNotesUseTheProjectKeyRootAcrossChannels() {
         let suite = "BeatboiRootNoteTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!

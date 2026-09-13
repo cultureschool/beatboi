@@ -250,20 +250,45 @@ final class GameStore {
         }
     }
 
+    /// Applies a voicing change across every pattern.
+    ///
+    /// A **key change transposes** melodic material by the interval to the new key, so the
+    /// song keeps its shape and simply moves into that key. Re-quantizing towards the new
+    /// key instead would ratchet notes downward: snapping breaks ties toward the lower pitch,
+    /// and in a diatonic scale every non-scale pitch class sits above its lower neighbour, so
+    /// each key change dragged the melody a semitone lower until it bottomed out.
+    ///
+    /// A **mode change re-snaps** the melodic rows into the new scale. Drum rows are untouched.
+    ///
+    /// Transposed notes are held inside the 24...96 register, so a note already sitting on an
+    /// edge of that range stays put rather than leaving the playable pitch range.
     func updateVoicing(key: Int? = nil, mode: ByteScaleMode? = nil) {
-        if let key { project.key = key.clamped(to: 0...11) }
+        var semitoneShift = 0
+        if let key {
+            let newKey = key.clamped(to: 0...11)
+            semitoneShift = Self.shortestSemitoneShift(from: project.key, to: newKey)
+            project.key = newKey
+        }
         if let mode { project.mode = mode }
+
         let melodicRows = ByteChannel.allCases.enumerated().filter { $0.element != .drum }.map { $0.offset }
         for patternIndex in project.patterns.indices {
             for row in melodicRows {
                 for step in project.patterns[patternIndex].steps[row].indices {
-                    if let note = project.patterns[patternIndex].steps[row][step] {
-                        project.patterns[patternIndex].steps[row][step] = project.mode.quantize(note, key: project.key)
-                    }
+                    guard let note = project.patterns[patternIndex].steps[row][step] else { continue }
+                    let moved = semitoneShift == 0 ? note : (note + semitoneShift).clamped(to: 24...96)
+                    project.patterns[patternIndex].steps[row][step] = project.mode.quantize(moved, key: project.key)
                 }
             }
         }
         touch()
+    }
+
+    /// Signed distance between two keys, taking the shortest path around the octave so that
+    /// C to B moves down a semitone instead of up eleven.
+    private static func shortestSemitoneShift(from oldKey: Int, to newKey: Int) -> Int {
+        let raw = ((newKey - oldKey) % 12 + 12) % 12
+        return raw > 6 ? raw - 12 : raw
     }
 
     /// Generates a fresh two-octave melodic sketch for the selected pulse or wave channel.

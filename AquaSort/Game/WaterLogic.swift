@@ -46,6 +46,12 @@ enum ByteScaleMode: String, CaseIterable, Codable, Identifiable, Sendable {
         }
     }
 
+    /// Snaps a note to the nearest pitch in this scale and key, clamped to the 24...96 register.
+    ///
+    /// Ties resolve to the **lower** pitch. That bias is intentional for one-off input snapping,
+    /// but it means repeated re-snapping of the same note is not drift-free — applying it while
+    /// walking through keys would pull the melody down a semitone each time. Callers that change
+    /// the project key must transpose instead of re-quantizing (see `GameStore.updateVoicing`).
     func quantize(_ note: Int, key: Int) -> Int {
         guard let intervals else { return min(96, max(24, note)) }
         let root = min(11, max(0, key))
