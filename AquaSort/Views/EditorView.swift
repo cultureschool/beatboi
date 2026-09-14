@@ -80,6 +80,11 @@ struct EditorView: View {
     var body: some View {
         ZStack {
             PocketBackdrop()
+            LiveAmbientField(
+                active: store.isPlaying,
+                phase: currentStep,
+                accent: restoredChannelAccent(store.selectedChannel)
+            )
             GeometryReader { proxy in
                 // A small negative overlap pulls the shell/header region upward toward
                 // the centered logo, removing the empty band visible beneath the branding.
@@ -365,6 +370,7 @@ struct EditorView: View {
             // matches the pixels (an .offset lift renders outside the touchable
             // bounds, which is what made the logo feel untouchable before).
             .padding(.horizontal, 12)
+            .beatGlow(active: store.isPlaying, phase: currentStep, color: .amber)
             .accessibilityLabel("BEATBOI")
             .accessibilityValue(String(format: "%.2f", scrollFraction))
             .accessibilityIdentifier("beatboi-logo")
@@ -378,9 +384,13 @@ struct EditorView: View {
                     Circle()
                         .fill(store.isPlaying ? Color.arcadeRed : Color.gbGlow)
                         .frame(width: 6, height: 6)
+                        .beatGlow(active: store.isPlaying, phase: currentStep, color: store.isPlaying ? .arcadeRed : .gbGlow)
                     Text(store.isPlaying ? "SEQUENCER LIVE" : "SEQUENCER READY")
                         .font(.custom("Futura-Bold", size: 8))
                         .foregroundStyle(Color.mutedText)
+                    MiniBeatIndicator(step: currentStep, active: store.isPlaying)
+                        .frame(width: 42, height: 12)
+                        .accessibilityHidden(true)
                 }
                 Spacer(minLength: 4)
                 // Visible only once the receipt backs the Export Pack entitlement.
@@ -676,23 +686,45 @@ struct EditorView: View {
     }
 
     private var consoleTransportRow: some View {
-        HStack(spacing: 9) {
-            Button { togglePlayback() } label: {
-                ZStack {
-                    Circle().fill(store.isPlaying ? Color.arcadeRed : Color.gbDeep).frame(width: 44, height: 44).overlay(Circle().stroke(Color.gbInk, lineWidth: 2))
-                    Image(systemName: store.isPlaying ? "stop.fill" : "play.fill").font(.system(size: 17, weight: .black)).foregroundStyle(Color.gbLight)
+        VStack(spacing: 8) {
+            HStack(spacing: 9) {
+                Button { togglePlayback() } label: {
+                    ZStack {
+                        Circle()
+                            .fill(store.isPlaying ? Color.arcadeRed : Color.gbDeep)
+                            .frame(width: 44, height: 44)
+                            .overlay(Circle().stroke(Color.gbInk, lineWidth: 2))
+                        BeatPulseRing(active: store.isPlaying, phase: currentStep, color: .arcadeRed)
+                            .frame(width: 58, height: 58)
+                        Image(systemName: store.isPlaying ? "stop.fill" : "play.fill")
+                            .font(.system(size: 17, weight: .black))
+                            .foregroundStyle(Color.gbLight)
+                    }
+                }
+                .buttonStyle(ArcadePressStyle(scale: 0.9))
+                .accessibilityLabel(store.isPlaying ? "Stop playback" : "Start playback")
+                .accessibilityIdentifier("playStopButton")
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(store.isPlaying ? "PLAYING" : "READY")
+                        .font(.custom("Futura-Bold", size: 10))
+                        .foregroundStyle(Color.gbInk)
+                    Text("STEP \(String(format: "%02d", max(0, currentStep + 1))) / 16")
+                        .font(.custom("Futura-Medium", size: 8))
+                        .foregroundStyle(Color.gbInk.opacity(0.62))
+                    if page == 3, currentSongSlot >= 0 {
+                        Text("BAR \(String(format: "%02d", currentSongSlot + 1))")
+                            .font(.custom("Futura-Bold", size: 8))
+                            .foregroundStyle(Color.gbInk.opacity(0.68))
+                            .accessibilityIdentifier("currentBarReadout")
+                    }
+                }
+                Spacer(minLength: 2)
+                RestoredTempoBox(value: store.project.tempo) { value in
+                    store.updateTempo(value)
+                    requestPlaybackRefresh()
                 }
             }
-            .buttonStyle(ArcadePressStyle(scale: 0.9))
-            .accessibilityLabel(store.isPlaying ? "Stop playback" : "Start playback")
-            .accessibilityIdentifier("playStopButton")
-            VStack(alignment: .leading, spacing: 2) {
-                Text(store.isPlaying ? "PLAYING" : "READY").font(.custom("Futura-Bold", size: 10)).foregroundStyle(Color.gbInk)
-                Text("STEP \(String(format: "%02d", max(0, currentStep + 1))) / 16").font(.custom("Futura-Medium", size: 8)).foregroundStyle(Color.gbInk.opacity(0.62))
-                if page == 3, currentSongSlot >= 0 { Text("BAR \(String(format: "%02d", currentSongSlot + 1))").font(.custom("Futura-Bold", size: 8)).foregroundStyle(Color.gbInk.opacity(0.68)).accessibilityIdentifier("currentBarReadout") }
-            }
-            Spacer(minLength: 2)
-            RestoredTempoBox(value: store.project.tempo) { value in store.updateTempo(value); requestPlaybackRefresh() }
+            BeatStepRail(step: currentStep, active: store.isPlaying, accent: .amber)
         }
     }
 
@@ -1894,6 +1926,7 @@ private struct RestoredChannelFader: View {
                 .padding(.horizontal, 4)
             }
             .overlay(Rectangle().stroke(selected ? Color.gbLight : Color.gbInk, lineWidth: selected ? 2 : 1.5))
+            .shadow(color: selected ? Color.amber.opacity(0.34) : .clear, radius: selected ? 7 : 0)
             .contentShape(Rectangle())
             .onTapGesture {
                 onSelect()
@@ -2114,9 +2147,123 @@ private struct RestoredSongPad: View {
     }
 }
 
+private struct LiveAmbientField: View {
+    let active: Bool
+    let phase: Int
+    let accent: Color
+    @State private var pulse = false
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack {
+                RadialGradient(
+                    colors: [accent.opacity(active ? (pulse ? 0.16 : 0.07) : 0.025), .clear],
+                    center: .center,
+                    startRadius: 20,
+                    endRadius: max(proxy.size.width, proxy.size.height) * 0.72
+                )
+                RadialGradient(
+                    colors: [Color.amber.opacity(active ? (pulse ? 0.07 : 0.025) : 0.012), .clear],
+                    center: .topTrailing,
+                    startRadius: 5,
+                    endRadius: 240
+                )
+            }
+            .animation(.easeOut(duration: 0.24), value: pulse)
+            .onChange(of: phase) { _, _ in
+                guard active else { return }
+                pulse = false
+                withAnimation(.easeOut(duration: 0.24)) { pulse = true }
+            }
+            .onChange(of: active) { _, isActive in
+                guard isActive else { pulse = false; return }
+                pulse = false
+                withAnimation(.easeOut(duration: 0.24)) { pulse = true }
+            }
+            .onAppear {
+                guard active else { return }
+                withAnimation(.easeOut(duration: 0.24)) { pulse = true }
+            }
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        }
+        .ignoresSafeArea()
+    }
+}
+
+private struct MiniBeatIndicator: View {
+    let step: Int
+    let active: Bool
+
+    var body: some View {
+        HStack(spacing: 3) {
+            ForEach(0..<4, id: \.self) { beat in
+                Capsule()
+                    .fill(active && beat == max(0, step) % 4 ? Color.amber : Color.mutedText.opacity(0.34))
+                    .frame(maxWidth: .infinity)
+                    .frame(height: active && beat == max(0, step) % 4 ? 9 : 5)
+                    .shadow(color: active && beat == max(0, step) % 4 ? Color.amber.opacity(0.8) : .clear, radius: 3)
+                    .animation(.easeOut(duration: 0.08), value: step)
+            }
+        }
+        .frame(height: 10)
+    }
+}
+
 /// Soft amber glow that swells on each beat (phase change) while active.
 /// Used by the song playhead and the active step pads so the instrument
 /// visibly breathes with the sequencer clock.
+private struct BeatPulseRing: View {
+    let active: Bool
+    let phase: Int
+    let color: Color
+    @State private var expanded = false
+
+    var body: some View {
+        Circle()
+            .stroke(color.opacity(active && !expanded ? 0.78 : 0), lineWidth: 2)
+            .scaleEffect(expanded ? 1.0 : 0.74)
+            .animation(.easeOut(duration: 0.28), value: expanded)
+            .onChange(of: phase) { _, _ in
+                guard active else { return }
+                expanded = false
+                withAnimation(.easeOut(duration: 0.28)) { expanded = true }
+            }
+            .onChange(of: active) { _, isActive in
+                guard isActive else { expanded = false; return }
+                expanded = false
+                withAnimation(.easeOut(duration: 0.28)) { expanded = true }
+            }
+            .onAppear {
+                guard active else { return }
+                withAnimation(.easeOut(duration: 0.28)) { expanded = true }
+            }
+            .accessibilityHidden(true)
+    }
+}
+
+private struct BeatStepRail: View {
+    let step: Int
+    let active: Bool
+    let accent: Color
+
+    var body: some View {
+        HStack(spacing: 3) {
+            ForEach(0..<BytePattern.barSteps, id: \.self) { index in
+                let isCurrent = active && index == step
+                RoundedRectangle(cornerRadius: 2, style: .continuous)
+                    .fill(isCurrent ? accent : index % 4 == 0 ? Color.screenShadow.opacity(0.62) : Color.screenShadow.opacity(0.25))
+                    .frame(maxWidth: .infinity)
+                    .frame(height: isCurrent ? 9 : index % 4 == 0 ? 6 : 4)
+                    .shadow(color: isCurrent ? accent.opacity(0.8) : .clear, radius: 4)
+                    .animation(.easeOut(duration: 0.08), value: step)
+            }
+        }
+        .frame(height: 10)
+        .accessibilityHidden(true)
+    }
+}
+
 private struct BeatGlow: ViewModifier {
     let active: Bool
     let phase: Int
