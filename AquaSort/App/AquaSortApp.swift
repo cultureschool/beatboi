@@ -12,8 +12,12 @@ struct AquaSortApp: App {
                 .environment(storeKit)
                 .task {
                     await storeKit.load()
+                    // The persisted flag speeds up first paint; the receipt is the
+                    // source of truth and reconciles it both directions.
                     if await storeKit.isPurchased() {
                         store.setUnlocked(true)
+                    } else {
+                        store.setUnlocked(false)
                     }
                 }
         }
@@ -25,6 +29,7 @@ struct BeatboiRootView: View {
 
     var body: some View {
         EditorView()
+            .font(.custom("Futura-Medium", size: 14))
             .preferredColorScheme(.dark)
     }
 }
