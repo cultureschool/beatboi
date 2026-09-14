@@ -18,6 +18,9 @@ extension Color {
 
     static let hardwareBlack = Color(red: 0.018, green: 0.022, blue: 0.024)
     static let hardwareSteel = Color(red: 0.19, green: 0.21, blue: 0.22)
+    static let hardwareEdge = Color(red: 0.38, green: 0.42, blue: 0.42)
+    static let panelSurface = Color(red: 0.11, green: 0.125, blue: 0.132)
+    static let panelSurfaceLight = Color(red: 0.17, green: 0.19, blue: 0.20)
 
     // Part colors are deliberately restrained so each channel stays identifiable at a glance.
     static let pulseAccent = Color(red: 0.98, green: 0.42, blue: 0.18)
@@ -90,6 +93,16 @@ struct PocketBackdrop: View {
                 }
             }
             .allowsHitTesting(false)
+            // A soft vignette keeps the eye on the illuminated console and makes the
+            // surrounding cabinet feel deeper without changing the palette.
+            RadialGradient(
+                colors: [Color.clear, Color.black.opacity(0.34)],
+                center: .center,
+                startRadius: 90,
+                endRadius: 520
+            )
+            .blendMode(.multiply)
+            .allowsHitTesting(false)
         }
         .ignoresSafeArea()
     }
@@ -122,12 +135,24 @@ struct ArcadeShell<Content: View>: View {
                     )
                     .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
                     RoundedRectangle(cornerRadius: 22, style: .continuous)
-                        .stroke(Color.plasticHighlight.opacity(0.72), lineWidth: 1.5)
+                        .stroke(Color.hardwareEdge.opacity(0.72), lineWidth: 1.5)
                     RoundedRectangle(cornerRadius: 19, style: .continuous)
                         .stroke(Color.black.opacity(0.55), lineWidth: 1)
                         .padding(3)
                 }
                 .shadow(color: Color.black.opacity(0.55), radius: 22, y: 14)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(
+                            LinearGradient(
+                                colors: [Color.white.opacity(0.13), Color.clear, Color.black.opacity(0.32)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            lineWidth: 1
+                        )
+                        .allowsHitTesting(false)
+                }
             )
             .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
     }
@@ -147,6 +172,10 @@ struct HardwareSection<Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Capsule()
+                    .fill(Color.amber)
+                    .frame(width: 4, height: 10)
+                    .shadow(color: Color.amber.opacity(0.55), radius: 4)
                 Text(title)
                     .font(.custom("Futura-Bold", size: 9))
                     .tracking(1.1)
@@ -161,30 +190,47 @@ struct HardwareSection<Content: View>: View {
                 }
             }
             Rectangle()
-                .fill(Color.plasticHighlight.opacity(0.55))
+                .fill(
+                    LinearGradient(
+                        colors: [Color.amber.opacity(0.72), Color.plasticHighlight.opacity(0.42), Color.clear],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
                 .frame(height: 1)
             content()
         }
         .padding(11)
-        .background(
-            ZStack {
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .fill(Color.plasticRaised.opacity(0.72))
-                LinearGradient(
-                    colors: [Color.white.opacity(0.045), Color.clear, Color.hardwareBlack.opacity(0.22)],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
+                .background(
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(
+                                LinearGradient(
+                                    colors: [Color.panelSurfaceLight.opacity(0.48), Color.panelSurface.opacity(0.88), Color.hardwareBlack.opacity(0.30)],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
+                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .stroke(Color.hardwareEdge.opacity(0.62), lineWidth: 1)
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(Color.hardwareBlack.opacity(0.8), lineWidth: 1)
+                            .padding(3)
+                    }
                 )
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .stroke(Color.plasticHighlight.opacity(0.72), lineWidth: 1)
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(Color.hardwareBlack.opacity(0.8), lineWidth: 1)
-                    .padding(3)
-            }
-        )
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .shadow(color: Color.black.opacity(0.28), radius: 5, y: 3)
+        .overlay(alignment: .bottom) {
+            LinearGradient(
+                colors: [Color.amber.opacity(0.7), Color.amber.opacity(0.08), Color.clear],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+            .frame(height: 2)
+            .padding(.horizontal, 18)
+            .allowsHitTesting(false)
+        }
+        .shadow(color: Color.black.opacity(0.34), radius: 5, y: 4)
     }
 }
 
@@ -237,7 +283,7 @@ struct LCDPanel<Content: View, Header: View>: View {
                     endPoint: .bottomTrailing
                 )
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
                     .stroke(Color.screenShadow.opacity(0.22), lineWidth: 1)
                     .padding(3)
             }
@@ -265,6 +311,14 @@ struct LCDPanel<Content: View, Header: View>: View {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .stroke(Color.gbInk.opacity(0.78), lineWidth: 1.5)
         )
+        .overlay(alignment: .topLeading) {
+            Capsule()
+                .fill(Color.white.opacity(0.34))
+                .frame(width: 42, height: 2)
+                .padding(.leading, 18)
+                .padding(.top, 1)
+                .allowsHitTesting(false)
+        }
         .overlay(alignment: .top) {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .stroke(Color.white.opacity(0.48), lineWidth: 1)
