@@ -2101,6 +2101,16 @@ private struct RestoredSongPad: View {
         .accessibilityLabel("Song bar \\(index + 1)")
         .accessibilityValue(pattern?.name ?? "Empty")
         .accessibilityHint("Tap to assign or clear. Swipe up or down to change pattern.")
+        .accessibilityAction { onTap() }
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            // Up in the drag is the next pattern, so increment means the same here: VoiceOver's
+            // swipe-up is the adjustable increment, and the two gestures keep one meaning.
+            case .increment: onCycle(1)
+            case .decrement: onCycle(-1)
+            @unknown default: break
+            }
+        }
     }
 }
 
@@ -2799,6 +2809,16 @@ private struct RestoredDrumVoiceRow: View {
         .accessibilityLabel("\(voice.title) voice")
         .accessibilityValue("\(voice.character), \(volume)%\(sounding ? ", sounding" : "")")
         .accessibilityHint("Tap to hear it. Swipe left or right to set its level. Tap 1 or 2 to choose the sample.")
+        .accessibilityAction { onAudition() }
+        .accessibilityAdjustableAction { direction in
+            // Same 5-point step the mixer faders use under VoiceOver, so the drum mixer
+            // and the channel mixer agree on how fast a swipe moves.
+            switch direction {
+            case .increment: onVolumeChange(min(100, volume + 5))
+            case .decrement: onVolumeChange(max(0, volume - 5))
+            @unknown default: break
+            }
+        }
     }
 
     /// The mixer row and the pad share one mapping, so the swatch beside a voice
@@ -2984,6 +3004,19 @@ private struct RestoredPatchCard: View {
         .accessibilityLabel(parameter.title)
         .accessibilityValue(restoredPatchValue)
         .accessibilityHint("Tap to select. Swipe left or right to adjust.")
+        .accessibilityAction { onSelect() }
+        .accessibilityAdjustableAction { direction in
+            onSelect()
+            // Coarse ranges (0-100 envelope stages and such) step like the mixer fader so a
+            // swipe actually moves; fine ranges (duty, sample, octave) step one unit so a
+            // swipe never skips a value the drag would have stopped on.
+            let step = parameter.range.count > 16 ? 5 : 1
+            switch direction {
+            case .increment: onChange(min(currentValue + step, parameter.range.upperBound))
+            case .decrement: onChange(max(currentValue - step, parameter.range.lowerBound))
+            @unknown default: break
+            }
+        }
     }
 
     private var restoredPatchValue: String {
