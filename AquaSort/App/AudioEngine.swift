@@ -2,8 +2,15 @@ import AVFoundation
 import Foundation
 
 enum ByteTransportClock {
+    /// Seconds per quarter note at this tempo. Everything the app spaces in time is a division
+    /// of this, so a preview that wants to be in time with the loop has one number to read.
+    static func beatDuration(bpm: Int) -> Double {
+        60.0 / Double(max(1, bpm))
+    }
+
+    /// A step is a sixteenth note, so four of them make the beat above.
     static func stepDuration(bpm: Int) -> Double {
-        60.0 / Double(max(1, bpm)) / 4.0
+        beatDuration(bpm: bpm) / 4.0
     }
 
     static func step(at elapsed: TimeInterval, bpm: Int, loopLength: Int = 16) -> Int {
@@ -68,16 +75,40 @@ private final class ByteLiveAudioState: @unchecked Sendable {
     private var stepElapsed = 0.0
     private var playbackStep = 0
     private var lastStep = -1
-    private var phases = Array(repeating: 0.0, count: 4)
-    private var waveFilterStates = Array(repeating: 0.0, count: 4)
-    private var noiseStates: [UInt16] = Array(repeating: 0x7FFF, count: 4)
-    private var noiseAccumulators = Array(repeating: 0.0, count: 4)
-    private var drumSamplePositions = Array(repeating: 0, count: 4)
+    /// The four sequence channels, plus one slot held back for the pad audition. Giving the
+    /// preview a slot of its own is what lets it sound through the same synthesis without
+    /// touching any channel's oscillator phase or drum sample position — so auditioning a
+    /// pitch while the loop plays cannot make the sequence repeat or stutter.
+    private static let auditionSlot = ByteChannel.allCases.count
+    private static let voiceSlots = ByteChannel.allCases.count + 1
+    /// How long one auditioned note sounds. This carries the patch's whole envelope once,
+    /// which is long enough to recognise a pitch and short enough to step to the next one.
+    private static let auditionDuration = 0.45
+    /// The pulse duty cycles, built once instead of once per rendered frame.
+    private static let pulseDuties: [Double] = [0.125, 0.25, 0.50, 0.75]
+
+    // All per-voice state is indexed by voice SLOT, so every array here is sized to
+    // `voiceSlots` and no reset may size one back down to the channel count. A half-grown
+    // set of these is an index-out-of-range waiting for the first audition.
+    private var phases = Array(repeating: 0.0, count: ByteLiveAudioState.voiceSlots)
+    private var waveFilterStates = Array(repeating: 0.0, count: ByteLiveAudioState.voiceSlots)
+    private var noiseStates: [UInt16] = Array(repeating: 0x7FFF, count: ByteLiveAudioState.voiceSlots)
+    private var noiseAccumulators = Array(repeating: 0.0, count: ByteLiveAudioState.voiceSlots)
+    /// Fractional, because a voice's shape reads its sample at its own rate rather than one
+    /// frame per output frame.
+    private var drumSamplePositions = Array(repeating: 0.0, count: ByteLiveAudioState.voiceSlots)
     private var effectsProcessor = ByteMixEffects(sampleRate: 44_100)
     private var currentStepValue = 0
     private var currentSongSlotValue = -1
     /// UI scrubbing submits one command; the realtime callback consumes it at a safe render boundary.
     private var pendingSongSlot: Int?
+    /// A pad audition, handed over exactly like `pendingSongSlot`.
+    private var pendingAudition: (row: Int, note: Int)?
+    // Owned by the render callback.
+    private var auditioning = false
+    private var auditionRow = 0
+    private var auditionNote = 60
+    private var auditionElapsed = 0.0
 
     func begin(project: ByteProject, patterns: [BytePattern], slotIndices: [Int] = [], startSongSlot: Int? = nil) {
         dataLock.lock()
@@ -92,10 +123,10 @@ private final class ByteLiveAudioState: @unchecked Sendable {
         stepElapsed = 0
         playbackStep = 0
         lastStep = -1
-        phases = Array(repeating: 0.0, count: 4)
-        waveFilterStates = Array(repeating: 0.0, count: 4)
-        noiseStates = Array(repeating: 0x7FFF, count: 4)
-        noiseAccumulators = Array(repeating: 0.0, count: 4)
+        phases = Array(repeating: 0.0, count: Self.voiceSlots)
+        waveFilterStates = Array(repeating: 0.0, count: Self.voiceSlots)
+        noiseStates = Array(repeating: 0x7FFF, count: Self.voiceSlots)
+        noiseAccumulators = Array(repeating: 0.0, count: Self.voiceSlots)
         effectsProcessor = ByteMixEffects(sampleRate: 44_100)
         setCurrentStep(0)
         setCurrentSongSlot(slotIndices.indices.contains(patternIndex) ? slotIndices[patternIndex] : -1)
@@ -119,6 +150,19 @@ private final class ByteLiveAudioState: @unchecked Sendable {
         if slotIndices.contains(slot) {
             pendingSongSlot = slot
         }
+        dataLock.unlock()
+    }
+
+    /// Submits one note to be auditioned — played on its own, through the same synthesis as
+    /// the sequence, so a melody can be built by ear from the pad grid.
+    ///
+    /// The project travels with the request because `update` is only called while the
+    /// transport is running; without it a preview would be voiced by whatever patch happened
+    /// to be published last, which is not the patch the user is looking at.
+    func audition(row: Int, note: Int, project: ByteProject) {
+        dataLock.lock()
+        self.project = project
+        pendingAudition = (row: row, note: note)
         dataLock.unlock()
     }
 
@@ -147,7 +191,20 @@ private final class ByteLiveAudioState: @unchecked Sendable {
             resetTransport = true
         }
         let pattern = patterns.isEmpty ? nil : patterns[min(patternIndex, patterns.count - 1)]
+        let auditionRequest = pendingAudition
+        if auditionRequest != nil { self.pendingAudition = nil }
         dataLock.unlock()
+
+        // Armed here, on the render thread, so a request that arrives mid-drag replaces the
+        // note in flight rather than stacking a second one.
+        if let request = auditionRequest {
+            auditionRow = min(max(0, request.row), ByteChannel.allCases.count - 1)
+            auditionNote = request.note
+            auditionElapsed = 0
+            auditioning = true
+            phases[Self.auditionSlot] = 0.0
+            drumSamplePositions[Self.auditionSlot] = 0
+        }
 
         // Only the realtime callback mutates oscillator and step state. This avoids racing
         // the audio thread when the user scrubs repeatedly across the timeline.
@@ -155,8 +212,8 @@ private final class ByteLiveAudioState: @unchecked Sendable {
             stepElapsed = 0
             playbackStep = 0
             lastStep = -1
-            phases = Array(repeating: 0.0, count: 4)
-            drumSamplePositions = Array(repeating: 0, count: 4)
+            phases = Array(repeating: 0.0, count: Self.voiceSlots)
+            drumSamplePositions = Array(repeating: 0, count: Self.voiceSlots)
             setCurrentStep(0)
             setCurrentSongSlot(slotIndices.indices.contains(patternIndex) ? slotIndices[patternIndex] : -1)
         }
@@ -174,6 +231,15 @@ private final class ByteLiveAudioState: @unchecked Sendable {
                 guard let buffer else { continue }
                 for frame in 0..<frameCount { buffer[frame] = 0 }
             }
+            // With the transport stopped, an audition is the only thing that can make a
+            // sound — which is exactly the case the pad grid needs it for.
+            renderAudition(
+                frameCount: frameCount,
+                buffers: buffers,
+                channelPointers: channelPointers,
+                project: project,
+                sampleRate: sampleRate
+            )
             return
         }
 
@@ -235,19 +301,13 @@ private final class ByteLiveAudioState: @unchecked Sendable {
                 // Supplied drum one-shots own their duration and level. Do not apply the
                 // former synthesized-noise length gate or envelope to them.
                 let effectiveLength = channel == .drum ? 63 : patch.length
-                let drumVolume = channel == .drum && patch.drumVolumes.indices.contains(ByteDrumVoice.voice(for: note).rawValue)
-                    ? patch.drumVolumes[ByteDrumVoice.voice(for: note).rawValue]
-                    : 15
-                let effectiveVolume = channel == .drum ? drumVolume : patch.initialVolume
                 let gated = channel == .drum ? false : (patch.lengthCounter && noteNormalized > Double(effectiveLength) / 63.0)
                 let envelopeLevel = channel == .drum ? 1.0 : liveEnvelope(normalized: noteNormalized, patch: patch)
                 let value: Double
 
                 switch channel {
                 case .pulseA, .pulseB:
-                    let duties = [0.125, 0.25, 0.50, 0.75]
-                    let duty = duties[min(3, max(0, patch.duty))]
-                    value = livePulse(phase: phases[channelIndex], duty: duty)
+                    value = livePulse(phase: phases[channelIndex], duty: pulseDuty(patch))
                     phases[channelIndex] = (phases[channelIndex] + frequency / sampleRate).truncatingRemainder(dividingBy: 1.0)
                 case .wave:
                     value = liveWave(phase: phases[channelIndex], shape: patch.waveShape, volume: patch.waveVolume)
@@ -262,8 +322,7 @@ private final class ByteLiveAudioState: @unchecked Sendable {
                     let tremolo = 1.0 - tremoloAmount * 0.65 * (0.5 + 0.5 * sin((stepElapsed + Double(step) * secondsPerStep) * 2.0 * .pi * 7.0))
                     shaped *= tremolo
                 }
-                let masterLevel = ByteAudioTaper.gain(for: patch.masterVolume)
-                let mixed = gated ? 0.0 : shaped * (channel == .drum ? 0.16 : (channel == .pulseA || channel == .pulseB ? 0.06 : 0.12)) * (Double(effectiveVolume) / 15.0) * envelopeLevel * masterLevel
+                let mixed = gated ? 0.0 : shaped * channelGain(channel: channel, note: note, patch: patch) * envelopeLevel
                 let sendIndex = ByteChannel.allCases.firstIndex(of: channel) ?? 0
                 let send = project.effects.channelSends.indices.contains(sendIndex)
                     ? ByteAudioTaper.gain(for: project.effects.channelSends[sendIndex])
@@ -310,6 +369,16 @@ private final class ByteLiveAudioState: @unchecked Sendable {
                 }
             }
         }
+
+        // Mixed on top of the sequence, so scrubbing a pitch while the loop plays is heard
+        // immediately instead of waiting for the transport to come back round to the step.
+        renderAudition(
+            frameCount: frameCount,
+            buffers: buffers,
+            channelPointers: channelPointers,
+            project: project,
+            sampleRate: sampleRate
+        )
     }
 
     private func noteAt(row: Int, step: Int, pattern: BytePattern) -> (note: Int, start: Int, length: Int)? {
@@ -345,6 +414,82 @@ private final class ByteLiveAudioState: @unchecked Sendable {
         transportLock.unlock()
     }
 
+
+    /// The pulse duty cycle for a patch. Pulled out of the render loop so an audition cannot
+    /// drift from the sequence, and so the table is built once rather than once per frame.
+    private func pulseDuty(_ patch: ByteChannelPatch) -> Double {
+        Self.pulseDuties[min(3, max(0, patch.duty))]
+    }
+
+    /// The steady part of a channel's level: its voice weight, the patch volume, and the
+    /// master taper. Shared with the audition, so a preview is heard at the level the note
+    /// will really play at rather than at some convenient preview volume.
+    private func channelGain(channel: ByteChannel, note: Int, patch: ByteChannelPatch) -> Double {
+        let drumVolume = channel == .drum && patch.drumVolumes.indices.contains(ByteDrumVoice.voice(for: note).rawValue)
+            ? patch.drumVolumes[ByteDrumVoice.voice(for: note).rawValue]
+            : 15
+        let effectiveVolume = channel == .drum ? drumVolume : patch.initialVolume
+        let voiceWeight = channel == .drum ? 0.16 : (channel == .pulseA || channel == .pulseB ? 0.06 : 0.12)
+        return voiceWeight * (Double(effectiveVolume) / 15.0) * ByteAudioTaper.gain(for: patch.masterVolume)
+    }
+
+    /// Renders one auditioned note, added to whatever the transport is producing.
+    ///
+    /// It runs the same oscillators, envelope and channel gain as the sequence so a preview
+    /// sounds like the note it is previewing, but it reads and writes only its own voice slot
+    /// and it deliberately ignores pan: a preview is a reference pitch, not a mix position.
+    private func renderAudition(
+        frameCount: Int,
+        buffers: UnsafeMutableAudioBufferListPointer,
+        channelPointers: [UnsafeMutablePointer<Float>?],
+        project: ByteProject,
+        sampleRate: Double
+    ) {
+        guard auditioning else { return }
+        let channel = ByteChannel.allCases[min(max(0, auditionRow), ByteChannel.allCases.count - 1)]
+        let patch = project.channelPatches.first(where: { $0.channel == channel }) ?? ByteChannelPatch(channel: channel)
+        // Mute and solo are honoured, so an audition is an honest preview of the mix the
+        // sequence will actually produce rather than a private channel that ignores the mixer.
+        let hasSoloChannel = project.channelPatches.contains(where: { $0.soloed })
+        guard !patch.muted, !hasSoloChannel || patch.soloed else {
+            auditioning = false
+            return
+        }
+
+        let slot = Self.auditionSlot
+        let frequency = 440.0 * pow(2.0, Double(auditionNote - 69 + patch.octave * 12) / 12.0)
+
+        for frame in 0..<frameCount {
+            let normalized = min(1.0, auditionElapsed / Self.auditionDuration)
+            let value: Double
+            switch channel {
+            case .pulseA, .pulseB:
+                value = livePulse(phase: phases[slot], duty: pulseDuty(patch))
+                phases[slot] = (phases[slot] + frequency / sampleRate).truncatingRemainder(dividingBy: 1.0)
+            case .wave:
+                value = liveWave(phase: phases[slot], shape: patch.waveShape, volume: patch.waveVolume)
+                phases[slot] = (phases[slot] + frequency / sampleRate).truncatingRemainder(dividingBy: 1.0)
+            case .drum:
+                value = liveDrumSample(note: auditionNote, patch: patch, channelIndex: slot)
+            }
+            let envelopeLevel = channel == .drum ? 1.0 : liveEnvelope(normalized: normalized, patch: patch)
+            let sample = Float(value * channelGain(channel: channel, note: auditionNote, patch: patch) * envelopeLevel)
+            if buffers.count == 1 {
+                if let buffer = channelPointers[0] {
+                    buffer[frame * 2] += sample
+                    buffer[frame * 2 + 1] += sample
+                }
+            } else {
+                if let left = channelPointers[0] { left[frame] += sample }
+                if let right = channelPointers[1] { right[frame] += sample }
+            }
+            auditionElapsed += 1.0 / sampleRate
+            if auditionElapsed >= Self.auditionDuration {
+                auditioning = false
+                break
+            }
+        }
+    }
 
     private func livePulse(phase: Double, duty: Double) -> Double {
         phase < duty ? 1.0 : -1.0
@@ -390,42 +535,13 @@ private final class ByteLiveAudioState: @unchecked Sendable {
         return sustain
     }
 
-    private func liveDrumVoice(note: Int, normalized: Double, lfsr: Double, secondsPerStep: Double) -> Double {
-        // DMG drums remain LFSR noise; the kick adds a short low-frequency body whose
-        // pitch falls rapidly, matching the compact impact used by Game Boy music engines.
-        switch note {
-        case 36:
-            let bodyFrequency = 145.0 - normalized * 105.0
-            let body = sin(normalized * secondsPerStep * bodyFrequency * 2.0 * .pi) * exp(-normalized * 5.5)
-            return lfsr * 0.48 + body * 0.92
-        case 38:
-            return lfsr * (0.72 + (1.0 - normalized) * 0.18)
-        case 42:
-            return lfsr * 0.52
-        case 49:
-            return lfsr * (0.84 + (1.0 - normalized) * 0.16)
-        default:
-            return lfsr
-        }
-    }
-
     private func liveDrumSample(note: Int, patch: ByteChannelPatch, channelIndex: Int) -> Double {
         let voice = ByteDrumVoice.voice(for: note)
         let variant = patch.drumSamples.indices.contains(voice.rawValue) ? patch.drumSamples[voice.rawValue] : 1
         let sample = ByteDrumSampleBank.shared.sample(voice: voice, variant: variant)
-        guard drumSamplePositions[channelIndex] < sample.count else { return 0 }
-        let value = Double(sample[drumSamplePositions[channelIndex]])
+        let value = ByteDrumVoice.value(of: sample, voice: voice, at: drumSamplePositions[channelIndex])
         drumSamplePositions[channelIndex] += 1
         return value
-    }
-
-    private func drumVoiceIndex(_ note: Int) -> Int {
-        switch note {
-        case 38: return 1
-        case 42: return 2
-        case 49: return 3
-        default: return 0
-        }
     }
 
     private func liveNoiseClockRate(_ patch: ByteChannelPatch) -> Double {
@@ -442,9 +558,18 @@ final class ByteAudioEngine {
     private let liveState = ByteLiveAudioState()
     private let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)!
     private var timer: Timer?
+    private var auditionIdleTask: Task<Void, Never>?
+    private let auditionIdleSeconds: Double
     private(set) var playing = false
 
-    init() {
+    /// Whether the audio unit is running. Auditions are the only reason it can be running
+    /// with the transport stopped, so a test needs to see this to pin that lifecycle.
+    var isAudioUnitRunning: Bool { engine.isRunning }
+
+    /// `auditionIdleSeconds` is injectable so a test can watch the audio unit go back to
+    /// sleep without waiting out the real window.
+    init(auditionIdleSeconds: Double = 5) {
+        self.auditionIdleSeconds = auditionIdleSeconds
         let state = liveState
         source = AVAudioSourceNode(format: format) { _, _, frameCount, audioBufferList in
             state.render(frameCount: Int(frameCount), audioBufferList: audioBufferList, sampleRate: 44_100)
@@ -490,9 +615,41 @@ final class ByteAudioEngine {
         liveState.seekSongSlot(slot)
     }
 
+    /// Plays one note on its own, for the pad grid's audition.
+    ///
+    /// An audition is the only thing that can make a sound while the transport is stopped,
+    /// so this brings the audio unit up on demand. The unit is then left running for a few
+    /// seconds after the last audition and closed again: long enough that a run of pitch
+    /// scrubs stays warm and responsive, but not so long that the audio hardware is left
+    /// powered up for the rest of the session.
+    func audition(channel: ByteChannel, note: Int, project: ByteProject) {
+        liveState.audition(row: ByteChannel.allCases.firstIndex(of: channel) ?? 0, note: note, project: project)
+        if !engine.isRunning {
+            do {
+                try engine.start()
+            } catch {
+                // A silent preview is better than a crash; the edit itself already landed.
+                return
+            }
+        }
+        scheduleAuditionIdleStop()
+    }
+
+    private func scheduleAuditionIdleStop() {
+        auditionIdleTask?.cancel()
+        auditionIdleTask = Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(for: .seconds(self.auditionIdleSeconds))
+            guard !Task.isCancelled, !self.playing else { return }
+            self.engine.stop()
+        }
+    }
+
     func stop() {
         timer?.invalidate()
         timer = nil
+        auditionIdleTask?.cancel()
+        auditionIdleTask = nil
         liveState.end()
         engine.stop()
         playing = false
@@ -616,7 +773,7 @@ enum ByteRenderer {
         var patternIndex = 0
         var lastStep = -1
         var phases = Array(repeating: 0.0, count: ByteChannel.allCases.count)
-        var drumSamplePositions = Array(repeating: 0, count: ByteChannel.allCases.count)
+        var drumSamplePositions = Array(repeating: 0.0, count: ByteChannel.allCases.count)
         let progressInterval = max(1, totalSamples / 100)
 
         var effectsProcessor = ByteMixEffects(sampleRate: sampleRate)
@@ -690,12 +847,9 @@ enum ByteRenderer {
                     let voice = ByteDrumVoice.voice(for: note)
                     let variant = patch.drumSamples.indices.contains(voice.rawValue) ? patch.drumSamples[voice.rawValue] : 1
                     let sampleData = ByteDrumSampleBank.shared.sample(voice: voice, variant: variant)
-                    if drumSamplePositions[channelIndex] < sampleData.count {
-                        value = Double(sampleData[drumSamplePositions[channelIndex]])
-                        drumSamplePositions[channelIndex] += 1
-                    } else {
-                        value = 0.0
-                    }
+                    // The same reader live playback uses, so an export carries the same kit.
+                    value = ByteDrumVoice.value(of: sampleData, voice: voice, at: drumSamplePositions[channelIndex])
+                    drumSamplePositions[channelIndex] += 1
                 }
 
                 var shaped = value
@@ -862,32 +1016,6 @@ enum ByteRenderer {
             break
         }
         return nil
-    }
-
-    private static func staticDrumVoice(note: Int, normalized: Double, lfsr: Double, secondsPerStep: Double) -> Double {
-        switch note {
-        case 36:
-            let bodyFrequency = 145.0 - normalized * 105.0
-            let body = sin(normalized * secondsPerStep * bodyFrequency * 2.0 * .pi) * exp(-normalized * 5.5)
-            return lfsr * 0.48 + body * 0.92
-        case 38:
-            return lfsr * (0.72 + (1.0 - normalized) * 0.18)
-        case 42:
-            return lfsr * 0.52
-        case 49:
-            return lfsr * (0.84 + (1.0 - normalized) * 0.16)
-        default:
-            return lfsr
-        }
-    }
-
-    private static func drumVoiceIndex(_ note: Int) -> Int {
-        switch note {
-        case 38: return 1
-        case 42: return 2
-        case 49: return 3
-        default: return 0
-        }
     }
 
     private static func dmgNoiseClockRate(_ patch: ByteChannelPatch) -> Double {

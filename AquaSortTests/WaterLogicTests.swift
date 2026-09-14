@@ -1,4 +1,6 @@
 import XCTest
+import SwiftUI
+import UIKit
 @testable import AquaSort
 
 @MainActor
@@ -528,12 +530,58 @@ final class BeatboiTests: XCTestCase {
         defaults.removePersistentDomain(forName: suite)
     }
 
-    func testDrumVoiceNamesAndPercSamplesUseSwappedMapping() {
-        XCTAssertEqual(ByteDrumVoice.label(for: 42), "PERC")
-        XCTAssertEqual(ByteDrumVoice.label(for: 49), "HI-HAT")
-        XCTAssertEqual(ByteDrumVoice.hiHat.title, "PERC")
-        XCTAssertEqual(ByteDrumVoice.perc.title, "HI-HAT")
+    func testDrumVoiceNamesMatchTheirSamplesAndGestureDirections() {
+        XCTAssertEqual(ByteDrumVoice.label(for: 42), "HI-HAT")
+        XCTAssertEqual(ByteDrumVoice.label(for: 49), "PERC")
+        XCTAssertEqual(ByteDrumVoice.hiHat.title, "HI-HAT")
+        XCTAssertEqual(ByteDrumVoice.perc.title, "PERC")
+        XCTAssertEqual(ByteDrumVoice.hiHat.resourceNames, ["hihat1", "hihat2"])
         XCTAssertEqual(ByteDrumVoice.perc.resourceNames, ["perc2", "perc1"])
+        // A swipe has to point at the voice it is named after.
+        XCTAssertEqual(ByteDrumVoice.voice(horizontal: -1, vertical: 0).title, "HI-HAT")
+        XCTAssertEqual(ByteDrumVoice.voice(horizontal: 1, vertical: 0).title, "PERC")
+        XCTAssertEqual(ByteDrumVoice.voice(horizontal: 0, vertical: -1).title, "SNARE")
+        XCTAssertEqual(ByteDrumVoice.voice(horizontal: 0, vertical: 1).title, "KICK")
+    }
+
+    /// A drum pad is painted the colour of the voice it holds. Renaming a voice is how the
+    /// pads once ended up labelled HI-HAT and drawn in the perc colour, so each voice is pinned
+    /// here to the palette entry that shares its name rather than to whatever table the view
+    /// happens to build.
+    func testDrumPadColorsFollowTheVoiceNames() {
+        let expected: [ByteDrumVoice: Color] = [
+            .kick: .drumKick,
+            .snare: .drumSnare,
+            .hiHat: .drumHiHat,
+            .perc: .drumPerc,
+        ]
+        for voice in ByteDrumVoice.allCases {
+            guard let named = expected[voice] else {
+                return XCTFail("\(voice.title) has no palette colour sharing its name")
+            }
+            XCTAssertEqual(
+                resampled(voice.padColor),
+                resampled(named),
+                "\(voice.title) pads must use the palette colour named after them"
+            )
+        }
+        XCTAssertEqual(
+            Set(ByteDrumVoice.allCases.map { resampled($0.padColor) }).count,
+            ByteDrumVoice.allCases.count,
+            "two voices sharing a colour would make the pads unreadable"
+        )
+    }
+
+    /// A colour as four quantized sRGB channels. Comparing the channels rather than the
+    /// `Color` values keeps the failure legible and survives SwiftUI resolving an equivalent
+    /// colour through a different internal representation.
+    private func resampled(_ color: Color) -> [Int] {
+        var red: CGFloat = 0
+        var green: CGFloat = 0
+        var blue: CGFloat = 0
+        var alpha: CGFloat = 0
+        UIColor(color).getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+        return [red, green, blue, alpha].map { Int(($0 * 1000).rounded()) }
     }
 
     func testSoundDiceRandomizesOnlyMelodicChannels() {
@@ -2508,6 +2556,294 @@ final class BeatboiTests: XCTestCase {
         XCTAssertEqual(ByteChannel.pulseB.title, "PULSE 2")
         XCTAssertEqual(ByteChannel.wave.title, "TRIANGLE")
         XCTAssertEqual(ByteChannel.drum.title, "DRUM")
+        // The compact token is the title's first letter, so a channel cannot be labelled one
+        // thing and abbreviated as another. PULSE 2 used to abbreviate to "S".
+        for channel in ByteChannel.allCases {
+            XCTAssertEqual(
+                channel.shortTitle,
+                String(channel.title.prefix(1)),
+                "\(channel.title) must abbreviate from its own name"
+            )
+        }
+    }
+
+    /// The seeded drum kit names its voices the way the model does, and each seed carries the
+    /// voice it is named after. The kit once offered a CRASH for what the pads, the mixer and the
+    /// samples all call PERC, so a seed named after a voice the app does not have would put a
+    /// second name back on the same sound.
+    func testDrumSeedKitNamesEveryVoiceTheWayTheModelDoes() {
+        let kit = ByteInstrumentPreset.library(for: .drum)
+        XCTAssertEqual(
+            kit.map(\.name).sorted(),
+            ByteDrumVoice.allCases.map(\.title).sorted(),
+            "every drum voice needs exactly one seed, under the voice's own title"
+        )
+        for preset in kit {
+            guard ByteDrumVoice.allCases.indices.contains(preset.patch.drumVoice) else {
+                return XCTFail("\(preset.name) seeds a drum voice index that does not exist")
+            }
+            XCTAssertEqual(
+                ByteDrumVoice.allCases[preset.patch.drumVoice].title,
+                preset.name,
+                "the seed named \(preset.name) must set that voice, not another"
+            )
+        }
+    }
+
+    /// The four voices have to be tellable apart by ear, and the bundled one-shots are not a
+    /// kit: the kick is the only low voice while three of them are bright, and the snare has no
+    /// body of its own. The shape table is what separates them, so it has to separate them on
+    /// both axes — no two voices may share a register, and no two may share a length.
+    func testDrumVoiceShapesSeparateTheFourVoices() {
+        let rates = ByteDrumVoice.allCases.map(\.playbackRate)
+        let kept = ByteDrumVoice.allCases.map(\.keptFraction)
+        XCTAssertEqual(
+            Set(rates).count, ByteDrumVoice.allCases.count,
+            "two voices read their sample at the same rate, so they sit in the same register"
+        )
+        XCTAssertEqual(
+            Set(kept).count, ByteDrumVoice.allCases.count,
+            "two voices keep the same fraction of their sample, so they last the same time"
+        )
+        XCTAssertEqual(
+            Set(ByteDrumVoice.allCases.map(\.character)).count, ByteDrumVoice.allCases.count,
+            "two voices are described the same way, so a reader cannot tell what to listen for"
+        )
+        for voice in ByteDrumVoice.allCases {
+            XCTAssertTrue((0.75...1.6).contains(voice.playbackRate), "\(voice.title) reads at \(voice.playbackRate)×")
+            XCTAssertTrue((0.25...1.0).contains(voice.keptFraction), "\(voice.title) keeps \(voice.keptFraction) of its sample")
+        }
+        // The kick is the kit's floor, so it stays at the pitch it was recorded at with its whole
+        // tail; the hi-hat is the fastest and the most cut, which is what stops it reading as a
+        // quieter snare.
+        XCTAssertEqual(ByteDrumVoice.kick.playbackRate, 1.0)
+        XCTAssertEqual(ByteDrumVoice.kick.keptFraction, 1.0)
+        XCTAssertEqual(ByteDrumVoice.hiHat.playbackRate, rates.max())
+        XCTAssertEqual(ByteDrumVoice.hiHat.keptFraction, kept.min())
+    }
+
+    /// Every path that plays a drum reads through one shaper, so the shaper has to behave at
+    /// its edges: a rate of one frame per position at native pitch, a voice past its trim silent
+    /// rather than playing the rumble the trim was there to remove, and a cut tail that releases
+    /// instead of stepping to silence.
+    func testDrumVoiceReaderAppliesRateTrimAndRelease() {
+        let sample = (0..<1000).map { Float($0) + 1 }
+        XCTAssertEqual(ByteDrumVoice.value(of: sample, voice: .kick, at: 0), 1.0, accuracy: 0.0001)
+        // A faster voice is further into its sample at the same read position.
+        XCTAssertGreaterThan(
+            ByteDrumVoice.value(of: sample, voice: .hiHat, at: 100),
+            ByteDrumVoice.value(of: sample, voice: .snare, at: 100)
+        )
+        // The snare is slowed to find the body its own sample lacks, so it reads an earlier
+        // frame than its position suggests: 100 × 0.88 = frame 88.
+        XCTAssertEqual(ByteDrumVoice.value(of: sample, voice: .snare, at: 100), Double(sample[88]), accuracy: 0.001)
+        // Past the trim the voice is silent, whichever sample it was handed.
+        let trimmedLength = Double(ByteDrumVoice.hiHat.keptFrameCount(sampleCount: sample.count))
+        XCTAssertEqual(ByteDrumVoice.value(of: sample, voice: .hiHat, at: trimmedLength), 0, accuracy: 0.0001)
+        // The last kept frame is eased out, so the trim cannot end on a step.
+        let lastKeptFrame = (trimmedLength - 1) / ByteDrumVoice.hiHat.playbackRate
+        XCTAssertGreaterThan(ByteDrumVoice.value(of: sample, voice: .hiHat, at: lastKeptFrame), 0)
+        XCTAssertLessThan(
+            ByteDrumVoice.value(of: sample, voice: .hiHat, at: lastKeptFrame),
+            Double(sample[ByteDrumVoice.hiHat.keptFrameCount(sampleCount: sample.count) - 1]),
+            "the cut tail has to fade, or trimming a sample ends on a click"
+        )
+        // The kick keeps its whole tail, and an empty sample is silence rather than a crash.
+        XCTAssertEqual(ByteDrumVoice.kick.keptFrameCount(sampleCount: 1000), 1000)
+        XCTAssertEqual(ByteDrumVoice.kick.keptFrameCount(sampleCount: 0), 0)
+        XCTAssertEqual(ByteDrumVoice.value(of: [], voice: .kick, at: 5), 0)
+    }
+
+    /// The audition run has to visit every voice exactly once — a kit check that skipped a voice
+    /// or played one twice would misrepresent the kit it exists to let you compare — and each
+    /// voice's note has to read back as that voice, because the preview plays a note through the
+    /// same path the sequence does.
+    func testDrumAuditionCoversEveryVoiceAndItsNoteRoundTrips() {
+        XCTAssertEqual(
+            Set(ByteDrumVoice.auditionOrder), Set(ByteDrumVoice.allCases),
+            "every voice needs a place in the run"
+        )
+        XCTAssertEqual(
+            ByteDrumVoice.auditionOrder.count, ByteDrumVoice.allCases.count,
+            "a voice played twice would leave another one unheard"
+        )
+        for voice in ByteDrumVoice.allCases {
+            XCTAssertEqual(
+                ByteDrumVoice.voice(for: ByteDrumVoice.note(voice: voice)), voice,
+                "\(voice.title)'s note must read back as \(voice.title), or it previews the wrong sample"
+            )
+        }
+    }
+
+    /// The run has to be heard in the project's time. One voice per beat puts the four voices on
+    /// the four beats of the bar, so the run is countable and shares its pulse with the loop; a
+    /// fixed interval plays the same four hits at a tempo the project does not have.
+    func testDrumAuditionRunIsOneBarInTimeWithTheTempo() {
+        XCTAssertEqual(
+            ByteDrumVoice.auditionStepsPerVoice, 4,
+            "a voice a beat is what puts the four voices on the bar's four beats"
+        )
+
+        for bpm in [60, 90, 120, 132, 174, 240] {
+            XCTAssertEqual(
+                ByteDrumVoice.auditionInterval(bpm: bpm),
+                ByteTransportClock.stepDuration(bpm: bpm) * Double(ByteDrumVoice.auditionStepsPerVoice),
+                accuracy: 0.0001,
+                "the run must take its spacing from the transport's step at \(bpm) bpm"
+            )
+        }
+
+        // Four voices at a beat each fill exactly one bar, so the run can be counted back.
+        let barAt132 = ByteTransportClock.stepDuration(bpm: 132) * 16
+        XCTAssertEqual(
+            ByteDrumVoice.auditionInterval(bpm: 132) * Double(ByteDrumVoice.auditionOrder.count),
+            barAt132,
+            accuracy: 0.0001,
+            "the four voices have to be one bar long end to end to land as a countable bar"
+        )
+
+        // And the spacing has to follow the tempo, not merely be constant: a run that ignored the
+        // tempo would satisfy everything above at one speed and drift at every other.
+        XCTAssertNotEqual(
+            ByteDrumVoice.auditionInterval(bpm: 120), ByteDrumVoice.auditionInterval(bpm: 90),
+            "a slower project has to space the run wider, or the run is not in time with it"
+        )
+        XCTAssertEqual(
+            ByteDrumVoice.auditionInterval(bpm: 120), ByteTransportClock.beatDuration(bpm: 120),
+            accuracy: 0.0001,
+            "one voice per beat means the interval is the beat itself"
+        )
+    }
+
+    /// The row's picture has to be the sound it stands for. Each point is the loudest the voice
+    /// gets in its slice of the hit, read through the same reader playback and export use, and
+    /// scaled to the voice's own peak so a quiet voice's outline is legible rather than flat.
+    func testVoiceOutlineIsItsOwnPeaksScaledToItsOwnPeak() {
+        // A decaying tone, so an outline that ignored the reader would still look plausible.
+        let sample = (0..<20_000).map { Float(exp(-Double($0) / 3_000)) }
+        let points = 12
+
+        for voice in ByteDrumVoice.allCases {
+            let outline = voice.envelope(of: sample, points: points)
+            XCTAssertEqual(outline.count, points)
+            XCTAssertEqual(
+                outline.max() ?? 0, 1, accuracy: 0.0001,
+                "\(voice.title)'s outline has to be scaled to its own loudest point"
+            )
+            XCTAssertTrue(outline.allSatisfy { (0...1).contains($0) })
+
+            // Every point is a slice of the hit, so over a decaying sample none may rise: a rise
+            // would mean the points are not the slices they claim to be.
+            for (earlier, later) in zip(outline, outline.dropFirst()) {
+                XCTAssertGreaterThanOrEqual(
+                    earlier + 0.0001, later,
+                    "\(voice.title)'s outline should follow the decay rather than rise"
+                )
+            }
+
+            // And the outline covers the hit and no more: past the frames the voice plays, the
+            // reader is silent, which is where a trimmed voice's picture has to end.
+            let frames = voice.outputFrameCount(sampleCount: sample.count)
+            XCTAssertGreaterThan(frames, 0, "\(voice.title) should play something")
+            XCTAssertEqual(
+                ByteDrumVoice.value(of: sample, voice: voice, at: Double(frames)), 0, accuracy: 0.0001,
+                "\(voice.title)'s outline must stop where the voice goes quiet"
+            )
+        }
+
+        // A hit that is loud the whole way through has to draw full the whole way through. Points
+        // that ran past the frames the voice plays would come back as silence instead, splitting
+        // the outline into a loud part and a dead one. Not exactly full throughout: the trim's
+        // fade reaches into the final point of a voice that is cut short.
+        let constant = Array(repeating: Float(1), count: 20_000)
+        for voice in ByteDrumVoice.allCases {
+            let outline = voice.envelope(of: constant, points: points)
+            XCTAssertTrue(
+                outline.allSatisfy { $0 > 0.99 },
+                "\(voice.title)'s outline should span the frames it plays and no others, it reads \(outline)"
+            )
+        }
+
+        XCTAssertTrue(
+            ByteDrumVoice.kick.envelope(of: [], points: 8).allSatisfy { $0 == 0 },
+            "a voice with no sample has no shape to draw"
+        )
+    }
+
+    /// The drawn width is the voice's length against the longest hit in the kit, so the picture
+    /// and the caption have to agree: the voice captioned FULL is the widest, the one captioned
+    /// CLICK the narrowest. A row whose picture contradicts its own words is worse than one that
+    /// says nothing, because the reader has no way to know which half to believe.
+    func testVoiceOutlineWidthsRunInTheOrderTheCaptionsClaim() {
+        let captions: [(ByteDrumVoice, String)] = [
+            (.kick, "FULL"), (.snare, "LONG"), (.perc, "SHORT"), (.hiHat, "CLICK")
+        ]
+        var previous = Int.max
+        for (voice, word) in captions {
+            XCTAssertTrue(
+                voice.character.contains(word),
+                "\(voice.title) should still be captioned \(word), it says \(voice.character)"
+            )
+            let frames = voice.outputFrameCount(sampleCount: 44_100)
+            XCTAssertLessThan(
+                frames, previous,
+                "\(voice.title) is captioned \(word), so it has to be drawn narrower than the voice before it"
+            )
+            previous = frames
+        }
+    }
+
+    /// The kit check has to play the row the sequence plays, not a stand-in for it: a check that
+    /// could disagree with the pattern would send the reader looking for a fault in the kit.
+    func testDrumHitsReadTheRowTheSequenceWillPlay() {
+        var pattern = BytePattern.empty(name: "ROWS")
+        XCTAssertTrue(pattern.drumHits.isEmpty, "an empty row has nothing to check")
+
+        guard let drumRow = ByteChannel.allCases.firstIndex(of: .drum) else {
+            return XCTFail("expected a drum channel")
+        }
+        // Written the way the pad grid writes one, including voices that are not the default for
+        // the step they land on.
+        pattern.steps[drumRow][2] = ByteDrumVoice.note(voice: .snare)
+        pattern.steps[drumRow][9] = ByteDrumVoice.note(voice: .perc)
+
+        XCTAssertEqual(
+            pattern.drumHits,
+            [ByteDrumHit(step: 2, voice: .snare), ByteDrumHit(step: 9, voice: .perc)],
+            "each hit has to keep its own voice, in the order the bar plays them"
+        )
+
+        // A hit stored under an alias note still resolves to the voice it is named after.
+        pattern.steps[drumRow][12] = 50
+        XCTAssertEqual(
+            pattern.drumHits.last, ByteDrumHit(step: 12, voice: .perc),
+            "the check reads the row through the same note-to-voice table the pads do"
+        )
+    }
+
+    /// The walk up the kit is a grid of hits like a drum row, one voice per beat, so one runner
+    /// plays both — and the walk has to fill the bar that runner walks rather than stopping on
+    /// its last voice.
+    func testKitWalkIsTheVoicesOneBeatApartOnTheBar() {
+        XCTAssertEqual(
+            ByteDrumVoice.auditionWalk.map(\.voice), ByteDrumVoice.auditionOrder,
+            "the walk is the audition order, on the grid"
+        )
+        XCTAssertEqual(
+            ByteDrumVoice.auditionWalk.map(\.step), [0, 4, 8, 12],
+            "four voices a beat apart land on the bar's four beats"
+        )
+        for (earlier, later) in zip(ByteDrumVoice.auditionWalk, ByteDrumVoice.auditionWalk.dropFirst()) {
+            XCTAssertEqual(
+                later.step - earlier.step, ByteDrumVoice.auditionStepsPerVoice,
+                "the walk has to stay on the beat grid the interval is measured against"
+            )
+        }
+        XCTAssertEqual(
+            (ByteDrumVoice.auditionWalk.last?.step ?? 0) + ByteDrumVoice.auditionStepsPerVoice,
+            BytePattern.barSteps,
+            "the walk has to fill the bar the runner walks, or the run ends off the bar line"
+        )
     }
 
     /// The Export Pack product ID lives in two places that must agree: the app
@@ -2576,6 +2912,242 @@ final class BeatboiTests: XCTestCase {
         XCTAssertFalse(owned, "test environment must not hold an Export Pack entitlement")
         XCTAssertFalse(manager.hasReceiptEntitlement)
         XCTAssertFalse(manager.canExport)
+    }
+
+    // MARK: - Step sweeps
+
+    /// A sweep across several steps has to land as ONE undo step. The grid applies
+    /// the run live as the finger moves, so if each step pushed its own history
+    /// entry, taking a single drag back would need one undo for every pad it crossed.
+    @MainActor
+    func testStepSweepPaintsARunAsOneUndoStep() {
+        let suite = "BeatboiTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+        let row = ByteChannel.allCases.firstIndex(of: .pulseA)!
+        let before = (1...3).map { store.project.patterns[0].steps[row][$0] }
+
+        store.beginStepSweep(channel: .pulseA, step: 1, painting: true)
+        store.extendStepSweep(step: 2)
+        store.extendStepSweep(step: 3)
+        store.endStepSweep()
+
+        let rootNote = ByteChannel.pulseA.rootNote(for: store.project.key)
+        let expected: [Int?] = [rootNote, rootNote, rootNote]
+        XCTAssertEqual((1...3).map { store.project.patterns[0].steps[row][$0] }, expected)
+
+        store.undo()
+
+        XCTAssertEqual(
+            (1...3).map { store.project.patterns[0].steps[row][$0] }, before,
+            "one undo must take back the whole run, not one step of it"
+        )
+        XCTAssertFalse(store.canUndo, "the sweep was the only edit, so it must leave exactly one step to undo")
+
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    /// Starting a run on a filled step clears it. The sweep's meaning comes from the
+    /// pad it began on, which is why the same gesture paints or erases — and why the
+    /// grid captures that state at touch-down instead of re-reading it mid-drag.
+    @MainActor
+    func testStepSweepClearsWhenItStartsOnAFilledStep() {
+        let suite = "BeatboiTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+        let row = ByteChannel.allCases.firstIndex(of: .pulseA)!
+        for step in 1...3 { store.toggleStep(channel: .pulseA, step: step) }
+        let before = (1...3).map { store.project.patterns[0].steps[row][$0] }
+        XCTAssertTrue(before.allSatisfy { $0 != nil }, "setup: the run should start filled")
+
+        store.beginStepSweep(channel: .pulseA, step: 1, painting: false)
+        store.extendStepSweep(step: 2)
+        store.extendStepSweep(step: 3)
+        store.endStepSweep()
+
+        XCTAssertEqual((1...3).map { store.project.patterns[0].steps[row][$0] }, [nil, nil, nil])
+
+        store.undo()
+
+        XCTAssertEqual(
+            (1...3).map { store.project.patterns[0].steps[row][$0] }, before,
+            "one undo must restore the whole cleared run"
+        )
+
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    /// Re-crossing a step must not flip it again, or a finger that wobbles over a pad
+    /// boundary would punch a hole in the middle of the run it just painted.
+    @MainActor
+    func testStepSweepIgnoresAStepItHasAlreadyCrossed() {
+        let suite = "BeatboiTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+        let row = ByteChannel.allCases.firstIndex(of: .pulseA)!
+
+        store.beginStepSweep(channel: .pulseA, step: 1, painting: true)
+        store.extendStepSweep(step: 2)
+        store.extendStepSweep(step: 1)
+        store.extendStepSweep(step: 2)
+        store.endStepSweep()
+
+        XCTAssertNotNil(store.project.patterns[0].steps[row][1])
+        XCTAssertNotNil(store.project.patterns[0].steps[row][2])
+        store.undo()
+        XCTAssertFalse(store.canUndo)
+
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    /// A drum run paints the voice it was handed, which is how a sideways drag on an
+    /// empty drum row lays down a run of hi-hats instead of a run of kicks.
+    @MainActor
+    func testDrumSweepPaintsTheSuppliedVoice() {
+        let suite = "BeatboiTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+        let row = ByteChannel.allCases.firstIndex(of: .drum)!
+
+        store.beginStepSweep(
+            channel: .drum,
+            step: 0,
+            painting: true,
+            note: ByteDrumVoice.note(voice: .hiHat)
+        )
+        store.extendStepSweep(step: 1)
+        store.endStepSweep()
+
+        let painted = (0...1).map { store.project.patterns[0].steps[row][$0] }
+        let expected: [Int?] = [
+            ByteDrumVoice.note(voice: .hiHat),
+            ByteDrumVoice.note(voice: .hiHat),
+        ]
+        XCTAssertEqual(painted, expected, "the run must carry the voice, not the default kick")
+
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    /// A melodic run paints the pitch of the pad it started on, so dragging away from a note
+    /// repeats *that* note. Painting the channel's root note instead would stamp a melody the
+    /// user had just written flat, which is the one thing a sideways drag must not do.
+    @MainActor
+    func testMelodicSweepPaintsThePitchItStartedOn() {
+        let suite = "BeatboiTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+        let row = ByteChannel.allCases.firstIndex(of: .pulseA)!
+
+        store.setNote(channel: .pulseA, step: 4, note: 67)
+        guard let held = store.note(channel: .pulseA, step: 4) else {
+            return XCTFail("setup: step 4 should hold the note just written")
+        }
+        XCTAssertNotEqual(
+            held, ByteChannel.pulseA.rootNote(for: store.project.key),
+            "the seeded pitch has to differ from the channel root, or this test proves nothing"
+        )
+
+        store.beginStepSweep(channel: .pulseA, step: 4, painting: true, note: held)
+        store.extendStepSweep(step: 5)
+        store.extendStepSweep(step: 6)
+        store.endStepSweep()
+
+        XCTAssertEqual(
+            (4...6).map { store.project.patterns[0].steps[row][$0] },
+            [held, held, held],
+            "the run must repeat the pitch it started on, not the root note"
+        )
+
+        store.undo()
+        XCTAssertEqual(
+            [store.project.patterns[0].steps[row][4], store.project.patterns[0].steps[row][5], store.project.patterns[0].steps[row][6]],
+            [held, nil, nil],
+            "one undo must take back the painted run and leave the pad it started on alone"
+        )
+
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    /// A run handed no value — the drag began on an empty pad — still paints something, and
+    /// what it paints is the channel's root note.
+    @MainActor
+    func testMelodicSweepWithoutAValuePaintsTheRootNote() {
+        let suite = "BeatboiTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+        let row = ByteChannel.allCases.firstIndex(of: .wave)!
+        store.clearStep(channel: .wave, step: 9)
+
+        store.beginStepSweep(channel: .wave, step: 9, painting: true)
+        store.endStepSweep()
+
+        XCTAssertEqual(
+            store.project.patterns[0].steps[row][9],
+            ByteChannel.wave.rootNote(for: store.project.key),
+            "an empty start leaves the value to the channel's default"
+        )
+
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    // MARK: - Pad auditions
+
+    /// The grid auditions a step through the store's own view of it, so the accessor has to
+    /// report the note the step holds and nil when it is empty — an audition of an empty step
+    /// would play the previous note and mislead the ear the feature exists to serve.
+    @MainActor
+    func testStepNoteAccessorReportsTheHeldNoteOrNil() {
+        let suite = "BeatboiTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+
+        store.clearStep(channel: .pulseA, step: 5)
+        XCTAssertNil(store.note(channel: .pulseA, step: 5), "an empty step has no note to audition")
+
+        store.setNote(channel: .pulseA, step: 5, note: 67)
+        XCTAssertEqual(store.note(channel: .pulseA, step: 5), store.project.mode.quantize(67, key: store.project.key))
+
+        // A drum step stores a voice rather than a pitch, and the audition plays that.
+        store.setDrumVoice(step: 2, voice: Int(ByteDrumVoice.snare.rawValue))
+        XCTAssertEqual(store.note(channel: .drum, step: 2), ByteDrumVoice.note(voice: .snare))
+
+        XCTAssertNil(store.note(channel: .pulseA, step: 99), "a step outside the loop must not audition")
+
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    /// An audition has to bring the audio unit up, because with the transport stopped nothing
+    /// else can make a sound — and it has to let it go again, or the app holds the audio
+    /// hardware for the rest of the session.
+    @MainActor
+    func testAuditionWakesTheAudioUnitAndLetsItSleepAgain() async throws {
+        let engine = ByteAudioEngine(auditionIdleSeconds: 0.15)
+        XCTAssertFalse(engine.isAudioUnitRunning, "a fresh engine should not be holding the audio hardware")
+
+        engine.audition(channel: .pulseA, note: 64, project: .starter)
+        XCTAssertTrue(engine.isAudioUnitRunning, "an audition cannot be heard unless the audio unit is running")
+
+        try await Task.sleep(for: .seconds(0.8))
+        XCTAssertFalse(
+            engine.isAudioUnitRunning,
+            "the audio unit must close again once auditions stop, or it stays powered up indefinitely"
+        )
+    }
+
+    /// Auditioning while the loop plays must not disturb the transport or shut the audio unit
+    /// out from under it — the idle stop is only allowed to close an idle engine.
+    @MainActor
+    func testAuditionDuringPlaybackLeavesTheTransportAlone() async throws {
+        let engine = ByteAudioEngine(auditionIdleSeconds: 0.15)
+        engine.play(project: .starter) { _, _ in }
+        XCTAssertTrue(engine.playing)
+
+        engine.audition(channel: .pulseA, note: 60, project: .starter)
+        try await Task.sleep(for: .seconds(0.8))
+
+        XCTAssertTrue(engine.playing, "a preview must not stop the transport")
+        XCTAssertTrue(engine.isAudioUnitRunning, "the idle stop must not close the audio unit while the loop is playing")
+        engine.stop()
     }
 }
 

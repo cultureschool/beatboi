@@ -976,6 +976,84 @@ final class GameStore {
         toggleStep(channel: channel, step: step)
     }
 
+    // MARK: - Step sweeps
+
+    /// The run of steps one drag is painting or clearing, and the value it paints.
+    /// `note` is a pitch on a melodic channel and a drum voice's note on the drum row;
+    /// nil means "whatever the channel defaults to".
+    private var sweep: (channel: ByteChannel, painting: Bool, note: Int?, steps: Set<Int>)?
+
+    /// Starts a run of steps from a single drag.
+    ///
+    /// `painting` is decided by the caller from the state of the step the gesture
+    /// began on, so the whole run has exactly one meaning: a drag either adds notes
+    /// or removes them, never both. That is the paint-or-eraser idiom, and it is
+    /// also what keeps a sweep predictable — you know what it will do before you
+    /// move, because it is set by the pad you started on.
+    ///
+    /// `note` carries the same idea one step further: a run paints the value it
+    /// started on, which is the note the origin pad was holding — so dragging across
+    /// the grid repeats *that* note rather than stamping the channel's root note over
+    /// a melody the user just wrote. A run begun on an empty pad has no such value and
+    /// passes nil, and each channel supplies its own default.
+    ///
+    /// Nothing in a sweep calls `touch()`. The run commits once, in
+    /// `endStepSweep`, and because `touch()` snapshots the state from *before* the
+    /// whole run, a sweep of any length is a single undo step rather than one per
+    /// step. It is likewise a single write to disk instead of one per step.
+    func beginStepSweep(channel: ByteChannel, step: Int, painting: Bool, note: Int? = nil) {
+        // A run left open by an interrupted gesture is committed here rather than
+        // leaked, or its steps would be folded into whichever edit came next.
+        endStepSweep()
+        sweep = (channel, painting, note, [])
+        applySweep(step)
+    }
+
+    /// Adds one step to the run in progress. Steps already in the run are ignored,
+    /// so a finger that wanders back over a step does not toggle it twice.
+    func extendStepSweep(step: Int) {
+        applySweep(step)
+    }
+
+    /// Commits the run: one history entry and one write for the whole sweep.
+    func endStepSweep() {
+        guard let finished = sweep else { return }
+        sweep = nil
+        guard !finished.steps.isEmpty else { return }
+        selectedChannel = finished.channel
+        touch()
+    }
+
+    /// Applies one step of the run in progress. Split out of `toggleStep` on
+    /// purpose: the paint branch has to stay silent about history and disk, which is
+    /// the whole point of a sweep.
+    private func applySweep(_ step: Int) {
+        guard var running = sweep,
+              let patternIndex,
+              (0..<project.loopLength).contains(step),
+              !running.steps.contains(step) else { return }
+        running.steps.insert(step)
+        sweep = running
+
+        let row = channelIndex(running.channel)
+        if running.painting {
+            // Same hold-trimming rule as a single tap, so painting over a held note
+            // ends it where the new one starts instead of stacking two notes.
+            if running.channel != .drum,
+               let previousStart = noteStart(row: row, step: step, in: project.patterns[patternIndex]),
+               previousStart < step {
+                project.patterns[patternIndex].noteLengths[row][previousStart] = step - previousStart
+            }
+            project.patterns[patternIndex].steps[row][step] = running.note
+                ?? (running.channel == .drum
+                    ? ByteDrumVoice.note(voice: .kick)
+                    : running.channel.rootNote(for: project.key))
+        } else {
+            project.patterns[patternIndex].steps[row][step] = nil
+        }
+        project.patterns[patternIndex].noteLengths[row][step] = 1
+    }
+
     func setDrumVoice(step: Int, voice: Int) {
         guard let patternIndex, (0..<project.loopLength).contains(step) else { return }
         let row = channelIndex(.drum)
@@ -1038,6 +1116,13 @@ final class GameStore {
         guard channel != .drum, let patternIndex, (0..<project.loopLength).contains(step) else { return false }
         let row = channelIndex(channel)
         return project.patterns[patternIndex].steps[row][step] == nil && noteStart(row: row, step: step, in: project.patterns[patternIndex]) != nil
+    }
+
+    /// The note a step holds, or nil when it is empty. Used by the pad grid to audition a
+    /// step through the audio engine, so a melody can be built by ear.
+    func note(channel: ByteChannel, step: Int) -> Int? {
+        guard let patternIndex, (0..<project.loopLength).contains(step) else { return nil }
+        return project.patterns[patternIndex].steps[channelIndex(channel)][step]
     }
 
     /// Sets a note's hold length and clears starts hidden inside its span.

@@ -94,17 +94,29 @@ enum ByteDrumVoice: Int, CaseIterable, Identifiable, Sendable {
         switch self {
         case .kick: return "KICK"
         case .snare: return "SNARE"
-        case .hiHat: return "PERC"
-        case .perc: return "HI-HAT"
+        case .hiHat: return "HI-HAT"
+        case .perc: return "PERC"
         }
     }
 
     var baseNote: Int { [36, 38, 42, 49][rawValue] }
+
+    /// The two samples behind this voice.
+    ///
+    /// Both takes have to be the same instrument, or the second SAMPLE button is a lie: measure
+    /// them and a drum's identity is the register its energy sits in. SNARE and HI-HAT each
+    /// carried a take that failed that — a dark tom and a mid drum — so those two are now a
+    /// re-tune of their sibling (the snare a minor third down, the hi-hat a major third up), which
+    /// keeps a pair one instrument while staying two different hits. `DrumSampleAuditTests`
+    /// measures the files and fails if a pair drifts an octave apart.
     var resourceNames: [String] {
         switch self {
         case .kick: return ["kick1", "kick2"]
         case .snare: return ["snare1", "snare2"]
         case .hiHat: return ["hihat1", "hihat2"]
+        // Reversed: take 1 is the shorter, lower take of the two here, and that is the one the
+        // voice was voiced against. The order is positional, so the row's buttons read SAMPLE 1
+        // and 2 whichever file backs them.
         case .perc: return ["perc2", "perc1"]
         }
     }
@@ -119,8 +131,8 @@ enum ByteDrumVoice: Int, CaseIterable, Identifiable, Sendable {
     }
 
     /// Maps a completed hold-drag to the quick drum sketching layout.
-    /// Vertical up is Snare, horizontal left is the displayed Perc voice,
-    /// horizontal right is the displayed Hi-hat voice,
+    /// Vertical up is Snare, horizontal left is the Hi-hat voice,
+    /// horizontal right is the Perc voice,
     /// and a downward/neutral gesture keeps the default Kick.
     static func voice(horizontal: Int, vertical: Int) -> ByteDrumVoice {
         if abs(horizontal) > abs(vertical) {
@@ -133,6 +145,166 @@ enum ByteDrumVoice: Int, CaseIterable, Identifiable, Sendable {
     static func variant(for note: Int) -> Int { 1 }
     static func note(voice: ByteDrumVoice, variant: Int = 1) -> Int { voice.baseNote }
     static func label(for note: Int) -> String { voice(for: note).title }
+}
+
+extension ByteDrumVoice {
+    /// How a supplied sample is played as this voice.
+    ///
+    /// The eight bundled one-shots were not recorded as a kit, and measured they do not behave
+    /// like one. The kick's energy sits at 118 Hz with a 178 ms body; the snare is broadband
+    /// noise with no low end at all; the hi-hat is 38 ms of hat followed by a long low rumble
+    /// tail; the perc is the brightest thing in the file at 6.7 kHz. Left alone, three of the
+    /// four occupy the same bright register, the hi-hat rings for as long as a snare, and the
+    /// only thing telling them apart is how loud the mixer happens to have left them. So each
+    /// voice gets a shape — a read rate that puts it in a register of its own, and a tail
+    /// fraction that gives it a length of its own:
+    ///
+    ///  * kick: read at its recorded pitch with the whole tail, so it stays the one low voice
+    ///    and the one long one
+    ///  * snare: read slower for the body its own sample lacks, which is what stops it sounding
+    ///    like a second hi-hat
+    ///  * hi-hat: read fastest and cut to its transient, which also removes the rumble tail
+    ///  * perc: read slightly fast and trimmed to its bright body, staying the brightest voice
+    var playbackRate: Double {
+        switch self {
+        case .kick: return 1.0
+        case .snare: return 0.88
+        case .hiHat: return 1.45
+        case .perc: return 1.18
+        }
+    }
+
+    /// The fraction of the sample this voice plays, measured from its start.
+    var keptFraction: Double {
+        switch self {
+        case .kick: return 1.0
+        case .snare: return 0.8
+        case .hiHat: return 0.36
+        case .perc: return 0.62
+        }
+    }
+
+    /// The source frames this voice plays, once the tail trim is applied.
+    func keptFrameCount(sampleCount: Int) -> Int {
+        guard sampleCount > 0 else { return 0 }
+        return min(sampleCount, max(1, Int((Double(sampleCount) * keptFraction).rounded())))
+    }
+
+    /// How many frames this voice sounds for, read out of this many source frames.
+    ///
+    /// The kept frames divided by the read rate, because a voice read faster is over sooner. This
+    /// is the length of the hit, and it is what a row drawn at the voice's own length measures.
+    func outputFrameCount(sampleCount: Int) -> Int {
+        let kept = keptFrameCount(sampleCount: sampleCount)
+        guard kept > 0 else { return 0 }
+        return max(1, Int((Double(kept) / playbackRate).rounded(.up)))
+    }
+
+    /// The outline of this voice's hit: `points` peaks across the frames it plays, each scaled
+    /// against the voice's own loudest point.
+    ///
+    /// Read through `value(of:voice:at:)` — the reader live playback, export and the preview all
+    /// use — so the picture cannot flatter a voice the ear will not hear. Peaks rather than an
+    /// average, because averaging a decaying hit gives a smaller copy of it rather than its
+    /// outline; scaled per voice, so a quiet voice's shape is legible instead of flat.
+    func envelope(of sample: [Float], points: Int) -> [Double] {
+        guard points > 1 else { return [] }
+        let frames = outputFrameCount(sampleCount: sample.count)
+        guard frames > 0 else { return Array(repeating: 0, count: points) }
+
+        var peaks = Array(repeating: 0.0, count: points)
+        var loudest = 0.0
+        for point in 0..<points {
+            let start = frames * point / points
+            let end = max(start + 1, frames * (point + 1) / points)
+            for position in start..<end {
+                peaks[point] = max(peaks[point], abs(Self.value(of: sample, voice: self, at: Double(position))))
+            }
+            loudest = max(loudest, peaks[point])
+        }
+        guard loudest > 0 else { return peaks }
+        return peaks.map { $0 / loudest }
+    }
+
+    /// The value this voice contributes from a supplied sample at a fractional read position.
+    ///
+    /// Live playback, export and the Sound Lab preview all read through here. A voice shaped one
+    /// way while it plays and another way in a file would be worse than no shape at all, and two
+    /// copies of a resampling loop is how the drum names came to be swapped in the first place.
+    static func value(of sample: [Float], voice: ByteDrumVoice, at position: Double) -> Double {
+        let kept = voice.keptFrameCount(sampleCount: sample.count)
+        guard kept > 0 else { return 0 }
+        let frame = position * voice.playbackRate
+        guard frame < Double(kept) else { return 0 }
+        let index = min(kept - 1, max(0, Int(frame)))
+        let next = min(kept - 1, index + 1)
+        let blend = frame - Double(index)
+        let interpolated = Double(sample[index]) + (Double(sample[next]) - Double(sample[index])) * blend
+        // Ease the final twelfth of the tail out. A trimmed one-shot otherwise ends on a step
+        // from whatever level the cut landed at, which clicks.
+        let remaining = Double(kept) - frame
+        let fadeFrames = Double(max(1, kept / 12))
+        return interpolated * min(1.0, max(0.0, remaining / fadeFrames))
+    }
+
+    /// The order the kit is checked in: from the floor up, the way a player walks a kit.
+    ///
+    /// Written out rather than taken from `allCases`, so the run is pinned by design. The test
+    /// asserts it covers every voice exactly once, which `allCases` would satisfy by definition.
+    static let auditionOrder: [ByteDrumVoice] = [.kick, .snare, .hiHat, .perc]
+
+    /// How far apart the run places its voices, in sixteenth-note steps: four is one beat, so
+    /// the four voices land on the four beats of the bar and a listener can count the run back.
+    ///
+    /// At a fixed interval the same four hits are an arbitrary rhythm that happens to be a
+    /// different tempo from the loop behind them — the ear hears four hits, not a bar.
+    static let auditionStepsPerVoice = 4
+
+    /// Seconds between voices in the run, read from the transport's own sixteenth so the run
+    /// tracks the project tempo instead of carrying a tempo of its own.
+    static func auditionInterval(bpm: Int) -> Double {
+        ByteTransportClock.stepDuration(bpm: bpm) * Double(auditionStepsPerVoice)
+    }
+
+    /// The walk up the kit as hits on the step grid, which is how a pattern's drum row arrives.
+    ///
+    /// Both kit checks are then the same thing — a list of hits walked a step at a time — so one
+    /// runner plays them, at one tempo, with one highlight.
+    static let auditionWalk: [ByteDrumHit] = auditionOrder.enumerated().map { index, voice in
+        ByteDrumHit(step: index * auditionStepsPerVoice, voice: voice)
+    }
+
+    /// What the shape does to the sound, in words — the reader should know what to listen for
+    /// before tapping. Both halves are derived from the numbers above, so the caption cannot
+    /// end up describing a shape the voice no longer has.
+    var character: String { "\(pitchWord) · \(lengthWord)" }
+
+    private var pitchWord: String {
+        switch playbackRate {
+        case ..<0.93: return "DEEPER"
+        case ..<1.07: return "NATIVE"
+        case ..<1.35: return "BRIGHTER"
+        default: return "TIGHTER"
+        }
+    }
+
+    private var lengthWord: String {
+        switch keptFraction {
+        case ..<0.45: return "CLICK"
+        case ..<0.72: return "SHORT"
+        case ..<0.95: return "LONG"
+        default: return "FULL"
+        }
+    }
+}
+
+/// One hit of a drum row: the voice, and the step it lands on.
+///
+/// A plain value so a pattern's row and the walk up the kit can both be handed to one runner, and
+/// so a test can assert the music a kit check will play without playing it.
+struct ByteDrumHit: Equatable, Sendable {
+    let step: Int
+    let voice: ByteDrumVoice
 }
 
 enum ByteChannel: String, CaseIterable, Codable, Identifiable, Sendable {
@@ -162,14 +334,9 @@ enum ByteChannel: String, CaseIterable, Codable, Identifiable, Sendable {
         }
     }
 
-    var shortTitle: String {
-        switch self {
-        case .pulseA: return "P"
-        case .pulseB: return "S"
-        case .wave: return "T"
-        case .drum: return "D"
-        }
-    }
+    /// The compact token for this channel, derived from the title so the two cannot disagree.
+    /// Spelled out, it drifted: PULSE 2 carried an "S" left over from an earlier SQUARE naming.
+    var shortTitle: String { String(title.prefix(1)) }
 
     var systemImage: String {
         switch self {
@@ -314,6 +481,8 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
     var waveVolume: Int
     /// Fixed wave preset index plus simple tone and decay controls.
     var waveShape: Int
+    /// Retained for project compatibility. Nothing renders it, so the Sound Lab no longer offers
+    /// it as a control: a FILTER row that filtered nothing was the panel lying about the patch.
     var waveFilter: Int
     var waveEnvelope: Int
     // Retained privately for old project compatibility; Drum UI exposes voice controls instead.
@@ -327,7 +496,9 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
     /// Mixer state is project data so mute/solo survives autosave and export.
     var muted: Bool
     var soloed: Bool
-    /// Drum voice used by the Sound Lab selector: 0 kick, 1 snare, 2 hi-hat, 3 crash.
+    /// Drum voice used by the Sound Lab selector: one `ByteDrumVoice` per index, in its order —
+    /// 0 kick, 1 snare, 2 hi-hat, 3 perc. The drum voices themselves decide what each index is
+    /// called; this field only holds the index, so it must not name the voices again.
     var drumVoice: Int
     /// Selected supplied sample (1 or 2) for kick, snare, hi-hat, and perc.
     var drumSamples: [Int]
@@ -811,7 +982,7 @@ struct ByteInstrumentPreset: Identifiable, Hashable, Sendable {
                 drumPreset("kick", "KICK", channel, width7Bit: false, clockShift: 8, divider: 6, volume: 15, length: 18),
                 drumPreset("snare", "SNARE", channel, width7Bit: false, clockShift: 5, divider: 3, volume: 15, length: 26),
                 drumPreset("hat", "HI-HAT", channel, width7Bit: true, clockShift: 1, divider: 0, volume: 13, length: 8),
-                drumPreset("crash", "CRASH", channel, width7Bit: false, clockShift: 3, divider: 1, volume: 15, length: 48)
+                drumPreset("perc", "PERC", channel, width7Bit: false, clockShift: 3, divider: 1, volume: 15, length: 48)
             ]
         }
     }
@@ -839,7 +1010,10 @@ struct ByteInstrumentPreset: Identifiable, Hashable, Sendable {
         patch.noiseClockShift = clockShift
         patch.noiseDivider = divider
         patch.initialVolume = volume
-        patch.drumVoice = ["kick", "snare", "hat", "crash"].firstIndex(of: id) ?? 0
+        // Seeded under the voice's own title, so this kit cannot end up calling a voice
+        // something `ByteDrumVoice` does not. Note 49 is the crash-cymbal note in the general
+        // MIDI kit, which is where the CRASH name this used to carry came from.
+        patch.drumVoice = ByteDrumVoice.allCases.firstIndex { $0.title == name } ?? 0
         patch.drumVolumes[patch.drumVoice] = volume
         patch.drumLengths[patch.drumVoice] = length
         patch.envelopePace = id == "kick" ? 3 : id == "snare" ? 3 : id == "hat" ? 1 : 2
@@ -1068,6 +1242,10 @@ struct ByteEffects: Codable, Hashable, Sendable {
 }
 
 struct BytePattern: Codable, Hashable, Identifiable, Sendable {
+    /// Every pattern is one bar of sixteenths. A kit check walks this many steps, so a check
+    /// ends on the bar line however sparse the row is rather than as soon as the hits run out.
+    static let barSteps = 16
+
     var id: UUID
     var name: String
     /// Each pattern can be one or two bars while the project remains backward compatible.
@@ -1109,6 +1287,19 @@ struct BytePattern: Codable, Hashable, Identifiable, Sendable {
         try container.encode(loopLength, forKey: .loopLength)
         try container.encode(steps, forKey: .steps)
         try container.encode(noteLengths, forKey: .noteLengths)
+    }
+
+    /// The drum row as the sequence plays it: one hit per filled step, in step order.
+    ///
+    /// A kit check walks this rather than a hand-written stand-in for the row, so what is heard
+    /// in isolation is the bar the transport will play — a check that could disagree with the
+    /// pattern would be worth less than no check at all.
+    var drumHits: [ByteDrumHit] {
+        guard let row = ByteChannel.allCases.firstIndex(of: .drum),
+              steps.indices.contains(row) else { return [] }
+        return steps[row].enumerated().compactMap { step, note in
+            note.map { ByteDrumHit(step: step, voice: ByteDrumVoice.voice(for: $0)) }
+        }
     }
 
     static func starterSteps() -> [[Int?]] {

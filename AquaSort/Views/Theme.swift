@@ -37,6 +37,23 @@ extension Color {
     static let panelInset = Color.black.opacity(0.26)
 }
 
+extension ByteDrumVoice {
+    /// The colour a drum voice is drawn in, on the pad grid and in the voice mixer alike.
+    ///
+    /// Deliberately one definition for both: the pad grid and the mixer each used to carry
+    /// their own copy of this table, and both copies independently drifted into swapping
+    /// HI-HAT and PERC. A palette entry is paired here with the voice that shares its name,
+    /// and `testDrumPadColorsFollowTheVoiceNames` holds the two together.
+    var padColor: Color {
+        switch self {
+        case .kick: return .drumKick
+        case .snare: return .drumSnare
+        case .hiHat: return .drumHiHat
+        case .perc: return .drumPerc
+        }
+    }
+}
+
 struct PocketBackdrop: View {
     var body: some View {
         ZStack {

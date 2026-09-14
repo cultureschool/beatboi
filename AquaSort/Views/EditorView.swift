@@ -15,7 +15,10 @@ struct EditorView: View {
     @State private var pendingPage: Int?
     @State private var patternDragStartIndex: Int?
     @State private var lastPatternDragIndex: Int?
-    @State private var noteLinkSourceStep: Int?
+    @State private var armedLink: PendingNoteLink?
+    /// Live value readout for a pitch or voice drag on the pad grid. The pad is
+    /// under the fingertip, so the value being set has to be shown elsewhere.
+    @State private var scrubReadout: String?
     @State private var showLibrary = false
     @State private var showExport = false
     @State private var showImport = false
@@ -38,6 +41,23 @@ struct EditorView: View {
     @State private var logoDragArmed = false
     @State private var twoFingerScrollProxy: ScrollViewProxy?
     @State private var twoFingerLastDy: CGFloat?
+
+    /// A note end waiting to be placed by the next tap on a later pad.
+    ///
+    /// The channel travels with the step so an armed link cannot outlive the row it was
+    /// armed on: arming one on PULSE A and then switching to the drum row would otherwise
+    /// leave the mode armed and invisible, and the next tap would quietly set a note length
+    /// on a row that is no longer on screen.
+    private struct PendingNoteLink: Equatable {
+        let channel: ByteChannel
+        let step: Int
+    }
+
+    /// The armed link, but only while the row it was armed on is the row on screen.
+    private var linkSourceStep: Int? {
+        guard let armedLink, armedLink.channel == store.selectedChannel else { return nil }
+        return armedLink.step
+    }
 
     private var pageTitle: String {
         switch page {
@@ -852,30 +872,133 @@ struct EditorView: View {
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.plasticHighlight.opacity(0.68), lineWidth: 1))
     }
 
+    /// Hint for the note grid. While a drag scrubs a value the readout replaces
+    /// it, so the pitch stays legible while the finger is covering the pad.
+    private var padEditorHint: String {
+        if store.selectedChannel == .drum {
+            return "TAP: HIT ON / OFF  •  DRAG ACROSS PADS: PAINT A RUN"
+        }
+        if linkSourceStep != nil {
+            return "LINK ARMED  •  TAP A LATER PAD FOR THE NOTE END  •  TAP THIS PAD TO CANCEL"
+        }
+        return "TAP: ON / OFF  •  UP / DOWN: PITCH  •  ACROSS: PAINT  •  HOLD: LINK"
+    }
+
+    /// The drum row's four drag directions written out, because a voice pick with no legend
+    /// is a direction the user has to guess at. Read from the model rather than spelled out
+    /// here, so the legend cannot drift from what the gesture actually does.
+    private var drumVoiceLegend: String {
+        let up = ByteDrumVoice.voice(horizontal: 0, vertical: -1).title
+        let down = ByteDrumVoice.voice(horizontal: 0, vertical: 1).title
+        let left = ByteDrumVoice.voice(horizontal: -1, vertical: 0).title
+        let right = ByteDrumVoice.voice(horizontal: 1, vertical: 0).title
+        return "VOICE: ▲ \(up)  ▼ \(down)  ◀ \(left)  ▶ \(right)"
+    }
+
+    /// Reads one tap on the pad grid.
+    ///
+    /// A tap always toggles the pad it landed on, with exactly one exception: when a link is
+    /// armed and the tap meets the pad that armed it, the tap disarms the mode instead —
+    /// "tap the lit pad to get out", and pressing it cannot mean "delete this note". Tapping
+    /// an *earlier* pad cannot complete a link either, so it cancels the mode and then behaves
+    /// like the plain tap it looks like. That is what keeps a forgotten arm from silently
+    /// swallowing the next few taps.
+    private func resolveTap(on step: Int) {
+        let channel = store.selectedChannel
+        if let armed = armedLink, armed.channel == channel {
+            armedLink = nil
+            if step > armed.step {
+                store.setNoteLength(channel: channel, step: armed.step, length: step - armed.step)
+                store.presentToast("NOTE LINKED TO STEP \(step + 1)")
+                return
+            }
+            store.presentToast("LINK CANCELLED")
+            // The armed pad itself only cancels; any earlier pad cancels and then does what a
+            // tap always does.
+            if step == armed.step { return }
+        }
+        // Audition only when the tap places a note, so clearing a step
+        // stays silent and the sound confirms what was just written.
+        let placing = store.note(channel: channel, step: step) == nil
+        toggleStepAndRefresh(channel: channel, step: step)
+        if placing { auditionStep(step) }
+    }
+
     private var restoredPadEditor: some View {
         LCDPanel(title: "\(store.selectedChannel.title) / 16 STEP LOOP", header: {
             RestoredDiceButton(label: "Randomize melody", compact: true, live: store.isPlaying) { randomizeMelody() }
         }) {
             VStack(spacing: 6) {
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 4), spacing: 6) {
-                    ForEach(0..<16, id: \.self) { step in
-                        RestoredNotePad(step: step, note: selectedChannelNotes[step], length: store.noteLength(channel: store.selectedChannel, step: step), covered: store.isStepCovered(channel: store.selectedChannel, step: step), channel: store.selectedChannel, rootNote: store.selectedChannel.rootNote(for: store.project.key), accent: restoredChannelAccent(store.selectedChannel), current: step == currentStep, phase: currentStep, linkSource: noteLinkSourceStep == step, linkArmed: noteLinkSourceStep != nil && noteLinkSourceStep != step, noteName: noteName, drumName: drumName) {
-                            if let source = noteLinkSourceStep, source != step, step > source {
-                                store.setNoteLength(channel: store.selectedChannel, step: source, length: step - source)
-                                noteLinkSourceStep = nil
-                                store.presentToast("NOTE LINKED TO STEP \(step + 1)")
-                            } else { toggleStepAndRefresh(channel: store.selectedChannel, step: step) }
-                        } onArmLink: { source in
-                            guard store.selectedChannel != .drum else { return }
-                            noteLinkSourceStep = source
-                            store.presentToast("LINK ARMED / TAP A LATER PAD")
-                        } onSetNote: { note in store.setNote(channel: store.selectedChannel, step: step, note: note); requestPlaybackRefresh() } onSetDrum: { voice in store.setDrumVoice(step: step, voice: voice); requestPlaybackRefresh() }
+                RestoredNoteGrid(
+                    channel: store.selectedChannel,
+                    rootNote: store.selectedChannel.rootNote(for: store.project.key),
+                    accent: restoredChannelAccent(store.selectedChannel),
+                    currentStep: currentStep,
+                    linkSourceStep: linkSourceStep,
+                    note: { selectedChannelNotes[$0] },
+                    length: { store.noteLength(channel: store.selectedChannel, step: $0) },
+                    covered: { store.isStepCovered(channel: store.selectedChannel, step: $0) },
+                    noteName: noteName,
+                    drumName: drumName,
+                    snap: { store.project.mode.quantize($0, key: store.project.key) },
+                    onToggle: { step in resolveTap(on: step) },
+                    onArmLink: { source in
+                        guard store.selectedChannel != .drum else { return }
+                        armedLink = PendingNoteLink(channel: store.selectedChannel, step: source)
+                        store.presentToast("LINK ARMED / TAP A LATER PAD TO END THE NOTE")
+                    },
+                    onSetNote: { step, note in
+                        store.setNote(channel: store.selectedChannel, step: step, note: note)
+                        requestPlaybackRefresh()
+                        audio.audition(channel: store.selectedChannel, note: note, project: store.project)
+                    },
+                    onSetDrum: { step, voice in
+                        store.setDrumVoice(step: step, voice: voice)
+                        requestPlaybackRefresh()
+                        let index = min(ByteDrumVoice.allCases.count - 1, max(0, voice))
+                        audio.audition(
+                            channel: .drum,
+                            note: ByteDrumVoice.note(voice: ByteDrumVoice.allCases[index]),
+                            project: store.project
+                        )
+                    },
+                    onScrub: { scrubReadout = $0 },
+                    onSweepBegin: { step, painting, note in
+                        store.beginStepSweep(
+                            channel: store.selectedChannel,
+                            step: step,
+                            painting: painting,
+                            note: note
+                        )
+                    },
+                    onSweepExtend: { step in store.extendStepSweep(step: step) },
+                    onSweepEnd: {
+                        store.endStepSweep()
+                        requestPlaybackRefresh()
+                    }
+                )
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(scrubReadout ?? padEditorHint)
+                        .font(.custom("Futura-Bold", size: 8))
+                        .foregroundStyle(scrubReadout == nil ? Color.gbInk.opacity(0.62) : Color.amber)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityIdentifier("padEditor.readout")
+                    // The voice directions, shown only while they apply and only until a drag
+                    // takes the line over for a live value.
+                    if store.selectedChannel == .drum, scrubReadout == nil {
+                        Text(drumVoiceLegend)
+                            .font(.custom("Futura-Bold", size: 8))
+                            .foregroundStyle(Color.gbInk.opacity(0.62))
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
-                Text(store.selectedChannel == .drum ? "TAP: KICK ON / OFF  •  DRAG UP/DOWN: CHANGE VOICE" : (noteLinkSourceStep == nil ? "TAP: ON / OFF  •  HOLD: ARM LINK  •  DRAG UP/DOWN: PITCH" : "LINK ARMED  •  TAP A PAD TO SET THE NOTE END"))
-                    .font(.custom("Futura-Bold", size: 8)).foregroundStyle(Color.gbInk.opacity(0.62)).frame(maxWidth: .infinity, alignment: .leading)
             }
         }
+        // An armed link belongs to one step of one pattern. Switching rows already makes it
+        // inert — this makes it gone, so the mode cannot reappear later on a pad the user has
+        // stopped thinking about.
+        .onChange(of: store.selectedChannel) { _, _ in armedLink = nil }
+        .onChange(of: store.currentPatternID) { _, _ in armedLink = nil }
     }
 
     private var restoredSoundLab: some View {
@@ -885,6 +1008,8 @@ struct EditorView: View {
                 RestoredDrumEditor(
                     accent: restoredChannelAccent(.drum),
                     patch: store.patch(for: .drum),
+                    tempo: store.project.tempo,
+                    drumHits: selectedPattern.drumHits,
                     volume: { store.drumVoiceVolumePercent($0) },
                     onSelectSample: { voice, variant in
                         store.setDrumSample(voice: voice, variant: variant)
@@ -893,6 +1018,9 @@ struct EditorView: View {
                     onVolumeChange: { voice, percent in
                         store.setDrumVoiceVolume(voice: voice, percent: percent)
                         requestPlaybackRefresh()
+                    },
+                    onAudition: { voice in
+                        audio.audition(channel: .drum, note: ByteDrumVoice.note(voice: voice), project: store.project)
                     }
                 )
             } else {
@@ -1055,9 +1183,15 @@ struct EditorView: View {
 
     private func restoredParameters(for channel: ByteChannel) -> [BytePatchParameter] {
         switch channel {
+        // Every card here has to be a parameter the renderer reads for this channel. A card
+        // that moves a field nothing reads is worse than a missing one: it looks like a control.
         case .pulseA, .pulseB: return [.duty, .octave, .octaveFlutterSpeed, .octaveFlutterPattern, .envelopeAttack, .envelopeDecay, .envelopeSustain, .envelopeRelease, .portamento, .portamentoTime, .vibratoCycleLength, .vibratoDepth, .vibratoDelay, .bendRange]
-        case .wave: return [.waveShape, .waveFilter, .waveEnvelope, .octave, .octaveFlutterSpeed, .octaveFlutterPattern, .envelopeAttack, .envelopeDecay, .envelopeSustain, .envelopeRelease, .portamento, .portamentoTime, .vibratoDepth, .bendRange]
-        case .drum: return [.volume, .envelope, .tremolo, .panLeft, .panRight]
+        // No `.waveFilter`: nothing in the engine renders it, so the card would filter nothing.
+        case .wave: return [.waveShape, .waveEnvelope, .octave, .octaveFlutterSpeed, .octaveFlutterPattern, .envelopeAttack, .envelopeDecay, .envelopeSustain, .envelopeRelease, .portamento, .portamentoTime, .vibratoDepth, .bendRange]
+        // Unreachable by design — the drum row renders the kit editor instead — and kept to the
+        // parameters the sampler honours. The DMG envelope, tremolo and 4-bit volume all feed
+        // the synthesized voices, which supplied one-shots bypass.
+        case .drum: return [.panLeft, .panRight]
         }
     }
 
@@ -1225,6 +1359,13 @@ struct EditorView: View {
     private func drumName(_ midi: Int) -> String { ByteDrumVoice.label(for: midi) }
     private func updateVoicing(key: Int? = nil, mode: ByteScaleMode? = nil) { store.updateVoicing(key: key, mode: mode); requestPlaybackRefresh() }
     private func toggleStepAndRefresh(channel: ByteChannel, step: Int) { store.toggleStep(channel: channel, step: step); requestPlaybackRefresh() }
+
+    /// Plays one step through the audio engine. This is what makes the pad grid usable by
+    /// ear: the pitch under the finger is heard rather than read off a note name.
+    private func auditionStep(_ step: Int) {
+        guard let note = store.note(channel: store.selectedChannel, step: step) else { return }
+        audio.audition(channel: store.selectedChannel, note: note, project: store.project)
+    }
     private func randomizeMelody() { guard store.randomizeSelectedMelody() else { store.presentToast("SELECT A MELODIC CHANNEL"); return }; requestPlaybackRefresh() }
     private func randomizeSound() { guard store.randomizeSelectedPatch() else { store.presentToast("SELECT A MELODIC CHANNEL"); return }; requestPlaybackRefresh() }
 
@@ -1778,6 +1919,7 @@ private struct RestoredChannelFader: View {
                     }
             )
             .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("channelFader.\(channel.rawValue)")
             .accessibilityLabel("\(channel.title) channel")
             .accessibilityValue(accessibilityValue)
             .accessibilityHint("Tap the channel to edit. Swipe left or right to change volume. Use M to mute or S to solo.")
@@ -1999,13 +2141,25 @@ private extension View {
     }
 }
 
+/// One step of the 16-step grid. Presentation only.
+///
+/// The gesture that edits a pad lives on the grid as a whole, in
+/// `RestoredNoteGrid`, because a drag has to be able to travel from the pad it
+/// started on to its neighbours — and a gesture attached to a pad keeps receiving
+/// the touch after the finger has left that pad.
+/// The value a drag is setting, drawn on the pad under the finger so a pitch or voice can be
+/// read while it is being chosen instead of from a hint line across the panel.
+private struct PadLiveReadout: Equatable {
+    let value: String
+    let detail: String
+}
+
 private struct RestoredNotePad: View {
     let step: Int
     let note: Int?
     let length: Int
     let covered: Bool
     let channel: ByteChannel
-    let rootNote: Int
     let accent: Color
     let current: Bool
     let phase: Int
@@ -2013,23 +2167,14 @@ private struct RestoredNotePad: View {
     let linkArmed: Bool
     let noteName: (Int) -> String
     let drumName: (Int) -> String
-    let onTap: () -> Void
-    let onArmLink: (Int) -> Void
-    let onSetNote: (Int) -> Void
-    let onSetDrum: (Int) -> Void
-    @State private var startNote: Int?
-    @State private var didDrag = false
+    /// Set while a drag is editing this pad, nil otherwise.
+    let live: PadLiveReadout?
 
     private var padColor: Color {
         guard channel == .drum, let note else {
             return note == nil ? Color.gbDeep.opacity(0.16) : Color.amber
         }
-        switch ByteDrumVoice.voice(for: note) {
-        case .kick: return .drumKick
-        case .snare: return .drumSnare
-        case .hiHat: return .drumPerc
-        case .perc: return .drumHiHat
-        }
+        return ByteDrumVoice.voice(for: note).padColor
     }
 
     var body: some View {
@@ -2054,52 +2199,373 @@ private struct RestoredNotePad: View {
         .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(linkSource || linkArmed ? Color.arcadeRed : current ? Color.gbLight : Color.gbInk.opacity(0.34), lineWidth: linkSource || current ? 3 : 1))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .beatGlow(active: current, phase: phase, color: .amber)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            guard !didDrag else { return }
-            onTap()
-        }
-        .highPriorityGesture(LongPressGesture(minimumDuration: 0.5).onEnded { _ in
-            if note != nil && channel != .drum { onArmLink(step) }
-        })
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 8)
-                .onChanged { gesture in
-                    didDrag = true
-                    if channel == .drum {
-                        let voice = ByteDrumVoice.voice(horizontal: Int(gesture.translation.width), vertical: Int(gesture.translation.height)).rawValue
-                        if voice != ByteDrumVoice.voice(for: note ?? ByteDrumVoice.kick.baseNote).rawValue {
-                            onSetDrum(voice)
-                        } else if note == nil {
-                            onSetDrum(voice)
-                        }
-                    } else {
-                        if startNote == nil { startNote = note ?? rootNote }
-                        let base = startNote ?? 60
-                        let semitones = Int((-gesture.translation.height / 8).rounded())
-                        onSetNote(min(96, max(24, base + semitones)))
+        // Drawn over the pad rather than beside it, so the value stays legible under the
+        // finger that is choosing it — the one place the pad's own label cannot be read.
+        .overlay {
+            if let live {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.hardwareBlack.opacity(0.88))
+                    VStack(spacing: 1) {
+                        Text(live.value)
+                            .font(.custom("Futura-Bold", size: 14))
+                            .foregroundStyle(Color.amber)
+                        Text(live.detail)
+                            .font(.custom("Futura-Bold", size: 7))
+                            .foregroundStyle(Color.gbGlow.opacity(0.9))
                     }
                 }
-                .onEnded { _ in
-                    startNote = nil
-                    didDrag = false
-                }
+                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.amber, lineWidth: 2))
+                .allowsHitTesting(false)
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("notePad.\(step)")
+        .accessibilityLabel("Step \(step + 1)")
+        .accessibilityValue(note.map(channel == .drum ? drumName : noteName) ?? "EMPTY")
+        .contentShape(Rectangle())
+    }
+}
+
+/// The 16-step grid, and the single gesture that edits it.
+///
+/// The gesture belongs here rather than on each pad because a drag has to be able to
+/// travel from the pad it started on to its neighbours. A gesture attached to a pad
+/// keeps receiving the touch after the finger has left it and never learns which pad
+/// the finger is over now — which is the one thing a paint sweep needs to know. So
+/// the grid measures itself, turns the touch position into a step, and reads a single
+/// touch as exactly one of four things:
+///
+///  * movement under `tapSlop` that lifts quickly — toggle the step
+///  * movement under `tapSlop` that lifts after `linkHoldDuration` — arm the note link
+///  * a vertical drag — pitch on melodic channels, drum voice on the drum row
+///  * a sideways drag that reaches another pad — paint (or clear) every step it crosses
+///
+/// The reading is resolved once per touch and then latched, so a hesitant gesture
+/// cannot change its mind partway through. A sideways drag that stays on its own pad
+/// has no meaning for a melodic channel and is the drum voice pick for the drum row;
+/// either way it stays undecided, so it can still become a sweep if the finger keeps
+/// travelling.
+private struct RestoredNoteGrid: View {
+    let channel: ByteChannel
+    let rootNote: Int
+    let accent: Color
+    let currentStep: Int
+    let linkSourceStep: Int?
+    let note: (Int) -> Int?
+    let length: (Int) -> Int
+    let covered: (Int) -> Bool
+    let noteName: (Int) -> String
+    let drumName: (Int) -> String
+    /// The pitch the pattern will really hold for a requested note. Melodic notes are
+    /// quantized to the project's scale, so a drag that skipped this would announce a pitch
+    /// the pattern never takes and the readout would disagree with the pad's own label.
+    let snap: (Int) -> Int
+    let onToggle: (Int) -> Void
+    let onArmLink: (Int) -> Void
+    let onSetNote: (_ step: Int, _ note: Int) -> Void
+    let onSetDrum: (_ step: Int, _ voice: Int) -> Void
+    /// The value under the finger, or nil once nothing is being edited.
+    let onScrub: (String?) -> Void
+    /// The value a run should paint: the origin pad's own note, or nil to let the store pick
+    /// the channel's default.
+    let onSweepBegin: (_ step: Int, _ painting: Bool, _ note: Int?) -> Void
+    let onSweepExtend: (Int) -> Void
+    let onSweepEnd: () -> Void
+
+    private static let columns = 4
+    private static let rows = 4
+    private static let spacing: CGFloat = 6
+    /// Travel before a touch stops being a tap. Positional, not timed, so a slow tap
+    /// still toggles.
+    private static let tapSlop: CGFloat = 10
+    /// Travel per semitone while scrubbing pitch. The mapping this replaced used 8pt,
+    /// which put a full octave inside 96pt — under two pad heights — so the note
+    /// wanted was almost always overshot on the way there.
+    private static let pointsPerSemitone: CGFloat = 12
+    /// Hold still this long, then lift, to arm the note link.
+    private static let linkHoldDuration: TimeInterval = 0.45
+
+    private enum Intent: Equatable { case undecided, scrubbing, sweeping }
+    @State private var intent: Intent = .undecided
+    @State private var touchBeganAt: Date?
+    @State private var originStep: Int?
+    @State private var originNote: Int?
+    /// Whether the step under the finger was empty when the touch landed. That, and
+    /// not the state at sweep time, decides paint-or-clear: a drum drag sets a voice
+    /// on its own origin pad as it moves, so re-reading the origin mid-gesture would
+    /// turn every drum sweep into an eraser.
+    @State private var originWasEmpty = true
+    @State private var lastApplied: Int?
+    /// Whether this touch has already written a value to its origin pad. The drum voice pick
+    /// is not latched as an intent — see the drum branch of `handle` — so this is what tells
+    /// the release that the touch has already had its effect and must not also toggle.
+    @State private var appliedValue = false
+    @State private var sweptSteps: Set<Int> = []
+    @State private var sweepingPaints = true
+    @State private var gridFrame: CGRect = .zero
+    /// The value the drag in progress is setting, and the pad it lands on.
+    @State private var live: (step: Int, readout: PadLiveReadout)?
+
+    var body: some View {
+        LazyVGrid(
+            columns: Array(repeating: GridItem(.flexible(), spacing: Self.spacing), count: Self.columns),
+            spacing: Self.spacing
+        ) {
+            ForEach(0..<(Self.columns * Self.rows), id: \.self) { step in
+                RestoredNotePad(
+                    step: step,
+                    note: note(step),
+                    length: length(step),
+                    covered: covered(step),
+                    channel: channel,
+                    accent: accent,
+                    current: step == currentStep,
+                    phase: currentStep,
+                    linkSource: linkSourceStep == step,
+                    linkArmed: linkSourceStep.map { step > $0 } ?? false,
+                    noteName: noteName,
+                    drumName: drumName,
+                    live: live.flatMap { $0.step == step ? $0.readout : nil }
+                )
+            }
+        }
+        // The grid's own frame is what turns a touch into a step. Measured in global
+        // coordinates and subtracted from the gesture's global location, so there is
+        // no reliance on a named coordinate space resolving to this view.
+        .background {
+            GeometryReader { proxy in
+                Color.clear
+                    .onAppear { gridFrame = proxy.frame(in: .global) }
+                    .onChange(of: proxy.frame(in: .global)) { _, frame in gridFrame = frame }
+            }
+        }
+        // `highPriorityGesture` with `minimumDistance: 0` takes the touch away from
+        // the enclosing ScrollView, so a pitch drag does not fight the page. Scrolling
+        // the grid stays available two-fingered, through the scroll bridge.
+        .highPriorityGesture(
+            DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                .onChanged(handle)
+                .onEnded(finish)
         )
+    }
+
+    /// Which step sits under a global point. Derived from the measured frame rather
+    /// than from per-pad hit testing, because during a sweep the finger is usually
+    /// outside the pad whose gesture is still tracking it.
+    private func step(at point: CGPoint) -> Int? {
+        guard gridFrame.width > 0, gridFrame.height > 0 else { return nil }
+        let cellWidth = (gridFrame.width - Self.spacing * CGFloat(Self.columns - 1)) / CGFloat(Self.columns)
+        let cellHeight = (gridFrame.height - Self.spacing * CGFloat(Self.rows - 1)) / CGFloat(Self.rows)
+        let column = Int((point.x - gridFrame.minX) / (cellWidth + Self.spacing))
+        let row = Int((point.y - gridFrame.minY) / (cellHeight + Self.spacing))
+        guard (0..<Self.columns).contains(column), (0..<Self.rows).contains(row) else { return nil }
+        return row * Self.columns + column
+    }
+
+    private func handle(_ gesture: DragGesture.Value) {
+        if touchBeganAt == nil { begin(gesture) }
+
+        switch intent {
+        case .scrubbing:
+            scrubPitch(gesture)
+            return
+        case .sweeping:
+            extendSweep(gesture)
+            return
+        case .undecided:
+            break
+        }
+
+        guard hypot(gesture.translation.width, gesture.translation.height) >= Self.tapSlop else { return }
+
+        let sideways = abs(gesture.translation.width) > abs(gesture.translation.height)
+        let here = step(at: gesture.location)
+
+        // Reaching another pad on a sideways drag is the sweep. Requiring BOTH is
+        // what lets a vertical pitch scrub run off the bottom of its pad — and even
+        // onto the pad below it — without turning into an eraser.
+        if sideways, let here, here != originStep {
+            guard let origin = originStep else { return }
+            intent = .sweeping
+            sweepingPaints = originWasEmpty
+            sweptSteps.insert(origin)
+            // A drum drag may have a voice readout up on the origin pad. The run is about to
+            // paint that pad, so the readout has to go or it would cover what was painted.
+            live = nil
+            onSweepBegin(origin, sweepingPaints, valueForSweep())
+            extendSweep(gesture)
+            return
+        }
+
+        if channel == .drum {
+            // The drum voice pick, applied live. Deliberately not latched as an intent: a
+            // finger that goes on to reach the next pad has to still be able to become a
+            // sweep, and the sweep has to keep the voice that travel just picked. That is
+            // also why the pick is what the release has to know about — the lift of a drag
+            // that already chose a voice must not toggle the hit back off.
+            applyDrumVoice(gesture)
+        } else if !sideways {
+            intent = .scrubbing
+            scrubPitch(gesture)
+        }
+    }
+
+    private func finish(_ gesture: DragGesture.Value) {
+        let heldFor = gesture.time.timeIntervalSince(touchBeganAt ?? gesture.time)
+        let settled = intent
+        let step = originStep
+        let startedEmpty = originWasEmpty
+        let alreadyEdited = appliedValue
+        resetTouch()
+        onScrub(nil)
+
+        switch settled {
+        case .sweeping:
+            onSweepEnd()
+        case .scrubbing:
+            break
+        case .undecided:
+            // A drum drag that picked a voice has already written to its pad. Toggling here
+            // would delete the hit the drag just chose, which made a voice pick look like an
+            // eraser.
+            guard let step, !alreadyEdited else { return }
+            if heldFor >= Self.linkHoldDuration, channel != .drum, !startedEmpty {
+                // Held still, then lifted: arm the link. Deciding this on release is
+                // what stops the arm from firing partway through a drag.
+                onArmLink(step)
+            } else {
+                onToggle(step)
+            }
+        }
+    }
+
+    private func begin(_ gesture: DragGesture.Value) {
+        touchBeganAt = gesture.time
+        intent = .undecided
+        lastApplied = nil
+        appliedValue = false
+        sweptSteps = []
+        let start = step(at: gesture.startLocation) ?? step(at: gesture.location)
+        originStep = start
+        originNote = start.flatMap(note) ?? rootNote
+        originWasEmpty = start.map { note($0) == nil } ?? true
+    }
+
+    private func resetTouch() {
+        intent = .undecided
+        touchBeganAt = nil
+        originStep = nil
+        originNote = nil
+        lastApplied = nil
+        appliedValue = false
+        live = nil
+    }
+
+    /// Vertical travel sets the pitch, from the note the step held when the drag
+    /// began. The tap slop is discarded first, so the first semitone lands only once
+    /// the finger has clearly committed instead of jumping the moment the drag is
+    /// recognised.
+    private func scrubPitch(_ gesture: DragGesture.Value) {
+        guard let step = originStep else { return }
+        let start = originNote ?? rootNote
+        let dy = gesture.translation.height
+        let travel = dy < 0 ? dy + Self.tapSlop : dy - Self.tapSlop
+        let semitones = Int((-travel / Self.pointsPerSemitone).rounded())
+        let value = snap(min(96, max(24, start + semitones)))
+        guard value != lastApplied else { return }
+        lastApplied = value
+        onSetNote(step, value)
+        live = (step, PadLiveReadout(value: noteName(value), detail: pitchDetail(step: step, from: start, to: value)))
+        onScrub("PITCH \(noteName(value))")
+        Haptics.selection()
+    }
+
+    /// The small line under the live pitch: which pad is being edited, and how far the drag
+    /// has taken it, so "up is higher" needs no explaining.
+    private func pitchDetail(step: Int, from start: Int, to value: Int) -> String {
+        let amount = value - start
+        guard amount != 0 else { return "STEP \(step + 1)" }
+        return "STEP \(step + 1)  •  \(amount > 0 ? "+" : "")\(amount)"
+    }
+
+    /// The drum row's voice pick, unchanged in behaviour: the direction of the drag
+    /// chooses the voice.
+    private func applyDrumVoice(_ gesture: DragGesture.Value) {
+        guard channel == .drum, let step = originStep else { return }
+        let voice = ByteDrumVoice.voice(
+            horizontal: Int(gesture.translation.width),
+            vertical: Int(gesture.translation.height)
+        ).rawValue
+        guard voice != lastApplied else { return }
+        lastApplied = voice
+        appliedValue = true
+        onSetDrum(step, voice)
+        let title = ByteDrumVoice.allCases[min(3, max(0, voice))].title
+        live = (step, PadLiveReadout(value: title, detail: "STEP \(step + 1)"))
+        onScrub("VOICE \(title)")
+        Haptics.selection()
+    }
+
+    /// The value a run paints: whatever the origin pad is holding, so dragging away from a
+    /// note repeats *that* note instead of stamping the channel's root note across a melody
+    /// that was already there. An empty origin pad has no value to carry, and nil lets the
+    /// store supply the channel's own default.
+    ///
+    /// On the drum row this is read after the sideways travel has already picked a voice on
+    /// the origin pad, so a rightward drag on an empty drum row lays down the voice it picked
+    /// rather than a run of kicks.
+    private func valueForSweep() -> Int? {
+        guard let step = originStep else { return nil }
+        return note(step)
+    }
+
+    private func extendSweep(_ gesture: DragGesture.Value) {
+        guard let here = step(at: gesture.location), !sweptSteps.contains(here) else { return }
+        sweptSteps.insert(here)
+        onSweepExtend(here)
+        let count = sweptSteps.count
+        // Reported on the hint line rather than on a pad: mid-run the pads carry the paint
+        // itself, and covering one with a readout would hide what the drag just did.
+        onScrub("\(sweepingPaints ? "PAINTING" : "CLEARING") \(count) \(count == 1 ? "STEP" : "STEPS")")
     }
 }
 
 private struct RestoredDrumEditor: View {
     let accent: Color
     let patch: ByteChannelPatch
+    /// The project tempo. The run is spaced by the transport's own step so it is heard in the
+    /// time of the loop it belongs to, not at an interval of its own.
+    let tempo: Int
+    /// This pattern's drum row, so the kit can be heard in the music and not only in isolation.
+    let drumHits: [ByteDrumHit]
     let volume: (ByteDrumVoice) -> Int
     let onSelectSample: (ByteDrumVoice, Int) -> Void
     let onVolumeChange: (ByteDrumVoice, Int) -> Void
+    /// Plays one voice through the engine, so a tap here is heard where the pads are heard.
+    let onAudition: (ByteDrumVoice) -> Void
+    /// Set while the run is playing, so the row that is sounding can light.
+    @State private var sounding: ByteDrumVoice?
+    @State private var runTask: Task<Void, Never>?
+    @State private var flashTask: Task<Void, Never>?
+    /// Which of the two checks is playing. Held separately from `runTask` so each control lights
+    /// for its own run rather than both looking busy whenever either one is.
+    @State private var runningCheck: Check?
+
+    private enum Check { case kitWalk, drumRow }
 
     var body: some View {
-        LCDPanel(title: "DRUM KIT / VOICE MIX · DRUM FADER = MASTER") {
+        LCDPanel(title: "DRUM KIT / VOICE MIX", header: {
+            RestoredAuditionButton(
+                identifier: "drumKit.auditionAll",
+                label: "Hear all four drum voices",
+                hint: "Plays the kit from the floor up, one voice per beat in time with the tempo.",
+                running: runningCheck == .kitWalk
+            ) { runKitCheck(ByteDrumVoice.auditionWalk, kind: .kitWalk) }
+        }) {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 6) {
-                    Text("VOICE")
+                    Text("VOICE / CHARACTER")
                         .font(.custom("Futura-Bold", size: 8))
                     Spacer()
                     Text("SAMPLE")
@@ -2112,15 +2578,145 @@ private struct RestoredDrumEditor: View {
                         accent: accent,
                         sample: patch.drumSamples.indices.contains(voice.rawValue) ? patch.drumSamples[voice.rawValue] : 1,
                         volume: volume(voice),
+                        sounding: sounding == voice,
                         onSelectSample: { onSelectSample(voice, $0) },
-                        onVolumeChange: { onVolumeChange(voice, $0) }
+                        onVolumeChange: { onVolumeChange(voice, $0) },
+                        onAudition: { audition(voice) }
                     )
                 }
-                Text("TAP SAMPLE 1 OR 2. SWIPE LEFT / RIGHT ON A VOICE TO MIX IT. DRAG THE BEAT PAD UP, DOWN, LEFT, OR RIGHT TO CHOOSE KICK, SNARE, PERC, OR HI-HAT.")
+                RestoredAuditionButton(
+                    title: "HEAR THIS PATTERN'S DRUM ROW",
+                    identifier: "drumKit.patternCheck",
+                    label: "Hear this pattern's drum row",
+                    hint: drumHits.isEmpty
+                        ? "The drum row is empty. Tap some drum pads to write one first."
+                        : "Plays this pattern's drum row in time, so the kit is heard in the music.",
+                    running: runningCheck == .drumRow,
+                    enabled: !drumHits.isEmpty
+                ) { runKitCheck(drumHits, kind: .drumRow) }
+                Text(hint)
                     .font(.custom("Futura-Bold", size: 8))
                     .foregroundStyle(Color.gbInk.opacity(0.68))
             }
         }
+        .onDisappear {
+            runTask?.cancel()
+            runningCheck = nil
+        }
+    }
+
+    /// The panel's instructions. The drum-row half changes when the row is empty, because a
+    /// dimmed button with nothing to explain it reads as broken rather than as unarmed.
+    private var hint: String {
+        let rowHalf = drumHits.isEmpty
+            ? "TO CHECK A DRUM ROW HERE, WRITE ONE ON THE BEAT PAD FIRST."
+            : "THE DRUM ROW BUTTON PLAYS THE BAR YOU WROTE, IN TIME."
+        return "TAP A VOICE TO HEAR IT. ▶ PLAYS ALL FOUR, ONE PER BEAT. \(rowHalf) TAP SAMPLE 1 / 2 TO CHOOSE ITS HIT. SWIPE A VOICE TO MIX IT. ON THE BEAT PAD, DRAG UP FOR SNARE, DOWN FOR KICK, LEFT FOR HI-HAT, RIGHT FOR PERC."
+    }
+
+    /// Hears one voice, and lights its row while it sounds so the ear and the eye agree about
+    /// which voice that was. A tap here takes over from a run in progress rather than playing
+    /// under it.
+    private func audition(_ voice: ByteDrumVoice) {
+        runTask?.cancel()
+        runTask = nil
+        runningCheck = nil
+        onAudition(voice)
+        flashTask?.cancel()
+        sounding = voice
+        flashTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(0.35))
+            if !Task.isCancelled { sounding = nil }
+        }
+    }
+
+    /// Plays a kit check: one hit per step of the bar, lighting the voice's row as it sounds.
+    ///
+    /// Both checks go through here — the walk up the kit, and this pattern's drum row — because
+    /// they are the same walk over the same bar. Two runners is how two halves of one idea come
+    /// apart, and the tempo is the half that would go first.
+    ///
+    /// The hits play through the audition path rather than the transport, which is also what
+    /// gives the check the sequence's own voice: the transport plays the drum row from a single
+    /// sample position that each hit resets, so a check whose one-shots overlapped would sound
+    /// fuller than the music it exists to represent. The task is held so a second tap restarts
+    /// the run instead of layering a pass over it.
+    private func runKitCheck(_ hits: [ByteDrumHit], kind: Check) {
+        runTask?.cancel()
+        // A flash left over from a tap must not clear the run's highlight a beat into it.
+        flashTask?.cancel()
+        let stepSeconds = ByteTransportClock.stepDuration(bpm: tempo)
+        runningCheck = kind
+        runTask = Task { @MainActor in
+            var next = 0
+            for step in 0..<BytePattern.barSteps {
+                // Return rather than break: a cancelled run must not write the state a newer one
+                // has already claimed as its own.
+                if Task.isCancelled { return }
+                if next < hits.count, hits[next].step == step {
+                    let voice = hits[next].voice
+                    sounding = voice
+                    onAudition(voice)
+                    next += 1
+                }
+                do { try await Task.sleep(for: .seconds(stepSeconds)) } catch { return }
+            }
+            sounding = nil
+            runningCheck = nil
+            runTask = nil
+        }
+    }
+}
+
+/// A kit check's transport control, in the gradient the Sound Lab's randomizer and the panel
+/// headers use. It changes colour while its own run plays, so a tap that started a pass is
+/// visible without a label to read.
+///
+/// `title` is nil for the 34×30 header slot, where the glyph carries the meaning on its own, and
+/// set for the full-width button under the voice rows, where there is room to say what it plays.
+private struct RestoredAuditionButton: View {
+    var title: String? = nil
+    let identifier: String
+    let label: String
+    let hint: String
+    let running: Bool
+    var enabled = true
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: running ? "waveform" : "play.fill")
+                    .font(.system(size: 13, weight: .black))
+                if let title {
+                    Text(title)
+                        .font(.custom("Futura-Bold", size: 10))
+                        .tracking(0.6)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                }
+            }
+            .foregroundStyle(Color.gbInk)
+            .frame(width: title == nil ? 34 : nil, height: title == nil ? 30 : 36)
+            .frame(maxWidth: title == nil ? nil : .infinity)
+            .background(
+                LinearGradient(
+                    colors: [(running ? Color.amber : Color.gbGlow), (running ? Color.linkedOrange : Color.gbGlow).opacity(0.7)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(Color.gbInk, lineWidth: 1.5))
+            .shadow(color: running ? Color.amber.opacity(0.7) : .clear, radius: running ? 6 : 0)
+            .opacity(enabled ? 1 : 0.4)
+        }
+        .buttonStyle(ArcadePressStyle(scale: 0.88))
+        .disabled(!enabled)
+        .accessibilityIdentifier(identifier)
+        .accessibilityLabel(label)
+        .accessibilityValue(running ? "playing" : (enabled ? "idle" : "empty"))
+        .accessibilityHint(hint)
     }
 }
 
@@ -2129,24 +2725,36 @@ private struct RestoredDrumVoiceRow: View {
     let accent: Color
     let sample: Int
     let volume: Int
+    /// Whether the voice is sounding on its own right now, from the audition run.
+    let sounding: Bool
     let onSelectSample: (Int) -> Void
     let onVolumeChange: (Int) -> Void
+    let onAudition: () -> Void
     @State private var startVolume: Int?
     @State private var lastVolume: Int?
 
     var body: some View {
         GeometryReader { proxy in
             ZStack(alignment: .leading) {
-                voiceColor.opacity(0.16)
+                voiceColor.opacity(sounding ? 0.42 : 0.16)
                 voiceColor.opacity(0.72)
                     .animation(.easeOut(duration: 0.12), value: volume)
                     .frame(width: proxy.size.width * CGFloat(volume) / 100.0)
                 HStack(spacing: 5) {
-                    Text(voice.title)
-                        .font(.custom("Futura-Bold", size: 8))
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(voice.title)
+                            .font(.custom("Futura-Bold", size: 8))
+                        // What the voice's shape does to its sample, so the ear knows what it is
+                        // listening for instead of having to infer it from four similar hits.
+                        Text(voice.character)
+                            .font(.custom("Futura-Bold", size: 7))
+                            .lineLimit(1)
+                            .foregroundStyle(Color.gbInk.opacity(0.62))
+                    }
                     Text("\(volume)%")
                         .font(.custom("Futura-Bold", size: 8))
                     Spacer(minLength: 2)
+                    DrumVoiceSparkline(envelope: envelope, widthFraction: waveWidthFraction)
                     ForEach(1...2, id: \.self) { variant in
                         Button { onSelectSample(variant) } label: {
                             Text("\(variant)")
@@ -2163,8 +2771,14 @@ private struct RestoredDrumVoiceRow: View {
                 .padding(.horizontal, 7)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .overlay(Rectangle().stroke(Color.gbInk.opacity(0.4), lineWidth: 1))
+            .overlay(Rectangle().stroke(sounding ? Color.amber : Color.gbInk.opacity(0.4), lineWidth: sounding ? 2 : 1))
             .contentShape(Rectangle())
+            // A row is its own preview: the fastest way to know what a voice is called is to
+            // hear it. The volume swipe needs 8pt of travel, so a tap still reads as a tap.
+            // A row is its own preview: the fastest way to know what a voice is called is to
+            // hear it. The volume swipe needs 8pt of travel, so a tap still reads as a tap —
+            // the same pairing the mixer faders use.
+            .onTapGesture { onAudition() }
             .simultaneousGesture(
                 DragGesture(minimumDistance: 8)
                     .onChanged { gesture in
@@ -2179,19 +2793,84 @@ private struct RestoredDrumVoiceRow: View {
             )
         }
         .frame(height: 42)
+        .animation(.easeOut(duration: 0.12), value: sounding)
         .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("drumVoice.\(voice.rawValue)")
+        .accessibilityLabel("\(voice.title) voice")
+        .accessibilityValue("\(voice.character), \(volume)%\(sounding ? ", sounding" : "")")
+        .accessibilityHint("Tap to hear it. Swipe left or right to set its level. Tap 1 or 2 to choose the sample.")
     }
 
-    private var voiceColor: Color {
-        switch voice {
-        case .kick: return .drumKick
-        case .snare: return .drumSnare
-        case .hiHat: return .drumPerc
-        case .perc: return .drumHiHat
-        }
+    /// The mixer row and the pad share one mapping, so the swatch beside a voice
+    /// cannot disagree with the pads holding it.
+    private var voiceColor: Color { voice.padColor }
+
+    /// The voice's outline, taken from the sample the row has selected — so switching 1 / 2
+    /// changes the picture as well as the sound it stands for.
+    private var envelope: [Double] {
+        ByteDrumSampleBank.shared.envelope(voice: voice, variant: sample)
+    }
+
+    /// How much of the sparkline's slot this voice fills: its length against the longest hit in
+    /// the kit, which is what makes a click look like a stub beside a full tail.
+    private var waveWidthFraction: Double {
+        let bank = ByteDrumSampleBank.shared
+        let longest = bank.longestOutputFrameCount(variant: sample)
+        return min(1, max(0, Double(bank.outputFrameCount(voice: voice, variant: sample)) / Double(longest)))
     }
 }
 
+/// One voice's shaped hit, drawn as the outline it is heard as.
+///
+/// The points come from the reader playback uses, and the drawn width is this voice's length
+/// against the longest hit in the kit — so the row says "TIGHTER · CLICK" in words and shows a
+/// stub beside the kick's full tail, rather than four pictures that each fill their own box.
+private struct DrumVoiceSparkline: View {
+    let envelope: [Double]
+    /// How much of the slot the hit fills, from 0 to 1.
+    let widthFraction: Double
+
+    /// A fixed slot, so the four rows line up and the lengths can be compared between them.
+    private static let slotWidth: CGFloat = 46
+    private static let slotHeight: CGFloat = 18
+
+    var body: some View {
+        DrumVoiceWave(envelope: envelope)
+            .fill(Color.gbInk.opacity(0.72))
+            .frame(width: max(1, Self.slotWidth * CGFloat(min(1, max(0, widthFraction)))), height: Self.slotHeight)
+            .frame(width: Self.slotWidth, height: Self.slotHeight, alignment: .leading)
+            .background(Color.gbInk.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+            // The row's value already names the shape; the picture is the same fact in another
+            // form, so it would only repeat itself to a reader who cannot see it.
+            .accessibilityHidden(true)
+    }
+}
+
+/// A hit's outline, mirrored about the middle of its rect so it reads as a waveform rather than
+/// as a mountain.
+private struct DrumVoiceWave: Shape {
+    let envelope: [Double]
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        guard envelope.count > 1, rect.width > 0, rect.height > 0 else { return path }
+        let middle = rect.midY
+        let half = rect.height / 2
+        let step = rect.width / CGFloat(envelope.count - 1)
+
+        func point(_ index: Int, above: Bool) -> CGPoint {
+            let level = CGFloat(min(1, max(0, envelope[index]))) * half
+            return CGPoint(x: rect.minX + CGFloat(index) * step, y: above ? middle - level : middle + level)
+        }
+
+        path.move(to: point(0, above: true))
+        for index in envelope.indices { path.addLine(to: point(index, above: true)) }
+        for index in envelope.indices.reversed() { path.addLine(to: point(index, above: false)) }
+        path.closeSubpath()
+        return path
+    }
+}
 
 private struct RestoredPatchCard: View {
     let parameter: BytePatchParameter
