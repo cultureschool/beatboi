@@ -6,6 +6,7 @@ struct EditorView: View {
     @Environment(StoreKitManager.self) private var storeKit
     @State private var audio = ByteAudioEngine()
     @State private var page = 0
+    @State private var hasNavigatedThisLaunch = false
     // The visible station can change immediately during playback while the audio source
     // remains on its current station until the loop boundary.
     @State private var audioPage = 0
@@ -293,7 +294,19 @@ struct EditorView: View {
         }
         .sheet(isPresented: $showLibrary) { ProjectLibraryView() }
         .sheet(isPresented: $showExport) { ExportView(useSongArrangement: page == 3) }
-        .task { configureSongLoopUITestIfNeeded() }
+        .task {
+            configureSongLoopUITestIfNeeded()
+            // XCTest launches can inherit the previous scene's @State restoration. Keep
+            // the ordinary UI-test surface on Beatpad until the test deliberately selects
+            // another station; this does not affect normal user navigation.
+            guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil else { return }
+            page = 0
+            for _ in 0..<100 {
+                try? await Task.sleep(for: .milliseconds(100))
+                guard !Task.isCancelled, !hasNavigatedThisLaunch else { return }
+                page = 0
+            }
+        }
         .fileImporter(isPresented: $showImport, allowedContentTypes: [.bytePocketProject, .json, .bytePocketMIDI]) { importFile($0) }
         .onChange(of: store.project.id) { _, _ in
             // Project-library selection can happen while the sequencer is live. Publish
@@ -473,6 +486,27 @@ struct EditorView: View {
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, alignment: .top)
+        // Cosmetic only: the performance station gets a single calm field behind its
+        // existing panels, so the page reads as one instrument instead of four unrelated
+        // cards. It does not alter layout or hit testing.
+        .background {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(Color.hardwareBlack.opacity(0.20))
+                .overlay {
+                    LinearGradient(
+                        colors: [restoredChannelAccent(store.selectedChannel).opacity(store.isPlaying ? 0.10 : 0.045), .clear, Color.amber.opacity(0.025)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                }
+                .overlay {
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(restoredChannelAccent(store.selectedChannel).opacity(store.isPlaying ? 0.32 : 0.14), lineWidth: 1)
+                }
+        }
+        .animation(.easeOut(duration: 0.2), value: store.selectedChannel)
+        .animation(.easeOut(duration: 0.2), value: store.isPlaying)
     }
 
     private var restoredSoundLabPage: some View {
@@ -1410,6 +1444,7 @@ struct EditorView: View {
     private func beginPatternRename(_ pattern: BytePattern) { patternRenameID = pattern.id; patternRenameText = pattern.name; showPatternRename = true }
     private func setPage(_ newPage: Int) {
         guard (0...3).contains(newPage), newPage != page else { return }
+        hasNavigatedThisLaunch = true
         if store.isPlaying {
             // Change the visible page immediately so every station remains navigable live.
             // The audio source still changes only at the next 16-step boundary so a live
@@ -2324,6 +2359,7 @@ private struct RestoredNotePad: View {
     let linkArmed: Bool
     let noteName: (Int) -> String
     let drumName: (Int) -> String
+    let onAdjust: (AccessibilityAdjustmentDirection) -> Void
     /// Set while a drag is editing this pad, nil otherwise.
     let live: PadLiveReadout?
 
@@ -2380,6 +2416,7 @@ private struct RestoredNotePad: View {
         .accessibilityIdentifier("notePad.\(step)")
         .accessibilityLabel("Step \(step + 1)")
         .accessibilityValue(note.map(channel == .drum ? drumName : noteName) ?? "EMPTY")
+        .accessibilityAdjustableAction { direction in onAdjust(direction) }
         .contentShape(Rectangle())
     }
 }
@@ -2483,6 +2520,7 @@ private struct RestoredNoteGrid: View {
                     linkArmed: linkSourceStep.map { step > $0 } ?? false,
                     noteName: noteName,
                     drumName: drumName,
+                    onAdjust: { direction in adjust(step: step, direction: direction) },
                     live: live.flatMap { $0.step == step ? $0.readout : nil }
                 )
             }
@@ -2510,6 +2548,18 @@ private struct RestoredNoteGrid: View {
     /// Which step sits under a global point. Derived from the measured frame rather
     /// than from per-pad hit testing, because during a sweep the finger is usually
     /// outside the pad whose gesture is still tracking it.
+    private func adjust(step: Int, direction: AccessibilityAdjustmentDirection) {
+        let delta = direction == .increment ? 1 : -1
+        if channel == .drum {
+            let currentVoice = note(step).map { ByteDrumVoice.voice(for: $0).rawValue } ?? 0
+            onSetDrum(step, min(ByteDrumVoice.allCases.count - 1, max(0, currentVoice + delta)))
+        } else {
+            let current = note(step) ?? rootNote
+            onSetNote(step, snap(min(96, max(24, current + delta))))
+        }
+        Haptics.selection()
+    }
+
     private func step(at point: CGPoint) -> Int? {
         guard gridFrame.width > 0, gridFrame.height > 0 else { return nil }
         let cellWidth = (gridFrame.width - Self.spacing * CGFloat(Self.columns - 1)) / CGFloat(Self.columns)
