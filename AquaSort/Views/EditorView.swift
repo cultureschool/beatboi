@@ -464,12 +464,22 @@ struct EditorView: View {
             }
         }
         .padding(12)
-        .background(
-            LinearGradient(colors: [Color.plasticRaised.opacity(0.92), Color.hardwareBlack.opacity(0.96)], startPoint: .topLeading, endPoint: .bottomTrailing)
-        )
+        .background {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.surface.opacity(0.96))
+                .overlay(alignment: .leading) {
+                    Rectangle()
+                        .fill(store.isPlaying ? Color.arcadeRed : Color.amber)
+                        .frame(width: 3)
+                        .padding(.vertical, 10)
+                }
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(Color.hairline, lineWidth: 1)
+                }
+        }
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.plasticHighlight.opacity(0.8), lineWidth: 1))
-        .overlay(alignment: .bottom) { Rectangle().fill(Color.amber.opacity(0.72)).frame(height: 2).padding(.horizontal, 10) }
+        .overlay(alignment: .bottom) { Rectangle().fill(store.isPlaying ? Color.arcadeRed.opacity(0.72) : Color.amber.opacity(0.52)).frame(height: 2).padding(.horizontal, 14) }
     }
 
     private var restoredBeatpadPage: some View {
@@ -479,8 +489,9 @@ struct EditorView: View {
                 restoredConsole
             }
             restoredVoicing
-            // The mixer cards are the Beatpad channel selectors. Tapping a card selects
-            // its pad row; swiping horizontally on that same card changes its volume.
+            // The existing mixer remains the stable interaction surface for the grid
+            // helpers; the surrounding hero field supplies the new hierarchy without
+            // changing its hit geometry.
             restoredChannelMixer
             restoredPadEditor
             Spacer(minLength: 0)
@@ -697,11 +708,11 @@ struct EditorView: View {
         .padding(8)
         .frame(height: 54)
         .background(
-            LinearGradient(colors: [Color.plasticRaised.opacity(0.98), Color.hardwareBlack.opacity(0.98)], startPoint: .top, endPoint: .bottom)
+            LinearGradient(colors: [Color.surfaceRaised.opacity(0.88), Color.canvas.opacity(0.98)], startPoint: .top, endPoint: .bottom)
         )
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.plasticHighlight.opacity(0.78), lineWidth: 1))
-        .overlay(alignment: .top) { Rectangle().fill(Color.plasticHighlight.opacity(0.42)).frame(height: 1).padding(.horizontal, 14) }
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.hairline, lineWidth: 1))
+        .overlay(alignment: .top) { Rectangle().fill(Color.amber.opacity(0.42)).frame(height: 1).padding(.horizontal, 14) }
         .accessibilityElement(children: .contain)
     }
 
@@ -905,6 +916,35 @@ struct EditorView: View {
         .background(Color.plasticRaised.opacity(0.42))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.plasticHighlight.opacity(0.55), lineWidth: 1))
+    }
+
+    private var beatpadChannelStrip: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("PARTS")
+                    .font(.custom("Futura-Bold", size: 9))
+                    .tracking(1.2)
+                    .foregroundStyle(Color.gbLight)
+                Text("SELECT A CHANNEL")
+                    .font(.custom("Futura-Medium", size: 8))
+                    .foregroundStyle(Color.mutedText)
+                Spacer()
+                Text("SWIPE TO MIX")
+                    .font(.custom("Futura-Bold", size: 7))
+                    .foregroundStyle(Color.mutedText)
+            }
+            HStack(spacing: 5) {
+                ForEach(ByteChannel.allCases) { channel in
+                    BeatpadPartTab(
+                        channel: channel,
+                        selected: channel == store.selectedChannel,
+                        accent: restoredChannelAccent(channel),
+                        onSelect: { store.selectedChannel = channel; store.selectedStep = nil }
+                    )
+                }
+            }
+        }
+        .padding(.horizontal, 2)
     }
 
     private var restoredChannelMixer: some View {
@@ -1816,9 +1856,13 @@ private struct RestoredPageButton: View {
                 .minimumScaleFactor(0.72)
                 .foregroundStyle(selected ? Color.gbInk : Color.gbLight.opacity(0.82))
                 .frame(maxWidth: .infinity, minHeight: 46)
-                .background(selected ? Color.amber : Color.clear)
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(selected ? Color.gbInk : Color.plasticHighlight.opacity(0.45), lineWidth: selected ? 2 : 1))
+                .background {
+                    Rectangle()
+                        .fill(selected ? Color.amber : Color.clear)
+                        .overlay(alignment: .bottom) {
+                            Rectangle().fill(selected ? Color.gbInk : Color.plasticHighlight.opacity(0.45)).frame(height: selected ? 2 : 1)
+                        }
+                }
         }
         .buttonStyle(ArcadePressStyle())
     }
@@ -1912,6 +1956,28 @@ private struct RestoredChoiceBox: View {
     @State private var start: Int?
     @State private var last: Int?
     var body: some View { HStack(spacing: 4) { VStack(alignment: .leading, spacing: 1) { Text(title).font(.custom("Futura-Bold", size: 8)); Text(value).font(.custom("Futura-Bold", size: 9)).lineLimit(1) }; Spacer(); Image(systemName: "arrow.left.and.right").font(.system(size: 9, weight: .black)) }.foregroundStyle(Color.gbInk).padding(.horizontal, 9).frame(maxWidth: .infinity, minHeight: 44).background(title == "KEY" ? Color.amber : Color.gbGlow).overlay(Rectangle().stroke(Color.gbInk, lineWidth: 2)).gesture(DragGesture(minimumDistance: 0).onChanged { gesture in if start == nil { start = index }; guard !values.isEmpty else { return }; let offset = Int((gesture.translation.width / 20).rounded()); let selected = min(max((start ?? index) + offset, 0), values.count - 1); if selected != last { last = selected; onSelect(selected) } }.onEnded { _ in start = nil; last = nil }) }
+}
+
+private struct BeatpadPartTab: View {
+    let channel: ByteChannel
+    let selected: Bool
+    let accent: Color
+    let onSelect: () -> Void
+
+    var body: some View {
+        Text(channel.title)
+            .font(.custom("Futura-Bold", size: 8))
+            .foregroundStyle(selected ? Color.gbInk : Color.mutedText)
+            .frame(maxWidth: .infinity)
+            .frame(height: 34)
+            .background(selected ? accent : Color.surface)
+            .overlay(alignment: .bottom) { Rectangle().fill(accent).frame(height: 2) }
+            .contentShape(Rectangle())
+            .onTapGesture(perform: onSelect)
+            .accessibilityIdentifier("channelFader.\(channel.rawValue)")
+            .accessibilityLabel("\(channel.title) channel")
+            .accessibilityAddTraits(selected ? .isSelected : [])
+    }
 }
 
 private struct RestoredChannelFader: View {

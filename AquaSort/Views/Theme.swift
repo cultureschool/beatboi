@@ -38,6 +38,13 @@ extension Color {
     static let screenShadow = Color(red: 0.25, green: 0.36, blue: 0.26)
     static let panelLine = Color.white.opacity(0.12)
     static let panelInset = Color.black.opacity(0.26)
+
+    // Studio surface tokens: fewer competing borders, clearer depth, and one focused accent.
+    static let canvas = Color(red: 0.028, green: 0.032, blue: 0.038)
+    static let surface = Color(red: 0.075, green: 0.088, blue: 0.098)
+    static let surfaceRaised = Color(red: 0.12, green: 0.135, blue: 0.145)
+    static let hairline = Color.white.opacity(0.11)
+    static let shadow = Color.black.opacity(0.42)
 }
 
 extension ByteDrumVoice {
@@ -61,7 +68,7 @@ struct PocketBackdrop: View {
     var body: some View {
         ZStack {
             LinearGradient(
-                colors: [Color(red: 0.08, green: 0.09, blue: 0.10), Color.plastic, Color(red: 0.025, green: 0.028, blue: 0.032)],
+                colors: [Color(red: 0.12, green: 0.095, blue: 0.075), Color.canvas, Color(red: 0.018, green: 0.022, blue: 0.028)],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
@@ -82,13 +89,13 @@ struct PocketBackdrop: View {
                 for y in stride(from: 0, through: size.height, by: 8) {
                     context.fill(
                         Path(CGRect(x: 0, y: y, width: size.width, height: 1)),
-                        with: .color(Color.white.opacity(0.018))
+                        with: .color(Color.white.opacity(0.012))
                     )
                 }
                 for x in stride(from: 0, through: size.width, by: 32) {
                     context.fill(
                         Path(CGRect(x: x, y: 0, width: 1, height: size.height)),
-                        with: .color(Color.black.opacity(0.045))
+                        with: .color(Color.black.opacity(0.032))
                     )
                 }
             }
@@ -126,35 +133,20 @@ struct ArcadeShell<Content: View>: View {
         content()
             .background(
                 ZStack {
-                    RoundedRectangle(cornerRadius: 22, style: .continuous)
-                        .fill(Color.plastic)
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(Color.canvas)
                     LinearGradient(
                         colors: [Color.white.opacity(0.045), Color.clear, Color.black.opacity(0.22)],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
                     )
-                    .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-                    RoundedRectangle(cornerRadius: 22, style: .continuous)
-                        .stroke(Color.hardwareEdge.opacity(0.72), lineWidth: 1.5)
-                    RoundedRectangle(cornerRadius: 19, style: .continuous)
-                        .stroke(Color.black.opacity(0.55), lineWidth: 1)
-                        .padding(3)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(Color.hairline, lineWidth: 1)
                 }
-                .shadow(color: Color.black.opacity(0.55), radius: 22, y: 14)
-                .overlay {
-                    RoundedRectangle(cornerRadius: 22, style: .continuous)
-                        .stroke(
-                            LinearGradient(
-                                colors: [Color.white.opacity(0.13), Color.clear, Color.black.opacity(0.32)],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            ),
-                            lineWidth: 1
-                        )
-                        .allowsHitTesting(false)
-                }
+                .shadow(color: Color.shadow, radius: 18, y: 10)
             )
-            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 }
 
@@ -200,26 +192,23 @@ struct HardwareSection<Content: View>: View {
                 .frame(height: 1)
             content()
         }
-        .padding(11)
-                .background(
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 16, style: .continuous)
-                            .fill(
-                                LinearGradient(
-                                    colors: [Color.panelSurfaceLight.opacity(0.48), Color.panelSurface.opacity(0.88), Color.hardwareBlack.opacity(0.30)],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
-                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                        RoundedRectangle(cornerRadius: 16, style: .continuous)
-                            .stroke(Color.hardwareEdge.opacity(0.62), lineWidth: 1)
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .stroke(Color.hardwareBlack.opacity(0.8), lineWidth: 1)
-                            .padding(3)
-                    }
-                )
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .padding(12)
+        .background {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.surface.opacity(0.92))
+                .overlay(alignment: .leading) {
+                    Rectangle()
+                        .fill(Color.amber.opacity(0.78))
+                        .frame(width: 3)
+                        .clipShape(RoundedRectangle(cornerRadius: 2, style: .continuous))
+                        .padding(.vertical, 12)
+                }
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(Color.hairline, lineWidth: 1)
+                }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(alignment: .bottom) {
             LinearGradient(
                 colors: [Color.amber.opacity(0.7), Color.amber.opacity(0.08), Color.clear],
@@ -230,7 +219,7 @@ struct HardwareSection<Content: View>: View {
             .padding(.horizontal, 18)
             .allowsHitTesting(false)
         }
-        .shadow(color: Color.black.opacity(0.34), radius: 5, y: 4)
+        .shadow(color: Color.shadow.opacity(0.6), radius: 8, y: 5)
     }
 }
 
@@ -275,25 +264,24 @@ struct LCDPanel<Content: View, Header: View>: View {
         .padding(11)
         .background(
             ZStack {
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .fill(Color.screen)
                 LinearGradient(
                     colors: [Color.white.opacity(0.32), Color.clear, Color.screenShadow.opacity(0.14)],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
                 )
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .stroke(Color.screenShadow.opacity(0.22), lineWidth: 1)
-                    .padding(3)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color.screenShadow.opacity(0.28), lineWidth: 1)
             }
         )
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         // Faint dot-matrix scanlines sit above the content so the panel reads as a
         // real LCD screen. Opacity is kept low so text and controls stay crisp.
         .overlay(
             LCDScreenTexture()
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         )
         // Soft glass sheen: light catches the top edge of the screen glass.
         .overlay(alignment: .top) {
@@ -308,8 +296,8 @@ struct LCDPanel<Content: View, Header: View>: View {
             .accessibilityHidden(true)
         }
         .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(Color.gbInk.opacity(0.78), lineWidth: 1.5)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.gbInk.opacity(0.72), lineWidth: 1)
         )
         .overlay(alignment: .topLeading) {
             Capsule()
@@ -386,14 +374,14 @@ struct PixelButton: View {
             .frame(minWidth: 44, minHeight: 44)
             .background(
                 ZStack {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .fill(accent)
                     LinearGradient(colors: [Color.white.opacity(0.20), Color.clear, Color.black.opacity(0.12)], startPoint: .top, endPoint: .bottom)
                 }
             )
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .stroke(Color.gbInk, lineWidth: 1.5)
             )
             .shadow(color: Color.black.opacity(0.28), radius: 3, y: 2)
