@@ -1,8 +1,9 @@
-# BEATBOI — App Store Connect listing
+# BEATBOI DMG STUDIO — App Store Connect listing
 
 ## App identity
 
-- **App name:** BEATBOI
+- **App name:** BEATBOI DMG STUDIO
+- **Requested short name:** BEATBOI (Apple rejected this because the name is already used by another developer account.)
 - **Subtitle:** Make beats. Shape the sound.
 - **Primary category:** Music
 - **Secondary category:** Creativity
