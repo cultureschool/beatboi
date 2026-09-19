@@ -532,6 +532,14 @@ struct EditorView: View {
             restoredSoundLab
         }
         .frame(maxWidth: .infinity, alignment: .top)
+        .background {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(Color.squareAccent.opacity(0.035))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(Color.squareAccent.opacity(0.16), lineWidth: 1)
+                }
+        }
     }
 
     private var restoredFXPage: some View {
@@ -545,6 +553,14 @@ struct EditorView: View {
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, alignment: .top)
+        .background {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(Color.arcadePurple.opacity(0.07))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(Color.arcadePurple.opacity(0.22), lineWidth: 1)
+                }
+        }
     }
 
     private var restoredSongPage: some View {
@@ -561,6 +577,14 @@ struct EditorView: View {
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, alignment: .top)
+        .background {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(Color.drumAccent.opacity(0.045))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(Color.drumAccent.opacity(0.16), lineWidth: 1)
+                }
+        }
     }
 
     private var songTimelineReadout: some View {
@@ -935,11 +959,17 @@ struct EditorView: View {
             }
             HStack(spacing: 5) {
                 ForEach(ByteChannel.allCases) { channel in
-                    BeatpadPartTab(
+                    BeatpadPartTile(
                         channel: channel,
                         selected: channel == store.selectedChannel,
                         accent: restoredChannelAccent(channel),
-                        onSelect: { store.selectedChannel = channel; store.selectedStep = nil }
+                        volume: store.channelVolumePercent(channel),
+                        muted: store.isChannelMuted(channel),
+                        soloed: store.isChannelSoloed(channel),
+                        onSelect: { store.selectedChannel = channel; store.selectedStep = nil },
+                        onChange: { value in store.setChannelVolume(channel: channel, percent: value); requestPlaybackRefresh() },
+                        onToggleMute: { store.toggleChannelMute(channel); Haptics.toggle(); requestPlaybackRefresh() },
+                        onToggleSolo: { store.toggleChannelSolo(channel); Haptics.toggle(); requestPlaybackRefresh() }
                     )
                 }
             }
@@ -1958,25 +1988,64 @@ private struct RestoredChoiceBox: View {
     var body: some View { HStack(spacing: 4) { VStack(alignment: .leading, spacing: 1) { Text(title).font(.custom("Futura-Bold", size: 8)); Text(value).font(.custom("Futura-Bold", size: 9)).lineLimit(1) }; Spacer(); Image(systemName: "arrow.left.and.right").font(.system(size: 9, weight: .black)) }.foregroundStyle(Color.gbInk).padding(.horizontal, 9).frame(maxWidth: .infinity, minHeight: 44).background(title == "KEY" ? Color.amber : Color.gbGlow).overlay(Rectangle().stroke(Color.gbInk, lineWidth: 2)).gesture(DragGesture(minimumDistance: 0).onChanged { gesture in if start == nil { start = index }; guard !values.isEmpty else { return }; let offset = Int((gesture.translation.width / 20).rounded()); let selected = min(max((start ?? index) + offset, 0), values.count - 1); if selected != last { last = selected; onSelect(selected) } }.onEnded { _ in start = nil; last = nil }) }
 }
 
-private struct BeatpadPartTab: View {
+private struct BeatpadPartTile: View {
     let channel: ByteChannel
     let selected: Bool
     let accent: Color
+    let volume: Int
+    let muted: Bool
+    let soloed: Bool
     let onSelect: () -> Void
+    let onChange: (Int) -> Void
+    let onToggleMute: () -> Void
+    let onToggleSolo: () -> Void
+    @State private var start: Int?
+    @State private var last: Int?
 
     var body: some View {
-        Text(channel.title)
-            .font(.custom("Futura-Bold", size: 8))
-            .foregroundStyle(selected ? Color.gbInk : Color.mutedText)
-            .frame(maxWidth: .infinity)
-            .frame(height: 34)
-            .background(selected ? accent : Color.surface)
-            .overlay(alignment: .bottom) { Rectangle().fill(accent).frame(height: 2) }
-            .contentShape(Rectangle())
-            .onTapGesture(perform: onSelect)
-            .accessibilityIdentifier("channelFader.\(channel.rawValue)")
-            .accessibilityLabel("\(channel.title) channel")
-            .accessibilityAddTraits(selected ? .isSelected : [])
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 4) {
+                Circle().fill(selected ? accent : Color.mutedText).frame(width: 5, height: 5)
+                Text(channel.title).font(.custom("Futura-Bold", size: 7)).lineLimit(1).minimumScaleFactor(0.6)
+                Spacer(minLength: 0)
+                Text("\(volume)%").font(.custom("Futura-Bold", size: 7))
+            }
+            Rectangle().fill(accent.opacity(selected ? 0.9 : 0.36)).frame(height: 3)
+            HStack(spacing: 3) {
+                RestoredMiniMixerButton(title: "M", active: muted, accent: .arcadeRed, action: onToggleMute)
+                RestoredMiniMixerButton(title: "S", active: soloed, accent: .amber, action: onToggleSolo)
+                Spacer(minLength: 0)
+            }
+        }
+        .foregroundStyle(selected ? Color.gbLight : Color.mutedText)
+        .padding(6)
+        .frame(maxWidth: .infinity)
+        .frame(height: 70)
+        .background(selected ? accent.opacity(0.22) : Color.surface)
+        .overlay { RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(selected ? accent : Color.hairline, lineWidth: selected ? 1.5 : 1) }
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onSelect)
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 7)
+                .onChanged { gesture in
+                    if start == nil { start = volume; onSelect() }
+                    let proposed = min(100, max(0, (start ?? volume) + Int((gesture.translation.width / 1.2).rounded())))
+                    if proposed != last { last = proposed; onChange(proposed) }
+                }
+                .onEnded { _ in start = nil; last = nil }
+        )
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("channelFader.\(channel.rawValue)")
+        .accessibilityLabel("\(channel.title) channel")
+        .accessibilityValue("\(volume) percent\(muted ? ", muted" : "")\(soloed ? ", soloed" : "")")
+        .accessibilityHint("Tap to edit. Swipe left or right to change volume. Use M to mute or S to solo.")
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            case .increment: onChange(min(100, volume + 5))
+            case .decrement: onChange(max(0, volume - 5))
+            @unknown default: break
+            }
+        }
     }
 }
 
@@ -2568,27 +2637,30 @@ private struct RestoredNoteGrid: View {
     @State private var live: (step: Int, readout: PadLiveReadout)?
 
     var body: some View {
-        LazyVGrid(
-            columns: Array(repeating: GridItem(.flexible(), spacing: Self.spacing), count: Self.columns),
-            spacing: Self.spacing
-        ) {
-            ForEach(0..<(Self.columns * Self.rows), id: \.self) { step in
-                RestoredNotePad(
-                    step: step,
-                    note: note(step),
-                    length: length(step),
-                    covered: covered(step),
-                    channel: channel,
-                    accent: accent,
-                    current: step == currentStep,
-                    phase: currentStep,
-                    linkSource: linkSourceStep == step,
-                    linkArmed: linkSourceStep.map { step > $0 } ?? false,
-                    noteName: noteName,
-                    drumName: drumName,
-                    onAdjust: { direction in adjust(step: step, direction: direction) },
-                    live: live.flatMap { $0.step == step ? $0.readout : nil }
-                )
+        VStack(spacing: Self.spacing) {
+            ForEach(0..<Self.rows, id: \.self) { row in
+                HStack(spacing: Self.spacing) {
+                    ForEach(0..<Self.columns, id: \.self) { column in
+                        let step = row * Self.columns + column
+                        RestoredNotePad(
+                            step: step,
+                            note: note(step),
+                            length: length(step),
+                            covered: covered(step),
+                            channel: channel,
+                            accent: accent,
+                            current: step == currentStep,
+                            phase: currentStep,
+                            linkSource: linkSourceStep == step,
+                            linkArmed: linkSourceStep.map { step > $0 } ?? false,
+                            noteName: noteName,
+                            drumName: drumName,
+                            onAdjust: { direction in adjust(step: step, direction: direction) },
+                            live: live.flatMap { $0.step == step ? $0.readout : nil }
+                        )
+                        .frame(maxWidth: .infinity)
+                    }
+                }
             }
         }
         // The grid's own frame is what turns a touch into a step. Measured in global
