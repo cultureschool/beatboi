@@ -3911,6 +3911,13 @@ struct ExportPaywallView: View {
             .navigationTitle("EXPORT PACK")
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("CLOSE") { dismiss() } } }
         }
+        .task {
+            // Opening the paywall reconciles against the receipt too: a buyer whose
+            // purchase landed while the store read was lagging shows up here already
+            // unlocked instead of being asked to pay twice.
+            await storeKit.syncEntitlement()
+            if storeKit.hasReceiptEntitlement { store.setUnlocked(true) }
+        }
         .preferredColorScheme(.dark)
     }
 }

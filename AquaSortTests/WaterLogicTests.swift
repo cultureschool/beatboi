@@ -2914,6 +2914,25 @@ final class BeatboiTests: XCTestCase {
         XCTAssertFalse(manager.canExport)
     }
 
+    /// A revoked transaction is still "current" for a non-consumable, so the
+    /// entitlement rule has to read the revocation date, not merely the presence
+    /// of an entry. Without this, a refunded or Family-Sharing-removed Export
+    /// Pack would export forever.
+    func testRevokedExportPackTransactionDoesNotGrantEntitlement() {
+        let live = StoreKitManager.EntitlementEntry(productID: "exportunlock", revocationDate: nil)
+        let revoked = StoreKitManager.EntitlementEntry(productID: "exportunlock", revocationDate: Date())
+        let unrelated = StoreKitManager.EntitlementEntry(productID: "com.bytepocket.studio.export", revocationDate: nil)
+
+        XCTAssertFalse(StoreKitManager.isOwned(productID: "exportunlock", in: []), "no transactions means no entitlement")
+        XCTAssertTrue(StoreKitManager.isOwned(productID: "exportunlock", in: [live]), "an unrevoked purchase grants the pack")
+        XCTAssertFalse(StoreKitManager.isOwned(productID: "exportunlock", in: [revoked]), "a revocation must clear the pack")
+        XCTAssertFalse(StoreKitManager.isOwned(productID: "exportunlock", in: [unrelated]), "another product must not grant the pack")
+        XCTAssertTrue(
+            StoreKitManager.isOwned(productID: "exportunlock", in: [revoked, live]),
+            "a refund of one purchase must not revoke a later re-purchase"
+        )
+    }
+
     // MARK: - Step sweeps
 
     /// A sweep across several steps has to land as ONE undo step. The grid applies
