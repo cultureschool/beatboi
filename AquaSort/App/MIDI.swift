@@ -1,26 +1,12 @@
 import Foundation
 import UniformTypeIdentifiers
-import SwiftUI
 
 extension UTType {
     static let bytePocketMIDI = UTType(filenameExtension: "mid") ?? .data
 }
 
-struct ByteMIDIDocument: FileDocument {
-    static var readableContentTypes: [UTType] { [.bytePocketMIDI, .data] }
-    let data: Data
-
-    init(data: Data = Data()) { self.data = data }
-
-    init(configuration: ReadConfiguration) throws {
-        data = configuration.file.regularFileContents ?? Data()
-    }
-
-    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
-        FileWrapper(regularFileWithContents: data)
-    }
-}
-
+/// MIDI is import-only: the Export Pack covers WAV audio, and the app no longer offers a
+/// MIDI download, so there is no `FileDocument` wrapper for writing one out.
 enum ByteMIDI {
     /// A step is a sixteenth note — `ByteTransportClock.stepDuration` divides a quarter by
     /// four — while the header division counts ticks per **quarter** note. Deriving both from
@@ -29,6 +15,8 @@ enum ByteMIDI {
     private static let ticksPerQuarter = 480
     private static let ticksPerStep = ticksPerQuarter / 4
 
+    /// Kept for the import path's round-trip tests, which generate fixtures with it. The app
+    /// itself only ever reads MIDI in.
     static func export(project: ByteProject, patterns sourcePatterns: [BytePattern]? = nil) -> Data {
         let ticksPerStep = Self.ticksPerStep
         let patterns = sourcePatterns ?? project.arrangedPatterns

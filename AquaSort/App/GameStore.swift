@@ -348,7 +348,7 @@ final class GameStore {
     var canUndo: Bool { !undoStack.isEmpty }
     var canRedo: Bool { !redoStack.isEmpty }
 
-    /// The paid Export Pack adds MIDI/WAV export; all four classic channels are free.
+    /// The paid Export Pack adds WAV audio export; all four classic channels are free.
     var visibleChannels: [ByteChannel] { ByteChannel.allCases }
 
     func setUnlocked(_ value: Bool) {
@@ -1401,7 +1401,7 @@ final class GameStore {
     }
 
     func toggleEffect(_ effect: ByteEffect) {
-    // Sound design stays available in the core app; the Export Pack gates MIDI/WAV
+    // Sound design stays available in the core app; the Export Pack gates WAV
     // export without making the instrument editor paywalled.
         project.effects.toggle(effect)
         touch()

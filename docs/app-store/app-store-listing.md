@@ -41,7 +41,7 @@ BEATBOI includes:
 • Pattern banks, naming, duplication, and deletion.
 • Song arrangements up to 64 bars.
 • Project import and export.
-• MIDI and WAV export with the one-time Export Pack.
+• WAV export with the one-time Export Pack.
 • VoiceOver labels and adjustable controls for pads, parts, and parameters.
 • Offline-first project storage with no analytics or tracking.
 

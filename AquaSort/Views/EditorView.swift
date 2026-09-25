@@ -3742,10 +3742,8 @@ struct ExportView: View {
     @State private var showPaywall = false
     @State private var projectDocument = ByteProjectDocument()
     @State private var waveDocument = ByteWaveDocument()
-    @State private var midiDocument = ByteMIDIDocument()
     @State private var showProjectExporter = false
     @State private var showWaveExporter = false
-    @State private var showMIDIExporter = false
     @State private var exportProgress = 0.0
     @State private var isRenderingWave = false
     @State private var renderTask: Task<Void, Never>?
@@ -3759,18 +3757,13 @@ struct ExportView: View {
                         .foregroundStyle(Color.gbLight)
                         .multilineTextAlignment(.center)
                     exportButton("PROJECT FILE", "EDITABLE / REOPEN ANYTIME", "doc.fill", identifier: "export.project") { projectDocument = store.projectDocument(); showProjectExporter = true }
-                    exportButton("MIDI FILE", "4 CHANNELS / NOTE DATA", "pianokeys", locked: !storeKit.canExport, identifier: "export.midi") {
-                        guard storeKit.canExport else { showPaywall = true; return }
-                        midiDocument = ByteMIDIDocument(data: ByteMIDI.export(project: store.project, patterns: useSongArrangement ? store.songPlaybackPatterns : store.project.arrangedPatterns))
-                        showMIDIExporter = true
-                    }
                     exportButton("WAV AUDIO", "SYNTHESIZED / 44.1 KHZ", "waveform", locked: !storeKit.canExport, identifier: "export.wav") {
                         guard storeKit.canExport else { showPaywall = true; return }
                         startWaveExport()
                     }
                     if isRenderingWave { renderProgressView }
                     if !storeKit.canExport {
-                        Text("EXPORT PACK — MIDI + WAV / ONE-TIME UNLOCK")
+                        Text("EXPORT PACK — WAV AUDIO / ONE-TIME UNLOCK")
                             .font(.custom("Futura-Bold", size: 9))
                             .foregroundStyle(Color.mutedText)
                             .multilineTextAlignment(.center)
@@ -3784,7 +3777,6 @@ struct ExportView: View {
             .sheet(isPresented: $showPaywall) { ExportPaywallView() }
         }
         .fileExporter(isPresented: $showProjectExporter, document: projectDocument, contentTypes: [.bytePocketProject], defaultFilename: store.project.name.lowercased()) { _ in }
-        .fileExporter(isPresented: $showMIDIExporter, document: midiDocument, contentTypes: [.bytePocketMIDI], defaultFilename: store.project.name.lowercased() + ".mid") { _ in }
         .fileExporter(isPresented: $showWaveExporter, document: waveDocument, contentTypes: [.bytePocketWave], defaultFilename: store.project.name.lowercased() + ".wav") { _ in }
         .onDisappear { renderTask?.cancel() }
         .preferredColorScheme(.dark)
@@ -3874,7 +3866,6 @@ struct ExportPaywallView: View {
                     Text("EXPORT PACK").font(.custom("Futura-Bold", size: 27)).foregroundStyle(Color.gbLight)
                     Text("ONE-TIME UNLOCK / NO SUBSCRIPTION").font(.custom("Futura-Bold", size: 10)).foregroundStyle(Color.mutedText)
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("MIDI FILE EXPORT").font(.custom("Futura-Bold", size: 11)).foregroundStyle(Color.gbGlow)
                         Text("WAV AUDIO RENDER").font(.custom("Futura-Bold", size: 11)).foregroundStyle(Color.gbGlow)
                         Text("UNLOCKED FOREVER").font(.custom("Futura-Bold", size: 11)).foregroundStyle(Color.gbGlow)
                     }
