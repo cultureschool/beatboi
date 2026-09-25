@@ -1,11 +1,11 @@
 import XCTest
 
 /// Regression guard for the Export Pack paywall: WAV audio must be locked behind
-/// the $1.99 purchase while project-file export stays free, and tapping the
-/// locked WAV export row must present the paywall sheet.
+/// the $1.99 purchase, and tapping its row must present the paywall sheet.
 ///
-/// The pack used to also cover a MIDI download. That row is gone — the app reads
-/// MIDI in but never writes it out — so this test asserts the row stays gone.
+/// The pack used to also cover MIDI and the editor used to hand out a project
+/// file. Both rows are gone — WAV audio is the only export the app offers — so
+/// this test asserts they stay gone.
 final class ExportPaywallUITests: XCTestCase {
 
     override func setUpWithError() throws {
@@ -13,12 +13,12 @@ final class ExportPaywallUITests: XCTestCase {
     }
 
     @MainActor
-    func testWAVIsLockedBehindPaywallWhileProjectExportStaysFree() throws {
+    func testWAVIsTheOnlyExportAndIsLockedBehindPaywall() throws {
         let app = XCUIApplication()
         app.launch()
 
         // Open the export sheet from the editor header.
-        let exportButton = app.buttons["Export project"]
+        let exportButton = app.buttons["Export WAV"]
         XCTAssertTrue(exportButton.waitForExistence(timeout: 8), "export header button should exist")
         exportButton.tap()
 
@@ -28,12 +28,11 @@ final class ExportPaywallUITests: XCTestCase {
         // Without an entitlement the Beatpad header must not show the unlock badge.
         XCTAssertFalse(app.descendants(matching: .any)["exportPackBadge"].exists, "EXPORT PACK badge must be hidden without a verified entitlement")
 
-        // Project-file export stays free; WAV presents the paywall when tapped.
-        let projectRow = app.buttons["export.project"]
+        // WAV audio is the only row left, and it presents the paywall when tapped.
         let wavRow = app.buttons["export.wav"]
-        XCTAssertTrue(projectRow.waitForExistence(timeout: 8), "project export row should exist")
-        XCTAssertTrue(wavRow.exists, "WAV export row should exist")
+        XCTAssertTrue(wavRow.waitForExistence(timeout: 8), "WAV export row should exist")
         XCTAssertFalse(app.buttons["export.midi"].exists, "MIDI export row must no longer be offered")
+        XCTAssertFalse(app.buttons["export.project"].exists, "project-file export row must no longer be offered")
 
         // Tapping the locked row must present the paywall, not an export dialog.
         wavRow.tap()
@@ -54,7 +53,7 @@ final class ExportPaywallUITests: XCTestCase {
             "paywall should show a purchase, loading, or retry state"
         )
 
-        // The paywall advertises the pack without naming a MIDI download.
+        // The paywall advertises WAV alone.
         XCTAssertFalse(app.staticTexts["MIDI FILE EXPORT"].exists, "paywall must not advertise MIDI export")
 
         // Close the paywall and confirm the export sheet is still up.

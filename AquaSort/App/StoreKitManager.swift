@@ -18,7 +18,7 @@ final class StoreKitManager {
         let revocationDate: Date?
     }
 
-    /// One-time Export Pack; unlocking WAV audio export. Project-file export stays free.
+    /// One-time Export Pack; unlocking WAV audio export. WAV is the only export the app offers.
     ///
     /// This must be the identifier the product actually carries in App Store Connect. That app's
     /// live product is `exportunlock`, and an in-app purchase identifier cannot be renamed once the

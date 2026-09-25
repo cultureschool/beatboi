@@ -459,7 +459,7 @@ struct EditorView: View {
                     }
                     RestoredHeaderIcon(systemImage: "folder.fill", label: "Open project library") { showLibrary = true }
                     RestoredHeaderIcon(systemImage: "square.and.arrow.down", label: "Import project") { showImport = true }
-                    RestoredHeaderIcon(systemImage: "square.and.arrow.up", label: "Export project") { showExport = true }
+                    RestoredHeaderIcon(systemImage: "square.and.arrow.up", label: "Export WAV") { showExport = true }
                 }
             }
         }
@@ -3740,9 +3740,7 @@ struct ExportView: View {
     @Environment(\.dismiss) private var dismiss
     let useSongArrangement: Bool
     @State private var showPaywall = false
-    @State private var projectDocument = ByteProjectDocument()
     @State private var waveDocument = ByteWaveDocument()
-    @State private var showProjectExporter = false
     @State private var showWaveExporter = false
     @State private var exportProgress = 0.0
     @State private var isRenderingWave = false
@@ -3756,7 +3754,6 @@ struct ExportView: View {
                         .font(.custom("Futura-Bold", size: 15))
                         .foregroundStyle(Color.gbLight)
                         .multilineTextAlignment(.center)
-                    exportButton("PROJECT FILE", "EDITABLE / REOPEN ANYTIME", "doc.fill", identifier: "export.project") { projectDocument = store.projectDocument(); showProjectExporter = true }
                     exportButton("WAV AUDIO", "SYNTHESIZED / 44.1 KHZ", "waveform", locked: !storeKit.canExport, identifier: "export.wav") {
                         guard storeKit.canExport else { showPaywall = true; return }
                         startWaveExport()
@@ -3776,7 +3773,6 @@ struct ExportView: View {
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("DONE") { dismiss() }.disabled(isRenderingWave) } }
             .sheet(isPresented: $showPaywall) { ExportPaywallView() }
         }
-        .fileExporter(isPresented: $showProjectExporter, document: projectDocument, contentTypes: [.bytePocketProject], defaultFilename: store.project.name.lowercased()) { _ in }
         .fileExporter(isPresented: $showWaveExporter, document: waveDocument, contentTypes: [.bytePocketWave], defaultFilename: store.project.name.lowercased() + ".wav") { _ in }
         .onDisappear { renderTask?.cancel() }
         .preferredColorScheme(.dark)
@@ -3872,7 +3868,7 @@ struct ExportPaywallView: View {
                     .padding(16)
                     .background(Color.gbDeep)
                     .overlay(Rectangle().stroke(Color.gbMid, lineWidth: 2))
-                    Text("PROJECT FILES STAY FREE — YOUR TRACKS ALWAYS REOPEN IN THE POCKET")
+                    Text("IMPORTING PROJECTS AND MIDI STAYS FREE — WAV AUDIO IS THE ONE PAID EXPORT")
                         .font(.custom("Futura-Medium", size: 8))
                         .foregroundStyle(Color.mutedText)
                         .multilineTextAlignment(.center)

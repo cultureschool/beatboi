@@ -1419,8 +1419,6 @@ final class GameStore {
         }
     }
 
-    func projectDocument() -> ByteProjectDocument { ByteProjectDocument(project: project) }
-
     private var patternIndex: Int? {
         project.patterns.firstIndex(where: { $0.id == currentPatternID }) ?? project.patterns.indices.first
     }

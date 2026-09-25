@@ -40,7 +40,7 @@ BEATBOI includes:
 • Tempo-synced playback and one-bar drum auditioning.
 • Pattern banks, naming, duplication, and deletion.
 • Song arrangements up to 64 bars.
-• Project import and export.
+• Project and MIDI import.
 • WAV export with the one-time Export Pack.
 • VoiceOver labels and adjustable controls for pads, parts, and parameters.
 • Offline-first project storage with no analytics or tracking.
@@ -63,6 +63,6 @@ This release is a full visual overhaul of the studio interface. Beatpad now cent
 
 ## Review notes
 
-BEATBOI does not require an account, network connection, microphone, camera, contacts, location, or tracking permission. Projects are stored locally on the device. The Export Pack is a non-consumable in-app purchase; project-file export remains available without purchase.
+BEATBOI does not require an account, network connection, microphone, camera, contacts, location, or tracking permission. Projects are stored locally on the device. The Export Pack is a non-consumable in-app purchase that unlocks WAV audio export; importing projects and MIDI files remains available without purchase.
 
 To test the paid feature in App Review, use the StoreKit product `exportunlock` in the app's purchase flow. The app's core sequencer, playback, editing, and project features are available without purchasing it.

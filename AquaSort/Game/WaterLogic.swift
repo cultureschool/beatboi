@@ -1716,21 +1716,6 @@ extension UTType {
     static let bytePocketWave = UTType(filenameExtension: "wav") ?? .data
 }
 
-struct ByteProjectDocument: FileDocument {
-    static var readableContentTypes: [UTType] { [.bytePocketProject, .json] }
-    var project: ByteProject
-
-    init(project: ByteProject = .starter) { self.project = project }
-
-    init(configuration: ReadConfiguration) throws {
-        project = try JSONDecoder.bytePocketDecoder.decode(ByteProject.self, from: configuration.file.regularFileContents ?? Data())
-    }
-
-    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
-        FileWrapper(regularFileWithContents: try JSONEncoder.bytePocketEncoder.encode(project))
-    }
-}
-
 struct ByteWaveDocument: FileDocument {
     static var readableContentTypes: [UTType] { [.bytePocketWave] }
     let data: Data
@@ -1741,9 +1726,9 @@ struct ByteWaveDocument: FileDocument {
 }
 
 extension JSONEncoder {
-    /// Used for files the user keeps: project, wave and MIDI exports. Pretty printing and key
+    /// Used for the project library files the user keeps in the pocket. Pretty printing and key
     /// sorting cost real time, but they buy a file that opens readably in a text editor and that
-    /// diffs cleanly, which is why exports keep them.
+    /// diffs cleanly, which is why stored projects keep them.
     static var bytePocketEncoder: JSONEncoder {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
