@@ -100,6 +100,20 @@ final class StoreKitManager {
             || Self.isOwned(productID: unlockProductID, in: entries)
     }
 
+    /// Seeds the in-session grant floor from a launch argument, exactly where a signed
+    /// transaction would put it.
+    ///
+    /// UI tests cannot buy anything — the App Store is not there to sell — so the unlocked state
+    /// has to be reachable, or the unlocked half of the export surface (the header's open padlock,
+    /// the export sheet with its WAV row live rather than behind the paywall) is untestable and can
+    /// only be checked by hand. Seeding the floor rather than forcing `hasReceiptEntitlement` keeps
+    /// the fixture honest: `syncEntitlement` still derives the answer, so a launch that seeds this
+    /// and then loses the entitlement would still lock up the way the real rule says it should.
+    func seedEntitlementForUITestIfNeeded() {
+        guard ProcessInfo.processInfo.arguments.contains("--export-unlocked-ui-test") else { return }
+        sessionVerifiedGrants.insert(unlockProductID)
+    }
+
     func load() async {
         startTransactionObserverIfNeeded()
         status = .loading

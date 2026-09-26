@@ -265,6 +265,44 @@ final class NotePadGestureUITests: XCTestCase {
         XCTAssertFalse(editor.readout.contains("LINK ARMED"), "clearing must not arm a link")
     }
 
+    /// The dice on the drum row is the drum shuffle, and the one thing it may never do is leave a
+    /// bar the ear cannot find its way around: the snare has to land on the backbeat — beats 2 and
+    /// 4, or beat 3 alone for a half-time loop.
+    ///
+    /// It reads the pads rather than the store, because the report was that the button did nothing
+    /// on screen, and a test that asked the store instead would have agreed with itself. It also
+    /// names the feel in its toast, so the user can tell which of the two they just rolled.
+    @MainActor
+    func testDrumDiceWritesABeatWithItsSnareOnTheBackbeat() throws {
+        let app = XCUIApplication()
+        app.launch()
+        let editor = try openDrumPadGrid(app)
+
+        let dice = app.buttons["Shuffle drum beat"]
+        XCTAssertTrue(
+            dice.waitForExistence(timeout: 5),
+            "the drum row's dice should say what it does to the drum row"
+        )
+        dice.tap()
+
+        let announced = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "DRUM BEAT"))
+        XCTAssertTrue(
+            announced.firstMatch.waitForExistence(timeout: 2),
+            "the shuffle should name the feel it just built"
+        )
+
+        let voices = (0..<16).map { editor.pad($0).value as? String ?? "MISSING" }
+        let snares = voices.enumerated().filter { $0.element == "SNARE" }.map(\.offset)
+        XCTAssertTrue(
+            snares == [4, 12] || snares == [8],
+            "the shuffle wrote its snare to \(snares); a beat needs beats 2 and 4, or beat 3 half time"
+        )
+        XCTAssertEqual(
+            voices[0], "KICK",
+            "a shuffled beat still lands on the downbeat, pads read \(voices)"
+        )
+    }
+
     // MARK: - Helpers
 
     /// The pad grid edits whichever channel is selected, and a fresh launch selects

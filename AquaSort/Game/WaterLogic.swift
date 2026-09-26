@@ -298,6 +298,54 @@ extension ByteDrumVoice {
     }
 }
 
+/// Where a shuffled drum row puts its backbeat.
+///
+/// The backbeat is the one thing a randomizer must not guess at — take the snare off beats 2 and 4
+/// and the bar stops having a middle — so the feel is chosen first and the rest of the row is
+/// filled around it. Sixteen steps read as four beats of four, which is why the step numbers below
+/// are multiples of four.
+///
+/// Half time is the same backbeat heard half as often: the snare lands on beat 3 instead of 2 and
+/// 4, and the second half of the bar opens up for a fill.
+enum ByteDrumFeel: Sendable, CaseIterable {
+    case straight
+    case halfTime
+
+    var title: String {
+        switch self {
+        case .straight: return "SNARE ON 2 & 4"
+        case .halfTime: return "HALF TIME · SNARE ON 3"
+        }
+    }
+
+    /// Steps the snare fills, and never yields. Everything else moves around these.
+    var snareSteps: [Int] {
+        switch self {
+        case .straight: return [4, 12]
+        case .halfTime: return [8]
+        }
+    }
+
+    /// The kick's fixed steps: the bar's downbeat in both feels, plus beat 3 when the snare has
+    /// vacated it, so a straight beat still walks and a half-time beat still has an anchor late in
+    /// the bar.
+    var kickAnchors: [Int] {
+        switch self {
+        case .straight: return [0, 8]
+        case .halfTime: return [0]
+        }
+    }
+
+    /// Steps an extra kick may take this roll. All are offbeats or the "and" of a beat, and none
+    /// is a snare step, so a fill kick can never eat the backbeat.
+    var kickCandidates: [Int] {
+        switch self {
+        case .straight: return [3, 6, 7, 10, 11, 14]
+        case .halfTime: return [6, 7, 10, 11, 14]
+        }
+    }
+}
+
 /// One hit of a drum row: the voice, and the step it lands on.
 ///
 /// A plain value so a pattern's row and the walk up the kit can both be handed to one runner, and
@@ -1366,6 +1414,61 @@ struct BytePattern: Codable, Hashable, Identifiable, Sendable {
         }
     }
 
+    /// Replaces the drum row with a random beat and reports the feel it built.
+    ///
+    /// Unlike `randomizeMelody`, which only has to keep its notes in a scale, this row has a rule
+    /// the ear will notice immediately: the snare has to fall on the backbeat. So the feel is
+    /// picked first, the snare is written where that feel says — beats 2 and 4, or beat 3 for a
+    /// half-time loop — and kick, hi-hat, and perc are then filled into the steps the snare left
+    /// empty, in that order. The order is load-bearing: a drum row holds one voice per step, so
+    /// each pass may only take a step that is still free rather than layering onto it.
+    ///
+    /// The injected picker keeps the whole thing testable, and every loop below is bounded by
+    /// something other than the picker's answer, so a degenerate picker (one that always returns
+    /// the same value) cannot spin.
+    @discardableResult
+    mutating func shuffleDrums(nextInt: (ClosedRange<Int>) -> Int) -> ByteDrumFeel {
+        guard let row = ByteChannel.allCases.firstIndex(of: .drum) else { return .straight }
+        let feel: ByteDrumFeel = nextInt(0...3) == 0 ? .halfTime : .straight
+        steps[row] = Array(repeating: nil, count: 16)
+        noteLengths[row] = Array(repeating: 1, count: 16)
+
+        var hits: [Int: ByteDrumVoice] = [:]
+        for step in feel.snareSteps { hits[step] = .snare }
+        for step in feel.kickAnchors { hits[step] = .kick }
+
+        // One to three extra kicks, so two rolls of the same feel still differ where it matters
+        // most. Capped by the candidate list rather than by the picker, so a stuck picker exits.
+        let wantedFills = nextInt(0...2)
+        var placedFills = 0
+        var attempts = 0
+        while placedFills < wantedFills, attempts < feel.kickCandidates.count {
+            attempts += 1
+            let candidate = feel.kickCandidates[nextInt(0...(feel.kickCandidates.count - 1))]
+            guard hits[candidate] == nil else { continue }
+            hits[candidate] = .kick
+            placedFills += 1
+        }
+
+        // Hi-hats carry the pulse: the offbeat eighth of every beat is the spine, and a busier
+        // sixteenth feel is a per-roll garnish rather than a rewrite of that spine.
+        for step in stride(from: 2, to: 16, by: 4) where hits[step] == nil { hits[step] = .hiHat }
+        if nextInt(0...99) < 45 {
+            for step in [1, 5, 9, 13] where hits[step] == nil {
+                if nextInt(0...99) < 60 { hits[step] = .hiHat }
+            }
+        }
+
+        // Perc lands on the "a" of a beat when it lands at all, and never on a kick or snare.
+        if nextInt(0...99) < 55 {
+            let open = [3, 7, 11, 15].filter { hits[$0] == nil }
+            if !open.isEmpty { hits[open[nextInt(0...(open.count - 1))]] = .perc }
+        }
+
+        for (step, voice) in hits { steps[row][step] = ByteDrumVoice.note(voice: voice) }
+        return feel
+    }
+
     static func empty(name: String) -> BytePattern {
         BytePattern(name: name, steps: ByteChannel.allCases.map { _ in Array(repeating: nil, count: 16) })
     }
@@ -1713,16 +1816,52 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
 
 extension UTType {
     static let bytePocketProject = UTType(exportedAs: "com.bytepocket.project")
-    static let bytePocketWave = UTType(filenameExtension: "wav") ?? .data
 }
 
-struct ByteWaveDocument: FileDocument {
-    static var readableContentTypes: [UTType] { [.bytePocketWave] }
-    let data: Data
+/// The file a rendered WAV lives in while it is being written, shared, or saved.
+///
+/// The render streams straight into this file, and both handovers read it from here: the activity
+/// sheet hands the URL to whichever app the user picked, and the Files picker copies the file to
+/// wherever they chose. Neither needs the audio in memory, which is what makes a long take possible
+/// at all. One fixed name in the app's own temporary directory, so a second render replaces the
+/// first instead of leaving a copy of every take behind in the sandbox — and so a cached URL keeps
+/// meaning the same take after a re-render.
+///
+/// The name is the project's, lowercased and stripped of path separators, so what a recipient sees
+/// is what the Files picker would have named the same take: a project called "FIRST BEAT" arrives as
+/// `first beat.wav` either way.
+enum ByteWaveFile {
+    static func url(named name: String) -> URL {
+        let separators = CharacterSet(charactersIn: "/\\:")
+        let safeName = name.lowercased().components(separatedBy: separators).joined(separator: "-")
+        return FileManager.default.temporaryDirectory.appending(path: safeName).appendingPathExtension("wav")
+    }
 
-    init(data: Data = Data()) { self.data = data }
-    init(configuration: ReadConfiguration) throws { data = configuration.file.regularFileContents ?? Data() }
-    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper { FileWrapper(regularFileWithContents: data) }
+    /// Runs `body` against a staging file and promotes it to `url` only if the whole write succeeds.
+    ///
+    /// Writing into the destination directly would leave a fragment where a finished take belongs if
+    /// the app died mid-render — and the destination has a stable name, which the export cache keeps
+    /// nothing but a URL for, so a share would then hand out half a song. Staging beside it and
+    /// moving it into place in one step makes the swap all or nothing: what sits at `url` is either
+    /// the previous complete take or the new one.
+    static func withStagingFile(at url: URL, _ body: (FileHandle) throws -> Void) throws {
+        let staging = url.appendingPathExtension("partial")
+        try? FileManager.default.removeItem(at: staging)
+        guard FileManager.default.createFile(atPath: staging.path, contents: nil) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        let handle = try FileHandle(forWritingTo: staging)
+        do {
+            try body(handle)
+            try handle.close()
+        } catch {
+            try? handle.close()
+            try? FileManager.default.removeItem(at: staging)
+            throw error
+        }
+        try? FileManager.default.removeItem(at: url)
+        try FileManager.default.moveItem(at: staging, to: url)
+    }
 }
 
 extension JSONEncoder {

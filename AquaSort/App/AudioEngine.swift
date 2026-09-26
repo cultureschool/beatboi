@@ -657,9 +657,20 @@ final class ByteAudioEngine {
 }
 
 enum ByteRenderer {
+    /// The whole take as interleaved stereo Floats.
+    ///
+    /// Only the tests call this now — the export streams to a file and live playback synthesizes a
+    /// buffer at a time — but it is the reference the export paths are measured against, so it stays
+    /// the plainest possible statement of what the synth produces.
     static func render(project: ByteProject, patterns sourcePatterns: [BytePattern]? = nil, sampleRate: Double, onProgress: @Sendable (Double) -> Void = { _ in }) -> [Float] {
         let patterns = sourcePatterns ?? project.arrangedPatterns
-        return renderStateful(project: project, patterns: patterns, sampleRate: sampleRate, onProgress: onProgress)
+        let frames = patterns.isEmpty ? 0 : waveFrameCount(project: project, patterns: patterns, sampleRate: sampleRate)
+        var output = [Float]()
+        output.reserveCapacity(frames * 2)
+        forEachWaveBlock(project: project, patterns: patterns, frames: frames, sampleRate: sampleRate, onProgress: onProgress) { block in
+            output.append(contentsOf: block)
+        }
+        return output
 #if false
         let totalSteps = patterns.count * 16
         let secondsPerStep = ByteTransportClock.stepDuration(bpm: project.tempo)
@@ -755,203 +766,286 @@ enum ByteRenderer {
 #endif
     }
 
-    private static func renderStateful(project: ByteProject, patterns: [BytePattern], sampleRate: Double, onProgress: @Sendable (Double) -> Void) -> [Float] {
-        return renderStatefulAccurate(project: project, patterns: patterns, sampleRate: sampleRate, onProgress: onProgress)
-    }
+    /// Longest run of frames synthesized in a single call. Large enough that the per-block
+    /// bookkeeping costs nothing measurable, small enough that the scratch buffers a blocked export
+    /// holds are kilobytes rather than the tens of megabytes the whole take would be.
+    private static let waveBlockFrames = 32_768
 
-    private static func renderStatefulAccurate(project: ByteProject, patterns: [BytePattern], sampleRate: Double, onProgress: @Sendable (Double) -> Void) -> [Float] {
-        guard !patterns.isEmpty else {
-            onProgress(1.0)
-            return []
-        }
-        onProgress(0.0)
-        let secondsPerStep = ByteTransportClock.stepDuration(bpm: project.tempo)
-        let totalSamples = Int(Double(patterns.count * 16) * secondsPerStep * sampleRate)
-        var output = Array(repeating: Float(0), count: totalSamples * 2)
+    /// The synth's mutable state, in a value that outlives a single call so a take can be rendered
+    /// a block at a time.
+    ///
+    /// Live playback walks this same math sample by sample; an export walks it to the end of the
+    /// arrangement. Keeping the state — oscillator phases, drum read positions, the delay line —
+    /// outside the loop is what lets the WAV writer convert a block and stream it out while the next
+    /// one is synthesized, instead of the whole take having to exist as Floats before a single byte
+    /// can be written.
+    private struct ByteRenderCursor {
+        let project: ByteProject
+        let patterns: [BytePattern]
+        let sampleRate: Double
+        let secondsPerStep: Double
         var stepElapsed = 0.0
         var playbackStep = 0
         var patternIndex = 0
         var lastStep = -1
-        var phases = Array(repeating: 0.0, count: ByteChannel.allCases.count)
-        var drumSamplePositions = Array(repeating: 0.0, count: ByteChannel.allCases.count)
-        let progressInterval = max(1, totalSamples / 100)
+        var phases: [Double]
+        var drumSamplePositions: [Double]
+        var effectsProcessor: ByteMixEffects
 
-        var effectsProcessor = ByteMixEffects(sampleRate: sampleRate)
-        for sampleIndex in 0..<totalSamples {
-            if sampleIndex % progressInterval == 0 {
-                onProgress(Double(sampleIndex) / Double(max(1, totalSamples)) * 0.95)
-            }
-            let pattern = patterns[min(patternIndex, patterns.count - 1)]
-            let step = playbackStep
-            let normalized = min(1.0, max(0.0, stepElapsed / secondsPerStep))
-            if step != lastStep {
-                lastStep = step
-                for channelIndex in ByteChannel.allCases.indices {
-                    if let active = noteAt(row: channelIndex, step: step, pattern: pattern), active.start == step {
-                        phases[channelIndex] = 0.0
-                        drumSamplePositions[channelIndex] = 0
+        init(project: ByteProject, patterns: [BytePattern], sampleRate: Double) {
+            self.project = project
+            self.patterns = patterns
+            self.sampleRate = sampleRate
+            self.secondsPerStep = ByteTransportClock.stepDuration(bpm: project.tempo)
+            self.phases = Array(repeating: 0.0, count: ByteChannel.allCases.count)
+            self.drumSamplePositions = Array(repeating: 0.0, count: ByteChannel.allCases.count)
+            self.effectsProcessor = ByteMixEffects(sampleRate: sampleRate)
+        }
+
+        /// Writes `frames` interleaved stereo frames into `output`, then carries the state on to the
+        /// next call.
+        ///
+        /// Only the route the samples take out of here is new. Where a block boundary falls cannot
+        /// change a sample of the take, which is why rendering an arrangement in one call and in a
+        /// thousand of them is the same audio.
+        mutating func render(into output: UnsafeMutableBufferPointer<Float>, frames: Int) {
+            for frame in 0..<frames {
+                let pattern = patterns[min(patternIndex, patterns.count - 1)]
+                let step = playbackStep
+                let normalized = min(1.0, max(0.0, stepElapsed / secondsPerStep))
+                if step != lastStep {
+                    lastStep = step
+                    for channelIndex in ByteChannel.allCases.indices {
+                        if let active = noteAt(row: channelIndex, step: step, pattern: pattern), active.start == step {
+                            phases[channelIndex] = 0.0
+                            drumSamplePositions[channelIndex] = 0
+                        }
                     }
                 }
-            }
 
-            var left = 0.0
-            var right = 0.0
-            var effectsLeft = 0.0
-            var effectsRight = 0.0
-            for (channelIndex, channel) in ByteChannel.allCases.enumerated() {
-                guard let activeNote = noteAt(row: channelIndex, step: step, pattern: pattern) else { continue }
-                let note = activeNote.note
-                let noteProgress = Double(step - activeNote.start) + normalized
-                let noteNormalized = min(1.0, max(0.0, noteProgress / Double(max(1, activeNote.length))))
-                let patch = project.channelPatches.first(where: { $0.channel == channel }) ?? ByteChannelPatch(channel: channel)
-                let hasSoloChannel = project.channelPatches.contains(where: { $0.soloed })
-                guard !patch.muted, !hasSoloChannel || patch.soloed else { continue }
-                let baseFrequency = 440.0 * pow(2.0, Double(note - 69 + patch.octave * 12) / 12.0)
-                let sweep = channel == .pulseA ? dmgSweep(noteNormalized, patch: patch) : 0.0
-                let portamentoAmount = Double(min(100, max(0, patch.portamento))) / 100.0
-                let portamentoTime = max(0.01, Double(min(100, max(0, patch.portamentoTime))) / 100.0)
-                let portamentoProgress = min(1.0, noteProgress / max(0.01, portamentoTime * 2.0))
-                let portamentoSemitones = (1.0 - portamentoProgress) * portamentoAmount * Double(patch.bendRange)
-                let vibratoDepth = Double(min(100, max(0, patch.vibratoDepth))) / 100.0
-                let vibratoCycle = 0.05 + Double(min(100, max(0, patch.vibratoCycleLength))) / 100.0 * 0.45
-                let vibratoDelay = Double(min(100, max(0, patch.vibratoDelay))) / 100.0 * max(0.01, Double(activeNote.length))
-                let vibratoTime = Double(step - activeNote.start) + normalized
-                let vibrato = vibratoDepth > 0 && vibratoTime >= vibratoDelay
-                    ? sin((vibratoTime - vibratoDelay) * secondsPerStep * 2.0 * .pi / vibratoCycle) * vibratoDepth * 0.018
-                    : 0.0
-                let flutterMultiplier = channel == .drum ? 1.0 : ByteEffects.octaveFlutterMultiplier(
-                    at: Double(step) * secondsPerStep + stepElapsed,
-                    bpm: project.tempo,
-                    amount: patch.octaveFlutterAmount,
-                    pattern: ByteOctaveFlutterPattern(rawValue: patch.octaveFlutterPattern) ?? .baseUp
-                )
-                let frequency = max(1.0, baseFrequency * pow(2.0, portamentoSemitones / 12.0) * flutterMultiplier * (1.0 + vibrato + sweep))
-                let effectiveLength = channel == .drum ? 63 : patch.length
-                let drumVolume = channel == .drum && patch.drumVolumes.indices.contains(ByteDrumVoice.voice(for: note).rawValue)
-                    ? patch.drumVolumes[ByteDrumVoice.voice(for: note).rawValue]
-                    : 15
-                let effectiveVolume = channel == .drum ? drumVolume : patch.initialVolume
-                let gated = channel == .drum ? false : (patch.lengthCounter && noteNormalized > Double(effectiveLength) / 63.0)
-                let envelopeLevel = channel == .drum ? 1.0 : envelope(normalized: noteNormalized, patch: patch)
-                let value: Double
+                var left = 0.0
+                var right = 0.0
+                var effectsLeft = 0.0
+                var effectsRight = 0.0
+                for (channelIndex, channel) in ByteChannel.allCases.enumerated() {
+                    guard let activeNote = noteAt(row: channelIndex, step: step, pattern: pattern) else { continue }
+                    let note = activeNote.note
+                    let noteProgress = Double(step - activeNote.start) + normalized
+                    let noteNormalized = min(1.0, max(0.0, noteProgress / Double(max(1, activeNote.length))))
+                    let patch = project.channelPatches.first(where: { $0.channel == channel }) ?? ByteChannelPatch(channel: channel)
+                    let hasSoloChannel = project.channelPatches.contains(where: { $0.soloed })
+                    guard !patch.muted, !hasSoloChannel || patch.soloed else { continue }
+                    let baseFrequency = 440.0 * pow(2.0, Double(note - 69 + patch.octave * 12) / 12.0)
+                    let sweep = channel == .pulseA ? dmgSweep(noteNormalized, patch: patch) : 0.0
+                    let portamentoAmount = Double(min(100, max(0, patch.portamento))) / 100.0
+                    let portamentoTime = max(0.01, Double(min(100, max(0, patch.portamentoTime))) / 100.0)
+                    let portamentoProgress = min(1.0, noteProgress / max(0.01, portamentoTime * 2.0))
+                    let portamentoSemitones = (1.0 - portamentoProgress) * portamentoAmount * Double(patch.bendRange)
+                    let vibratoDepth = Double(min(100, max(0, patch.vibratoDepth))) / 100.0
+                    let vibratoCycle = 0.05 + Double(min(100, max(0, patch.vibratoCycleLength))) / 100.0 * 0.45
+                    let vibratoDelay = Double(min(100, max(0, patch.vibratoDelay))) / 100.0 * max(0.01, Double(activeNote.length))
+                    let vibratoTime = Double(step - activeNote.start) + normalized
+                    let vibrato = vibratoDepth > 0 && vibratoTime >= vibratoDelay
+                        ? sin((vibratoTime - vibratoDelay) * secondsPerStep * 2.0 * .pi / vibratoCycle) * vibratoDepth * 0.018
+                        : 0.0
+                    let flutterMultiplier = channel == .drum ? 1.0 : ByteEffects.octaveFlutterMultiplier(
+                        at: Double(step) * secondsPerStep + stepElapsed,
+                        bpm: project.tempo,
+                        amount: patch.octaveFlutterAmount,
+                        pattern: ByteOctaveFlutterPattern(rawValue: patch.octaveFlutterPattern) ?? .baseUp
+                    )
+                    let frequency = max(1.0, baseFrequency * pow(2.0, portamentoSemitones / 12.0) * flutterMultiplier * (1.0 + vibrato + sweep))
+                    let effectiveLength = channel == .drum ? 63 : patch.length
+                    let drumVolume = channel == .drum && patch.drumVolumes.indices.contains(ByteDrumVoice.voice(for: note).rawValue)
+                        ? patch.drumVolumes[ByteDrumVoice.voice(for: note).rawValue]
+                        : 15
+                    let effectiveVolume = channel == .drum ? drumVolume : patch.initialVolume
+                    let gated = channel == .drum ? false : (patch.lengthCounter && noteNormalized > Double(effectiveLength) / 63.0)
+                    let envelopeLevel = channel == .drum ? 1.0 : envelope(normalized: noteNormalized, patch: patch)
+                    let value: Double
 
-                switch channel {
-                case .pulseA, .pulseB:
-                    let duties = [0.125, 0.25, 0.50, 0.75]
-                    value = pulse(phases[channelIndex], duty: duties[min(3, max(0, patch.duty))])
-                    phases[channelIndex] = (phases[channelIndex] + frequency / sampleRate).truncatingRemainder(dividingBy: 1.0)
-                case .wave:
-                    value = wave(phase: phases[channelIndex], shape: patch.waveShape, volume: patch.waveVolume)
-                    phases[channelIndex] = (phases[channelIndex] + frequency / sampleRate).truncatingRemainder(dividingBy: 1.0)
-                case .drum:
-                    let voice = ByteDrumVoice.voice(for: note)
-                    let variant = patch.drumSamples.indices.contains(voice.rawValue) ? patch.drumSamples[voice.rawValue] : 1
-                    let sampleData = ByteDrumSampleBank.shared.sample(voice: voice, variant: variant)
-                    // The same reader live playback uses, so an export carries the same kit.
-                    value = ByteDrumVoice.value(of: sampleData, voice: voice, at: drumSamplePositions[channelIndex])
-                    drumSamplePositions[channelIndex] += 1
-                }
-
-                var shaped = value
-                let tremoloAmount = Double(min(100, max(0, patch.tremolo))) / 100.0
-                if channel != .drum && tremoloAmount > 0 {
-                    let tremolo = 1.0 - tremoloAmount * 0.65 * (0.5 + 0.5 * sin((stepElapsed + Double(step) * secondsPerStep) * 2.0 * .pi * 7.0))
-                    shaped *= tremolo
-                }
-                let masterLevel = ByteAudioTaper.gain(for: patch.masterVolume)
-                let mixed = gated ? 0.0 : shaped * (channel == .drum ? 0.16 : (channel == .pulseA || channel == .pulseB ? 0.06 : 0.12)) * (Double(effectiveVolume) / 15.0) * envelopeLevel * masterLevel
-                let sendIndex = ByteChannel.allCases.firstIndex(of: channel) ?? 0
-                let send = project.effects.channelSends.indices.contains(sendIndex)
-                    ? ByteAudioTaper.gain(for: project.effects.channelSends[sendIndex])
-                    : 1.0
-                if patch.panLeft {
-                    left += mixed
-                    effectsLeft += mixed * send
-                }
-                if patch.panRight {
-                    right += mixed
-                    effectsRight += mixed * send
-                }
-            }
-
-            let effected = effectsProcessor.process(left: effectsLeft, right: effectsRight, effects: project.effects, sampleRate: sampleRate)
-            let dryLeft = left - effectsLeft
-            let dryRight = right - effectsRight
-            output[sampleIndex * 2] = Float(max(-0.9, min(0.9, dryLeft + effected.left)))
-            output[sampleIndex * 2 + 1] = Float(max(-0.9, min(0.9, dryRight + effected.right)))
-
-            stepElapsed += 1.0 / sampleRate
-            if stepElapsed >= secondsPerStep {
-                stepElapsed -= secondsPerStep
-                if playbackStep + 1 >= 16 {
-                    playbackStep = 0
-                    patternIndex = (patternIndex + 1) % patterns.count
-                    for index in ByteChannel.allCases.indices {
-                        phases[index] = 0.0
-                        drumSamplePositions[index] = 0
+                    switch channel {
+                    case .pulseA, .pulseB:
+                        let duties = [0.125, 0.25, 0.50, 0.75]
+                        value = pulse(phases[channelIndex], duty: duties[min(3, max(0, patch.duty))])
+                        phases[channelIndex] = (phases[channelIndex] + frequency / sampleRate).truncatingRemainder(dividingBy: 1.0)
+                    case .wave:
+                        value = wave(phase: phases[channelIndex], shape: patch.waveShape, volume: patch.waveVolume)
+                        phases[channelIndex] = (phases[channelIndex] + frequency / sampleRate).truncatingRemainder(dividingBy: 1.0)
+                    case .drum:
+                        let voice = ByteDrumVoice.voice(for: note)
+                        let variant = patch.drumSamples.indices.contains(voice.rawValue) ? patch.drumSamples[voice.rawValue] : 1
+                        let sampleData = ByteDrumSampleBank.shared.sample(voice: voice, variant: variant)
+                        // The same reader live playback uses, so an export carries the same kit.
+                        value = ByteDrumVoice.value(of: sampleData, voice: voice, at: drumSamplePositions[channelIndex])
+                        drumSamplePositions[channelIndex] += 1
                     }
-                } else {
-                    playbackStep += 1
+
+                    var shaped = value
+                    let tremoloAmount = Double(min(100, max(0, patch.tremolo))) / 100.0
+                    if channel != .drum && tremoloAmount > 0 {
+                        let tremolo = 1.0 - tremoloAmount * 0.65 * (0.5 + 0.5 * sin((stepElapsed + Double(step) * secondsPerStep) * 2.0 * .pi * 7.0))
+                        shaped *= tremolo
+                    }
+                    let masterLevel = ByteAudioTaper.gain(for: patch.masterVolume)
+                    let mixed = gated ? 0.0 : shaped * (channel == .drum ? 0.16 : (channel == .pulseA || channel == .pulseB ? 0.06 : 0.12)) * (Double(effectiveVolume) / 15.0) * envelopeLevel * masterLevel
+                    let sendIndex = ByteChannel.allCases.firstIndex(of: channel) ?? 0
+                    let send = project.effects.channelSends.indices.contains(sendIndex)
+                        ? ByteAudioTaper.gain(for: project.effects.channelSends[sendIndex])
+                        : 1.0
+                    if patch.panLeft {
+                        left += mixed
+                        effectsLeft += mixed * send
+                    }
+                    if patch.panRight {
+                        right += mixed
+                        effectsRight += mixed * send
+                    }
+                }
+
+                let effected = effectsProcessor.process(left: effectsLeft, right: effectsRight, effects: project.effects, sampleRate: sampleRate)
+                let dryLeft = left - effectsLeft
+                let dryRight = right - effectsRight
+                output[frame * 2] = Float(max(-0.9, min(0.9, dryLeft + effected.left)))
+                output[frame * 2 + 1] = Float(max(-0.9, min(0.9, dryRight + effected.right)))
+
+                stepElapsed += 1.0 / sampleRate
+                if stepElapsed >= secondsPerStep {
+                    stepElapsed -= secondsPerStep
+                    if playbackStep + 1 >= 16 {
+                        playbackStep = 0
+                        patternIndex = (patternIndex + 1) % patterns.count
+                        for index in ByteChannel.allCases.indices {
+                            phases[index] = 0.0
+                            drumSamplePositions[index] = 0
+                        }
+                    } else {
+                        playbackStep += 1
+                    }
                 }
             }
         }
-
-        onProgress(0.95)
-        return output
     }
 
-    static func wavData(project: ByteProject, patterns: [BytePattern]? = nil, sampleRate: Double = 44_100, onProgress: @Sendable (Double) -> Void = { _ in }) -> Data {
-        let samples = render(project: project, patterns: patterns, sampleRate: sampleRate, onProgress: onProgress)
+    /// Renders a whole take a block at a time, handing each block of interleaved stereo samples to
+    /// `consume`.
+    ///
+    /// Every export path runs through this one loop, so a file streamed to disk and a buffer built
+    /// in memory cannot drift apart — they differ only in what they do with a block.
+    private static func forEachWaveBlock(
+        project: ByteProject,
+        patterns: [BytePattern],
+        frames: Int,
+        sampleRate: Double,
+        onProgress: @Sendable (Double) -> Void,
+        consume: (UnsafeBufferPointer<Float>) throws -> Void
+    ) rethrows {
+        guard frames > 0 else {
+            onProgress(1.0)
+            return
+        }
+        onProgress(0.0)
+        var cursor = ByteRenderCursor(project: project, patterns: patterns, sampleRate: sampleRate)
+        var block = [Float](repeating: 0, count: waveBlockFrames * 2)
+        var rendered = 0
+        while rendered < frames {
+            let count = min(waveBlockFrames, frames - rendered)
+            try block.withUnsafeMutableBufferPointer { buffer in
+                let slice = UnsafeMutableBufferPointer(rebasing: buffer[0..<(count * 2)])
+                cursor.render(into: slice, frames: count)
+                try consume(UnsafeBufferPointer(slice))
+            }
+            rendered += count
+            onProgress(Double(rendered) / Double(frames))
+        }
+    }
+
+    /// How many frames a take renders to. The arrangement has a fixed length, so this is known
+    /// before the first sample is synthesized — which is what lets a streaming writer put the real
+    /// sizes in the RIFF header as it opens the file, instead of seeking back to patch them in.
+    private static func waveFrameCount(project: ByteProject, patterns: [BytePattern], sampleRate: Double) -> Int {
+        Int(Double(patterns.count * 16) * ByteTransportClock.stepDuration(bpm: project.tempo) * sampleRate)
+    }
+
+    /// The canonical 44-byte RIFF header for a PCM payload of `dataSize` bytes: stereo, 16-bit.
+    private static func waveHeader(dataSize: UInt32, sampleRate: Double) -> Data {
         let channels: UInt16 = 2
         let bits: UInt16 = 16
         let bytesPerSample = Int(bits / 8)
-        let dataSize = UInt32(samples.count * bytesPerSample)
+        var header = Data()
+        header.reserveCapacity(44)
+        header.append(contentsOf: Array("RIFF".utf8))
+        header.appendLittleEndian(36 + dataSize)
+        header.append(contentsOf: Array("WAVEfmt ".utf8))
+        header.appendLittleEndian(UInt32(16))
+        header.appendLittleEndian(UInt16(1))
+        header.appendLittleEndian(channels)
+        header.appendLittleEndian(UInt32(sampleRate))
+        header.appendLittleEndian(UInt32(Int(sampleRate) * Int(channels) * bytesPerSample))
+        header.appendLittleEndian(UInt16(Int(channels) * bytesPerSample))
+        header.appendLittleEndian(bits)
+        header.append(contentsOf: Array("data".utf8))
+        header.appendLittleEndian(dataSize)
+        return header
+    }
 
-        // RIFF header. Reserving the payload up front keeps the append below from
-        // repeatedly reallocating as the buffer grows.
-        var data = Data()
-        data.reserveCapacity(44 + Int(dataSize))
-        data.append(contentsOf: Array("RIFF".utf8))
-        data.appendLittleEndian(36 + dataSize)
-        data.append(contentsOf: Array("WAVEfmt ".utf8))
-        data.appendLittleEndian(UInt32(16))
-        data.appendLittleEndian(UInt16(1))
-        data.appendLittleEndian(channels)
-        data.appendLittleEndian(UInt32(sampleRate))
-        data.appendLittleEndian(UInt32(Int(sampleRate) * Int(channels) * bytesPerSample))
-        data.appendLittleEndian(UInt16(Int(channels) * bytesPerSample))
-        data.appendLittleEndian(bits)
-        data.append(contentsOf: Array("data".utf8))
-        data.appendLittleEndian(dataSize)
+    /// Clamps one block of floats into the fixed-size 16-bit scratch buffer the caller reuses for
+    /// the whole render, which is why nothing here allocates. `FixedWidthInteger` bytes are
+    /// little-endian on every platform this app runs on, which is what RIFF wants.
+    private static func convertToPCM(_ block: UnsafeBufferPointer<Float>, into pcm: inout [Int16]) {
+        for index in block.indices {
+            pcm[index] = Int16(max(-1, min(1, block[index])) * Float(Int16.max))
+        }
+    }
 
-        // Convert and append the payload in fixed-size chunks. Appending per sample
-        // meant one Data mutation per sample — tens of millions of them for a 64-bar
-        // arrangement — and building the whole [Int16] first held a second buffer the
-        // size of the render alongside `samples`. FixedWidthInteger bytes are
-        // little-endian on every platform this app runs on, which is what RIFF wants.
-        let chunkSize = 65_536
-        let conversionInterval = max(1, samples.count / 20)
-        var nextProgress = 0
-        var scratch = [Int16]()
-        scratch.reserveCapacity(min(chunkSize, samples.count))
-
-        var index = 0
-        while index < samples.count {
-            let end = min(samples.count, index + chunkSize)
-            scratch.removeAll(keepingCapacity: true)
-            for sampleIndex in index..<end {
-                scratch.append(Int16(max(-1, min(1, samples[sampleIndex])) * Float(Int16.max)))
-            }
-            scratch.withUnsafeBytes { data.append(contentsOf: $0) }
-            index = end
-
-            if index >= nextProgress {
-                onProgress(0.95 + Double(index) / Double(max(1, samples.count)) * 0.05)
-                nextProgress = index + conversionInterval
+    /// Renders a take straight into a WAV file on disk, a block at a time.
+    ///
+    /// Nothing here is the size of the song. A long arrangement is tens of megabytes of 16-bit
+    /// audio and twice that while it is still Floats, so the old pair of buffers — the render and
+    /// the encoded `Data` — peaked far above the size of the file being handed over, and how long a
+    /// take could be was a question about the phone's spare memory. The stream holds one block of
+    /// each instead.
+    ///
+    /// The file lands where a handover needs it: the activity sheet is given this URL, and the Files
+    /// picker copies this same file, so neither of them holds the audio in memory either.
+    @discardableResult
+    static func streamWave(project: ByteProject, patterns sourcePatterns: [BytePattern]? = nil, sampleRate: Double = 44_100, to url: URL, onProgress: @Sendable (Double) -> Void = { _ in }) throws -> URL {
+        let patterns = sourcePatterns ?? project.arrangedPatterns
+        let frames = patterns.isEmpty ? 0 : waveFrameCount(project: project, patterns: patterns, sampleRate: sampleRate)
+        // Stereo 16-bit: four bytes per frame.
+        let dataSize = UInt32(frames * 4)
+        var pcm = [Int16](repeating: 0, count: waveBlockFrames * 2)
+        try ByteWaveFile.withStagingFile(at: url) { handle in
+            try handle.write(contentsOf: waveHeader(dataSize: dataSize, sampleRate: sampleRate))
+            try forEachWaveBlock(project: project, patterns: patterns, frames: frames, sampleRate: sampleRate, onProgress: onProgress) { block in
+                convertToPCM(block, into: &pcm)
+                try pcm.withUnsafeBytes { raw in
+                    try handle.write(contentsOf: Data(bytes: raw.baseAddress!, count: block.count * 2))
+                }
             }
         }
+        return url
+    }
 
-        onProgress(1.0)
+    /// The whole take as WAV bytes in memory.
+    ///
+    /// The app's export path no longer uses this — it streams to a file — but the reference-encoding
+    /// tests do, and sharing one encoder with `streamWave` is what makes the two provably the same
+    /// audio rather than merely similar.
+    static func wavData(project: ByteProject, patterns sourcePatterns: [BytePattern]? = nil, sampleRate: Double = 44_100, onProgress: @Sendable (Double) -> Void = { _ in }) -> Data {
+        let patterns = sourcePatterns ?? project.arrangedPatterns
+        let frames = patterns.isEmpty ? 0 : waveFrameCount(project: project, patterns: patterns, sampleRate: sampleRate)
+        // Stereo 16-bit: four bytes per frame.
+        let dataSize = UInt32(frames * 4)
+        var data = waveHeader(dataSize: dataSize, sampleRate: sampleRate)
+        var pcm = [Int16](repeating: 0, count: waveBlockFrames * 2)
+        // Reserving the payload up front keeps the appends below from repeatedly reallocating as the
+        // buffer grows.
+        data.reserveCapacity(44 + Int(dataSize))
+        forEachWaveBlock(project: project, patterns: patterns, frames: frames, sampleRate: sampleRate, onProgress: onProgress) { block in
+            convertToPCM(block, into: &pcm)
+            pcm.withUnsafeBytes { data.append(contentsOf: $0.prefix(block.count * 2)) }
+        }
         return data
     }
 

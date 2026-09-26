@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 struct EditorView: View {
@@ -406,24 +407,30 @@ struct EditorView: View {
                         .accessibilityHidden(true)
                 }
                 Spacer(minLength: 4)
-                // Visible only once the receipt backs the Export Pack entitlement.
+                // Visible only once the receipt backs the export entitlement, and deliberately
+                // wordless: there is one paid export — WAV — so a badge that spells out a
+                // purchase name would be naming a thing the user never bought. The label stays
+                // for VoiceOver, which cannot read a lock drawn as a shape.
+                //
+                // It also opens the export sheet, because the entitlement is the only thing
+                // keeping that sheet's WAV row reachable and a padlock that only reports is a
+                // padlock that has to be walked away from to be used.
                 if storeKit.hasReceiptEntitlement {
-                    HStack(spacing: 4) {
+                    Button {
+                        showExport = true
+                    } label: {
                         Image(systemName: "lock.open.fill")
-                            .font(.system(size: 9, weight: .black))
-                        Text("EXPORT PACK")
-                            .font(.custom("Futura-Bold", size: 8))
-                            .tracking(0.6)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.7)
+                            .font(.system(size: 11, weight: .black))
+                            .foregroundStyle(Color.gbGlow)
+                            .frame(minWidth: 32, minHeight: 32)
+                            .background(Color.hardwareBlack)
+                            .clipShape(Capsule())
+                            .overlay(Capsule().stroke(Color.gbGlow.opacity(0.55), lineWidth: 1))
+                            .contentShape(Capsule())
                     }
-                    .foregroundStyle(Color.gbGlow)
-                    .padding(.horizontal, 9)
-                    .frame(minHeight: 32)
-                    .background(Color.hardwareBlack)
-                    .clipShape(Capsule())
-                    .overlay(Capsule().stroke(Color.gbGlow.opacity(0.55), lineWidth: 1))
-                    .accessibilityLabel("Export Pack unlocked")
+                    .buttonStyle(ArcadePressStyle())
+                    .accessibilityLabel("Export WAV unlocked")
+                    .accessibilityHint("Tap to open")
                     .accessibilityIdentifier("exportPackBadge")
                 }
                 HStack(spacing: 6) {
@@ -1062,7 +1069,11 @@ struct EditorView: View {
 
     private var restoredPadEditor: some View {
         LCDPanel(title: "\(store.selectedChannel.title) / 16 STEP LOOP", header: {
-            RestoredDiceButton(label: "Randomize melody", compact: true, live: store.isPlaying) { randomizeMelody() }
+            RestoredDiceButton(
+                label: store.selectedChannel == .drum ? "Shuffle drum beat" : "Randomize melody",
+                compact: true,
+                live: store.isPlaying
+            ) { randomizeSelectedRow() }
         }) {
             VStack(spacing: 6) {
                 RestoredNoteGrid(
@@ -1503,6 +1514,16 @@ struct EditorView: View {
         audio.audition(channel: store.selectedChannel, note: note, project: store.project)
     }
     private func randomizeMelody() { guard store.randomizeSelectedMelody() else { store.presentToast("SELECT A MELODIC CHANNEL"); return }; requestPlaybackRefresh() }
+
+    /// One dice per row: the selected row decides whether it writes notes or a beat, so the button
+    /// never reports "wrong row" for a row it is sitting directly above.
+    private func randomizeSelectedRow() {
+        guard store.selectedChannel == .drum else { randomizeMelody(); return }
+        guard let feel = store.shuffleSelectedDrums() else { store.presentToast("SELECT THE DRUM CHANNEL"); return }
+        Haptics.toggle()
+        store.presentToast("DRUM BEAT · \(feel.title)")
+        requestPlaybackRefresh()
+    }
     private func randomizeSound() { guard store.randomizeSelectedPatch() else { store.presentToast("SELECT A MELODIC CHANNEL"); return }; requestPlaybackRefresh() }
 
     private func requestPatternSelection(_ id: UUID) {
@@ -3739,12 +3760,39 @@ struct ExportView: View {
     @Environment(StoreKitManager.self) private var storeKit
     @Environment(\.dismiss) private var dismiss
     let useSongArrangement: Bool
+    /// Where a rendered take should end up. The render is identical either way — only the handover
+    /// differs — so the choice is made when the button is tapped and read when the file exists.
+    private enum WaveDestination { case files, share }
+    /// A finished take on disk and where it is going. `Identifiable` so the sheet can be driven by
+    /// the take itself: the URL is what the sheet presents, and a new render must re-present it even
+    /// when the file name is unchanged.
+    ///
+    /// One sheet for both handovers rather than one each: stacked presentation modifiers on a single
+    /// view are the kind of thing SwiftUI quietly drops, and a save and a share are the same file
+    /// with a different picker in front of it.
+    private struct WaveHandover: Identifiable {
+        let id = UUID()
+        let destination: WaveDestination
+        let url: URL
+    }
+    /// What this sheet can say about the take in front of it. Nothing has been rendered, or the file
+    /// is ready — and in that second case whether the last handover reused it or paid for it again,
+    /// which is the difference between "ready" and "already prepared".
+    private enum TakeRenderStatus { case rendered, reused }
+
     @State private var showPaywall = false
-    @State private var waveDocument = ByteWaveDocument()
-    @State private var showWaveExporter = false
+    @State private var handover: WaveHandover?
     @State private var exportProgress = 0.0
     @State private var isRenderingWave = false
     @State private var renderTask: Task<Void, Never>?
+    @State private var takeRenderStatus: TakeRenderStatus?
+
+    /// The pattern sequence a render would use. Song Mode plays the song's bars; every other page
+    /// plays the pattern it was showing, so the same screen offers two different pieces of audio.
+    private var patternsForExport: [BytePattern] {
+        useSongArrangement ? store.songPlaybackPatterns : store.project.arrangedPatterns
+    }
+
     var body: some View {
         NavigationStack {
             ZStack {
@@ -3756,11 +3804,25 @@ struct ExportView: View {
                         .multilineTextAlignment(.center)
                     exportButton("WAV AUDIO", "SYNTHESIZED / 44.1 KHZ", "waveform", locked: !storeKit.canExport, identifier: "export.wav") {
                         guard storeKit.canExport else { showPaywall = true; return }
-                        startWaveExport()
+                        startWaveExport(to: .files)
+                    }
+                    exportButton("SHARE WAV", "FILES / MESSAGES / AIRDROP", "square.and.arrow.up", locked: !storeKit.canExport, identifier: "export.share") {
+                        guard storeKit.canExport else { showPaywall = true; return }
+                        startWaveExport(to: .share)
                     }
                     if isRenderingWave { renderProgressView }
+                    // Says what the next tap will cost: the file is already written, and after a
+                    // handover that reused it, that the track is not about to be synthesized
+                    // again. Hidden while a render is running, because then nothing is ready yet.
+                    if let takeRenderStatus, !isRenderingWave {
+                        Text(takeRenderStatus == .reused ? "RENDERED EARLIER · NO RE-RENDER NEEDED" : "RENDERED · READY TO EXPORT")
+                            .font(.custom("Futura-Bold", size: 9))
+                            .foregroundStyle(Color.gbGlow)
+                            .multilineTextAlignment(.center)
+                            .accessibilityIdentifier("export.ready")
+                    }
                     if !storeKit.canExport {
-                        Text("EXPORT PACK — WAV AUDIO / ONE-TIME UNLOCK")
+                        Text("WAV EXPORT — ONE-TIME UNLOCK")
                             .font(.custom("Futura-Bold", size: 9))
                             .foregroundStyle(Color.mutedText)
                             .multilineTextAlignment(.center)
@@ -3773,7 +3835,19 @@ struct ExportView: View {
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("DONE") { dismiss() }.disabled(isRenderingWave) } }
             .sheet(isPresented: $showPaywall) { ExportPaywallView() }
         }
-        .fileExporter(isPresented: $showWaveExporter, document: waveDocument, contentTypes: [.bytePocketWave], defaultFilename: store.project.name.lowercased() + ".wav") { _ in }
+        .sheet(item: $handover) { wave in
+            switch wave.destination {
+            case .files:
+                FilesExportSheet(url: wave.url, onFinish: { handover = nil })
+            case .share:
+                ActivitySheet(items: [wave.url])
+            }
+        }
+        // Opening onto a take that was rendered before this visit should already say so, since the
+        // cache outlives the sheet.
+        .onAppear {
+            takeRenderStatus = store.cachedWaveURL(project: store.project, patterns: patternsForExport) != nil ? .rendered : nil
+        }
         .onDisappear { renderTask?.cancel() }
         .preferredColorScheme(.dark)
     }
@@ -3800,26 +3874,53 @@ struct ExportView: View {
         .accessibilityValue("\(Int(exportProgress * 100)) percent complete")
     }
 
-    private func startWaveExport() {
+    /// Renders the take into the file both handovers read from, streaming as it goes.
+    ///
+    /// The audio is never held in memory — not the render, not the encoded bytes — because the file
+    /// is where it was always going to end up: the activity sheet needs a URL to hand to another
+    /// app, and so does the Files picker. A cache hit is therefore just the same URL discovered a
+    /// moment earlier, and what it skips is the whole synthesis rather than a copy.
+    private func startWaveExport(to destination: WaveDestination) {
         guard !isRenderingWave else { return }
+        let project = store.project
+        let patterns = patternsForExport
+        // Saving to Files and then sharing, or coming back to this screen while the take is
+        // untouched, is the same audio twice, so a hit hands over the file the last render left
+        // behind without synthesizing anything.
+        if let cached = store.cachedWaveURL(project: project, patterns: patterns) {
+            takeRenderStatus = .reused
+            handover = WaveHandover(destination: destination, url: cached)
+            return
+        }
         isRenderingWave = true
         exportProgress = 0
-        let project = store.project
-        let patterns = useSongArrangement ? store.songPlaybackPatterns : store.project.arrangedPatterns
+        let url = ByteWaveFile.url(named: project.name)
         let progressStream = AsyncStream<Double>.makeStream()
         let worker = Task.detached(priority: .userInitiated) {
             defer { progressStream.continuation.finish() }
-            return ByteRenderer.wavData(project: project, patterns: patterns) { value in
+            return try ByteRenderer.streamWave(project: project, patterns: patterns, to: url) { value in
                 progressStream.continuation.yield(value)
             }
         }
         renderTask = Task { @MainActor in
-            async let renderedData = worker.value
+            // The worker finishes the stream when the file is whole, so draining it is also what
+            // waits for the write.
             for await value in progressStream.stream { exportProgress = value }
-            waveDocument = ByteWaveDocument(data: await renderedData)
-            exportProgress = 1
-            isRenderingWave = false
-            showWaveExporter = true
+            do {
+                let file = try await worker.value
+                store.cacheWaveURL(file, project: project, patterns: patterns)
+                exportProgress = 1
+                isRenderingWave = false
+                takeRenderStatus = .rendered
+                handover = WaveHandover(destination: destination, url: file)
+            } catch {
+                // Nothing was handed over and nothing was cached, so the screen goes back to
+                // offering a fresh render instead of claiming a take it does not have.
+                exportProgress = 0
+                isRenderingWave = false
+                takeRenderStatus = nil
+                store.presentToast("COULD NOT WRITE THE FILE · CHECK FREE SPACE")
+            }
         }
     }
 
@@ -3833,7 +3934,7 @@ struct ExportView: View {
                     Image(systemName: "lock.fill")
                         .font(.system(size: 12))
                         .foregroundStyle(Color.amber)
-                        .accessibilityLabel("\(title) requires the Export Pack")
+                        .accessibilityLabel("\(title) requires the one-time WAV export unlock")
                 } else {
                     Image(systemName: "chevron.right")
                 }
@@ -3850,6 +3951,56 @@ struct ExportView: View {
     }
 }
 
+/// The Files picker, wrapped for SwiftUI, for the copy of the take the user wants to keep.
+///
+/// This is the URL-shaped way to save a file: the picker is handed the streamed file and copies it
+/// itself, where SwiftUI's `fileExporter` wants a `FileDocument` whose contents are already in
+/// memory — the whole take, back in RAM, at the end of a render that streamed to avoid exactly that.
+/// Both handovers now read the same file the renderer wrote.
+private struct FilesExportSheet: UIViewControllerRepresentable {
+    let url: URL
+    let onFinish: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(onFinish: onFinish) }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(forExporting: [url])
+        picker.delegate = context.coordinator
+        picker.shouldShowFileExtensions = true
+        return picker
+    }
+
+    func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
+
+    /// Ends the sheet either way, because a picked destination and a cancelled pick both finish the
+    /// handover — and the binding has to be cleared or the next export would find the sheet up.
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        private let onFinish: () -> Void
+
+        init(onFinish: @escaping () -> Void) { self.onFinish = onFinish }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) { onFinish() }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { onFinish() }
+    }
+}
+
+/// The system activity sheet, wrapped for SwiftUI.
+///
+/// It is presented as a sheet carrying one file URL rather than through `ShareLink`, because the
+/// file has to be rendered before it can be offered: `ShareLink` needs its item up front, which
+/// would leave the sheet showing a button that does nothing until a render finishes, then needing a
+/// second tap to do what the first one already meant.
+private struct ActivitySheet: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+}
+
 struct ExportPaywallView: View {
     @Environment(GameStore.self) private var store
     @Environment(StoreKitManager.self) private var storeKit
@@ -3859,7 +4010,7 @@ struct ExportPaywallView: View {
             ZStack {
                 PocketBackdrop()
                 VStack(spacing: 16) {
-                    Text("EXPORT PACK").font(.custom("Futura-Bold", size: 27)).foregroundStyle(Color.gbLight)
+                    Text("WAV EXPORT").font(.custom("Futura-Bold", size: 27)).foregroundStyle(Color.gbLight)
                     Text("ONE-TIME UNLOCK / NO SUBSCRIPTION").font(.custom("Futura-Bold", size: 10)).foregroundStyle(Color.mutedText)
                     VStack(alignment: .leading, spacing: 10) {
                         Text("WAV AUDIO RENDER").font(.custom("Futura-Bold", size: 11)).foregroundStyle(Color.gbGlow)
@@ -3873,7 +4024,7 @@ struct ExportPaywallView: View {
                         .foregroundStyle(Color.mutedText)
                         .multilineTextAlignment(.center)
                     if storeKit.hasReceiptEntitlement {
-                        Text("EXPORT PACK LOADED").font(.custom("Futura-Bold", size: 11)).foregroundStyle(Color.gbGlow)
+                        Text("WAV EXPORT UNLOCKED").font(.custom("Futura-Bold", size: 11)).foregroundStyle(Color.gbGlow)
                     } else {
                         // Entitlement is the only gate; a stray .purchased status with no
                         // receipt must never claim the unlock.
@@ -3895,7 +4046,7 @@ struct ExportPaywallView: View {
                 }
                 .padding(22)
             }
-            .navigationTitle("EXPORT PACK")
+            .navigationTitle("WAV EXPORT")
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("CLOSE") { dismiss() } } }
         }
         .task {

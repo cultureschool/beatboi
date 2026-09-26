@@ -913,6 +913,21 @@ final class GameStore {
         return true
     }
 
+    /// Fills the pattern in front of the user with a fresh random drum beat and reports the feel
+    /// it landed on, so the caller can say which backbeat it just heard.
+    ///
+    /// Guarded to the drum row for the same reason `randomizeSelectedMelody` is guarded to the
+    /// melodic ones: a dice that rewrites a row the user is not looking at reads as a dice that
+    /// does nothing. The two never overlap, so one button can mean whichever row is selected.
+    func shuffleSelectedDrums() -> ByteDrumFeel? {
+        guard selectedChannel == .drum,
+              let index = project.patterns.firstIndex(where: { $0.id == currentPatternID }) else { return nil }
+        let feel = project.patterns[index].shuffleDrums(nextInt: { range in Int.random(in: range) })
+        selectedStep = nil
+        touch()
+        return feel
+    }
+
     /// Clears one channel row while keeping the edit undoable and recoverable.
     func clearChannelRow(_ channel: ByteChannel) {
         guard let patternIndex, project.patterns.indices.contains(patternIndex) else { return }
@@ -1507,6 +1522,69 @@ final class GameStore {
             defaults.set(data, forKey: Self.projectsKey)
         }
         defaults.set(project.id.uuidString, forKey: Self.selectedProjectKey)
+    }
+
+    /// The last rendered take, kept so a second export of an unchanged arrangement reuses the file
+    /// instead of synthesizing the same track again.
+    ///
+    /// A render reads the project *and* the pattern sequence the export screen chose — Song Mode
+    /// plays a different arrangement than the page the sheet was opened from — so both are kept as
+    /// the entry's key. Everything else the render reads lives inside the project, so a snapshot
+    /// that still matches is the whole invalidation story: editing anything makes the comparison
+    /// fail and the next export renders afresh, with no separate "clear the cache" call to forget.
+    ///
+    /// What it holds is a URL, not audio: the render streams into the file the handover needs, so
+    /// there is no second copy to keep warm and nothing to spill. It lives here rather than in
+    /// `ExportView`'s state because a sheet's `@State` is torn down with the sheet, and saving to
+    /// Files then tapping SHARE WAV opens it twice.
+    private var cachedWave: CachedWave?
+
+    private struct CachedWave {
+        let project: ByteProject
+        /// Already run through `patternsIgnoringIdentity`, so a plain comparison is a comparison of
+        /// what the renderer would actually hear.
+        let patterns: [BytePattern]
+        let url: URL
+    }
+
+    /// The id every pattern takes on inside a cache key.
+    private static let waveKeyPatternID = UUID()
+
+    /// Drops pattern identity out of a cache key by giving every pattern the same id.
+    ///
+    /// Pattern `id` is not something the renderer reads, and a derived sequence can carry a fresh
+    /// id for every read: Song Mode fills its silent bars with a newly built `EMPTY BAR` pattern
+    /// each time it is asked, so comparing ids would miss the cache on any arrangement with a gap
+    /// in it — precisely the long takes where a second synthesis costs the most. Every other field
+    /// stays in the comparison, so a new audio-relevant field on `BytePattern` cannot quietly slip
+    /// past the key the way a hand-written list of fields would let it.
+    private static func patternsIgnoringIdentity(_ patterns: [BytePattern]) -> [BytePattern] {
+        patterns.map { pattern in
+            var normalized = pattern
+            normalized.id = waveKeyPatternID
+            return normalized
+        }
+    }
+
+    /// The file holding these exact inputs, or nil when they have changed since the last render and
+    /// the track has to be synthesized again.
+    ///
+    /// A hit also requires the file to still be there. The take lives in the temporary directory,
+    /// which the system may reclaim while the app is running, so an entry that named a file which is
+    /// gone would hand the share sheet nothing while the screen still claimed a finished take.
+    func cachedWaveURL(project: ByteProject, patterns: [BytePattern]) -> URL? {
+        guard let cached = cachedWave,
+              cached.project == project,
+              cached.patterns == Self.patternsIgnoringIdentity(patterns),
+              FileManager.default.fileExists(atPath: cached.url.path) else { return nil }
+        return cached.url
+    }
+
+    /// Records a finished render. One entry: the next render replaces it, so the cache never grows
+    /// with the number of takes the user has exported, and what it holds is one URL — the audio it
+    /// names is the file the render streamed to disk, never more than a single take's worth.
+    func cacheWaveURL(_ url: URL, project: ByteProject, patterns: [BytePattern]) {
+        cachedWave = CachedWave(project: project, patterns: Self.patternsIgnoringIdentity(patterns), url: url)
     }
 
     /// Encoded JSON for each project, kept so a save only re-encodes the project that changed.

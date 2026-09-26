@@ -11,6 +11,9 @@ struct AquaSortApp: App {
                 .environment(store)
                 .environment(storeKit)
                 .task {
+                    // Seeded before the first load, so the entitlement the fixture plants is
+                    // folded in by the same reconcile that reads a real receipt.
+                    storeKit.seedEntitlementForUITestIfNeeded()
                     await storeKit.load()
                     // The persisted flag speeds up first paint; the receipt is the
                     // source of truth and reconciles it both directions.

@@ -773,6 +773,245 @@ final class BeatboiTests: XCTestCase {
         defaults.removePersistentDomain(forName: suite)
     }
 
+    /// A handover names a real file, and names it the way the receiving app will show it.
+    func testWaveFileLandsUnderTheProjectsNameInOneKnownPlace() {
+        let url = ByteWaveFile.url(named: "FIRST BEAT")
+        XCTAssertEqual(url.lastPathComponent, "first beat.wav")
+        XCTAssertEqual(url.deletingLastPathComponent(), FileManager.default.temporaryDirectory)
+
+        // A project name carrying a path separator still lands as one file in the temporary
+        // directory instead of writing somewhere else or failing outright.
+        let awkward = ByteWaveFile.url(named: "A/B:TAKE")
+        XCTAssertEqual(awkward.lastPathComponent, "a-b-take.wav")
+        XCTAssertEqual(awkward.deletingLastPathComponent(), FileManager.default.temporaryDirectory)
+    }
+
+    /// The streamed file has to be the very bytes the in-memory writer produces, header included:
+    /// this is where the two encoders are pinned together, so streaming can be restructured without
+    /// anyone ever hearing the difference between the exports they already have and the ones this
+    /// build writes.
+    func testStreamedWaveIsByteForByteTheInMemoryEncoding() throws {
+        var project = ByteProject.starter
+        project.tempo = 132
+        let url = ByteWaveFile.url(named: "STREAM CHECK")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        var progress: [Double] = []
+        try ByteRenderer.streamWave(project: project, sampleRate: 8_000, to: url) { progress.append($0) }
+
+        let streamed = try Data(contentsOf: url)
+        let inMemory = ByteRenderer.wavData(project: project, sampleRate: 8_000)
+        XCTAssertEqual(streamed, inMemory)
+        // A player trusts these two sizes, so a stream that miscounted would ship a file that plays
+        // truncated or runs off the end.
+        XCTAssertEqual(streamed.readLittleEndianForTests(UInt32.self, at: 4), UInt32(streamed.count - 8))
+        XCTAssertEqual(streamed.readLittleEndianForTests(UInt32.self, at: 40), UInt32(streamed.count - 44))
+        XCTAssertEqual(progress.last, 1.0, "a finished render has to report itself finished")
+        // The staging file is the render's private business: nothing of it may survive the swap.
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path + ".partial"))
+    }
+
+    /// A second render writes over the previous take rather than appending to it, and a write that
+    /// breaks halfway leaves that previous take exactly where it was.
+    ///
+    /// The cached entry is nothing but this URL, so a fragment here would be a share of half a song.
+    func testStreamingReplacesThePreviousTakeAndNeverLeavesAFragment() throws {
+        let url = ByteWaveFile.url(named: "REPLACED TAKE")
+        defer { try? FileManager.default.removeItem(at: url) }
+        var project = ByteProject.starter
+        project.patterns[0].steps[0][0] = 60
+        try ByteRenderer.streamWave(project: project, sampleRate: 8_000, to: url)
+        let firstTake = try Data(contentsOf: url)
+
+        // A slower tempo is a longer file, so an append would show up as the wrong length.
+        project.tempo = 200
+        try ByteRenderer.streamWave(project: project, sampleRate: 8_000, to: url)
+        let secondTake = try Data(contentsOf: url)
+        XCTAssertNotEqual(secondTake.count, firstTake.count)
+        XCTAssertEqual(secondTake, ByteRenderer.wavData(project: project, sampleRate: 8_000))
+
+        struct WriteBroke: Error {}
+        XCTAssertThrowsError(try ByteWaveFile.withStagingFile(at: url) { handle in
+            try handle.write(contentsOf: Data(repeating: 0x11, count: 64))
+            throw WriteBroke()
+        })
+        XCTAssertEqual(try Data(contentsOf: url), secondTake, "a failed write must leave the last complete take in place")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path + ".partial"))
+    }
+
+    /// Saving a take and then sharing the same one must not synthesize it twice.
+    ///
+    /// The cached entry is keyed on everything the render reads — the project and the pattern
+    /// sequence, which differ between Song Mode and the page the sheet was opened from — so this
+    /// pins both halves: a match hands back the very bytes that were rendered, and an edit to
+    /// either input misses. The invalidation is the part that matters, because a cache that kept
+    /// serving a stale take would export the wrong audio rather than merely the slow way.
+    func testWaveCacheIsReusedUntilTheProjectOrPatternsChange() {
+        let suite = "BeatboiWaveCacheTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+
+        let project = store.project
+        let patterns = store.project.arrangedPatterns
+        let rendered = ByteWaveFile.url(named: "CACHE CHECK A")
+        try? Data([0x52, 0x49, 0x46, 0x46]).write(to: rendered)
+        defer { try? FileManager.default.removeItem(at: rendered) }
+
+        // Nothing rendered yet, so the first tap has to do the work.
+        XCTAssertNil(store.cachedWaveURL(project: project, patterns: patterns))
+
+        // The second tap — the other export row, or the same screen re-opened — reuses the file.
+        store.cacheWaveURL(rendered, project: project, patterns: patterns)
+        XCTAssertEqual(store.cachedWaveURL(project: project, patterns: patterns), rendered)
+
+        // A different pattern sequence is different audio, so it must not reuse the take.
+        XCTAssertNil(store.cachedWaveURL(project: project, patterns: [BytePattern.empty(name: "OTHER")]))
+
+        // Any project edit invalidates the entry without anything having to clear it.
+        store.updateTempo(141)
+        XCTAssertNil(store.cachedWaveURL(project: store.project, patterns: patterns))
+
+        // The next render replaces the stale entry rather than adding a second one.
+        let replaced = ByteWaveFile.url(named: "CACHE CHECK B")
+        try? Data([0x09]).write(to: replaced)
+        defer { try? FileManager.default.removeItem(at: replaced) }
+        store.cacheWaveURL(replaced, project: store.project, patterns: patterns)
+        XCTAssertEqual(store.cachedWaveURL(project: store.project, patterns: patterns), replaced)
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    /// The cache keeps a URL, not the audio, so it has to notice when the file behind the URL is
+    /// gone: the temporary directory is the system's to reclaim while the app is running, and a hit
+    /// naming a file that is no longer there would hand the share sheet nothing at all.
+    func testWaveCacheMissesWhenTheSystemReclaimedTheFile() throws {
+        let suite = "BeatboiWaveCachePurgeTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+
+        let taken = ByteWaveFile.url(named: "CACHE PURGED")
+        try Data([0x52, 0x49, 0x46, 0x46]).write(to: taken)
+        store.cacheWaveURL(taken, project: store.project, patterns: store.project.arrangedPatterns)
+        XCTAssertEqual(store.cachedWaveURL(project: store.project, patterns: store.project.arrangedPatterns), taken)
+
+        try FileManager.default.removeItem(at: taken)
+        XCTAssertNil(
+            store.cachedWaveURL(project: store.project, patterns: store.project.arrangedPatterns),
+            "an entry whose file is gone has to render again rather than claim a take it no longer has"
+        )
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    /// Song Mode fabricates a silent bar for every gap in the arrangement, and builds it anew on
+    /// each read, so the same arrangement hands back a sequence whose bars carry different ids
+    /// every time. The cache has to see through that: a key that compared identities would miss
+    /// on exactly the long arrangements worth caching most.
+    func testWaveCacheStillHitsWhenSongModeRebuildsItsSilentBars() {
+        let suite = "BeatboiWaveCacheSongTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+
+        store.addPattern()
+        let secondPatternID = store.currentPatternID
+        store.project.songModeEnabled = true
+        store.project.songArrangement[0] = ByteSongSlot(patternID: store.project.patterns[0].id, isContinuation: false)
+        // Bar 1 is left unassigned: that gap is the fabricated bar this test is about.
+        store.project.songArrangement[2] = ByteSongSlot(patternID: secondPatternID, isContinuation: false)
+
+        let firstRead = store.songPlaybackPatterns
+        XCTAssertEqual(firstRead.count, 3)
+        XCTAssertEqual(firstRead[1].name, "EMPTY BAR")
+        let rendered = ByteWaveFile.url(named: "CACHE SONG")
+        try? Data([0xAB, 0xCD]).write(to: rendered)
+        defer { try? FileManager.default.removeItem(at: rendered) }
+        store.cacheWaveURL(rendered, project: store.project, patterns: firstRead)
+
+        // A second read of the same arrangement mints the placeholder bar afresh.
+        let secondRead = store.songPlaybackPatterns
+        XCTAssertNotEqual(firstRead[1].id, secondRead[1].id, "the test needs the derived bar to come back with a new id")
+        XCTAssertEqual(store.cachedWaveURL(project: store.project, patterns: secondRead), rendered)
+
+        // The same project read through its other arrangement is different audio, so the entry
+        // must not answer for it: Song Mode and the page the sheet was opened from disagree.
+        XCTAssertNil(store.cachedWaveURL(project: store.project, patterns: store.project.arrangedPatterns))
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    /// The dice on the drum row has exactly one rule to keep: the snare lands on the backbeat.
+    ///
+    /// Rolled many times through a seeded picker, because a generator that keeps the rule only
+    /// sometimes is the bug this test exists to catch, and one roll cannot see that.
+    func testDrumShuffleAlwaysKeepsTheSnareOnTheBackbeat() {
+        var state: UInt64 = 0x9E3779B97F4A7C15
+        func nextInt(_ range: ClosedRange<Int>) -> Int {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            let span = range.upperBound - range.lowerBound + 1
+            return range.lowerBound + Int((state >> 33) % UInt64(span))
+        }
+
+        var seen: Set<String> = []
+        for roll in 0..<200 {
+            var pattern = BytePattern.empty(name: "ROLL \(roll)")
+            let row = ByteChannel.allCases.firstIndex(of: .drum)!
+            pattern.steps[row][7] = ByteDrumVoice.note(voice: .perc)
+            pattern.noteLengths[row][7] = 4
+
+            let feel = pattern.shuffleDrums(nextInt: nextInt)
+            seen.insert(feel.title)
+
+            let hits = pattern.drumHits
+            let snares = hits.filter { $0.voice == .snare }.map(\.step).sorted()
+            XCTAssertEqual(snares, feel.snareSteps.sorted(), "roll \(roll) moved the backbeat")
+            XCTAssertTrue(hits.contains(ByteDrumHit(step: 0, voice: .kick)), "roll \(roll) lost the downbeat")
+            for anchor in feel.kickAnchors {
+                XCTAssertTrue(hits.contains(ByteDrumHit(step: anchor, voice: .kick)), "roll \(roll) lost a kick anchor")
+            }
+            // A drum row holds one hit per step, and every hit is its own voice.
+            XCTAssertEqual(Set(hits.map(\.step)).count, hits.count, "roll \(roll) stacked two voices on one step")
+            XCTAssertTrue(pattern.noteLengths[row].allSatisfy { $0 == 1 }, "roll \(roll) left drum holds behind")
+        }
+        XCTAssertEqual(seen.count, ByteDrumFeel.allCases.count, "one feel never came up")
+    }
+
+    /// A stuck picker must not be able to spin the fill loops, since the picker is the only part of
+    /// `shuffleDrums` a caller controls.
+    func testDrumShuffleTerminatesWithADegeneratePicker() {
+        let row = ByteChannel.allCases.firstIndex(of: .drum)!
+        for constant in 0...3 {
+            var pattern = BytePattern.empty(name: "STUCK \(constant)")
+            let feel = pattern.shuffleDrums { _ in constant }
+            let snares = pattern.drumHits.filter { $0.voice == .snare }.map(\.step).sorted()
+            XCTAssertEqual(snares, feel.snareSteps.sorted())
+            XCTAssertTrue(pattern.noteLengths[row].allSatisfy { $0 == 1 })
+        }
+    }
+
+    func testDrumShuffleWritesOnlyTheSelectedDrumRow() {
+        let suite = "BeatboiDrumShuffleTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = GameStore(defaults: defaults)
+        let drumRow = ByteChannel.allCases.firstIndex(of: .drum)!
+
+        store.selectedChannel = .pulseA
+        let drumsBefore = store.project.patterns[0].steps[drumRow]
+        XCTAssertNil(store.shuffleSelectedDrums(), "the drum dice should refuse a melodic row")
+        XCTAssertEqual(store.project.patterns[0].steps[drumRow], drumsBefore)
+
+        store.selectedChannel = .drum
+        let melodyBefore = store.project.patterns[0].steps[0]
+        let feel = store.shuffleSelectedDrums()
+        XCTAssertNotNil(feel)
+        XCTAssertEqual(
+            store.project.patterns[0].drumHits.filter { $0.voice == .snare }.map(\.step).sorted(),
+            feel!.snareSteps.sorted()
+        )
+        XCTAssertEqual(store.project.patterns[0].steps[0], melodyBefore, "the beat should not touch a melodic row")
+
+        // One tap of the dice is one undo away from the bar it replaced.
+        store.undo()
+        XCTAssertEqual(store.project.patterns[0].steps[drumRow], drumsBefore)
+        defaults.removePersistentDomain(forName: suite)
+    }
+
     func testNewPatternCreatesFreshEmptySelectedPattern() {
         let suite = "BeatboiNewPatternTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -3185,6 +3424,16 @@ private extension Data {
     func readBigEndianForTests<T: FixedWidthInteger>(_ type: T.Type, at offset: Int) -> T {
         var value: T = 0
         for index in 0..<MemoryLayout<T>.size {
+            value = (value << 8) | T(self[offset + index])
+        }
+        return value
+    }
+
+    /// RIFF sizes are little-endian, so a WAV can only be checked by reading them the way a player
+    /// would.
+    func readLittleEndianForTests<T: FixedWidthInteger>(_ type: T.Type, at offset: Int) -> T {
+        var value: T = 0
+        for index in (0..<MemoryLayout<T>.size).reversed() {
             value = (value << 8) | T(self[offset + index])
         }
         return value
