@@ -46,6 +46,12 @@ enum ByteScaleMode: String, CaseIterable, Codable, Identifiable, Sendable {
         }
     }
 
+    /// Snaps a note to the nearest pitch in this scale and key, clamped to the 24...96 register.
+    ///
+    /// Ties resolve to the **lower** pitch. That bias is intentional for one-off input snapping,
+    /// but it means repeated re-snapping of the same note is not drift-free — applying it while
+    /// walking through keys would pull the melody down a semitone each time. Callers that change
+    /// the project key must transpose instead of re-quantizing (see `GameStore.updateVoicing`).
     func quantize(_ note: Int, key: Int) -> Int {
         guard let intervals else { return min(96, max(24, note)) }
         let root = min(11, max(0, key))
@@ -88,17 +94,29 @@ enum ByteDrumVoice: Int, CaseIterable, Identifiable, Sendable {
         switch self {
         case .kick: return "KICK"
         case .snare: return "SNARE"
-        case .hiHat: return "PERC"
-        case .perc: return "HI-HAT"
+        case .hiHat: return "HI-HAT"
+        case .perc: return "PERC"
         }
     }
 
     var baseNote: Int { [36, 38, 42, 49][rawValue] }
+
+    /// The two samples behind this voice.
+    ///
+    /// Both takes have to be the same instrument, or the second SAMPLE button is a lie: measure
+    /// them and a drum's identity is the register its energy sits in. SNARE and HI-HAT each
+    /// carried a take that failed that — a dark tom and a mid drum — so those two are now a
+    /// re-tune of their sibling (the snare a minor third down, the hi-hat a major third up), which
+    /// keeps a pair one instrument while staying two different hits. `DrumSampleAuditTests`
+    /// measures the files and fails if a pair drifts an octave apart.
     var resourceNames: [String] {
         switch self {
         case .kick: return ["kick1", "kick2"]
         case .snare: return ["snare1", "snare2"]
         case .hiHat: return ["hihat1", "hihat2"]
+        // Reversed: take 1 is the shorter, lower take of the two here, and that is the one the
+        // voice was voiced against. The order is positional, so the row's buttons read SAMPLE 1
+        // and 2 whichever file backs them.
         case .perc: return ["perc2", "perc1"]
         }
     }
@@ -113,8 +131,8 @@ enum ByteDrumVoice: Int, CaseIterable, Identifiable, Sendable {
     }
 
     /// Maps a completed hold-drag to the quick drum sketching layout.
-    /// Vertical up is Snare, horizontal left is the displayed Perc voice,
-    /// horizontal right is the displayed Hi-hat voice,
+    /// Vertical up is Snare, horizontal left is the Hi-hat voice,
+    /// horizontal right is the Perc voice,
     /// and a downward/neutral gesture keeps the default Kick.
     static func voice(horizontal: Int, vertical: Int) -> ByteDrumVoice {
         if abs(horizontal) > abs(vertical) {
@@ -127,6 +145,214 @@ enum ByteDrumVoice: Int, CaseIterable, Identifiable, Sendable {
     static func variant(for note: Int) -> Int { 1 }
     static func note(voice: ByteDrumVoice, variant: Int = 1) -> Int { voice.baseNote }
     static func label(for note: Int) -> String { voice(for: note).title }
+}
+
+extension ByteDrumVoice {
+    /// How a supplied sample is played as this voice.
+    ///
+    /// The eight bundled one-shots were not recorded as a kit, and measured they do not behave
+    /// like one. The kick's energy sits at 118 Hz with a 178 ms body; the snare is broadband
+    /// noise with no low end at all; the hi-hat is 38 ms of hat followed by a long low rumble
+    /// tail; the perc is the brightest thing in the file at 6.7 kHz. Left alone, three of the
+    /// four occupy the same bright register, the hi-hat rings for as long as a snare, and the
+    /// only thing telling them apart is how loud the mixer happens to have left them. So each
+    /// voice gets a shape — a read rate that puts it in a register of its own, and a tail
+    /// fraction that gives it a length of its own:
+    ///
+    ///  * kick: read at its recorded pitch with the whole tail, so it stays the one low voice
+    ///    and the one long one
+    ///  * snare: read slower for the body its own sample lacks, which is what stops it sounding
+    ///    like a second hi-hat
+    ///  * hi-hat: read fastest and cut to its transient, which also removes the rumble tail
+    ///  * perc: read slightly fast and trimmed to its bright body, staying the brightest voice
+    var playbackRate: Double {
+        switch self {
+        case .kick: return 1.0
+        case .snare: return 0.88
+        case .hiHat: return 1.45
+        case .perc: return 1.18
+        }
+    }
+
+    /// The fraction of the sample this voice plays, measured from its start.
+    var keptFraction: Double {
+        switch self {
+        case .kick: return 1.0
+        case .snare: return 0.8
+        case .hiHat: return 0.36
+        case .perc: return 0.62
+        }
+    }
+
+    /// The source frames this voice plays, once the tail trim is applied.
+    func keptFrameCount(sampleCount: Int) -> Int {
+        guard sampleCount > 0 else { return 0 }
+        return min(sampleCount, max(1, Int((Double(sampleCount) * keptFraction).rounded())))
+    }
+
+    /// How many frames this voice sounds for, read out of this many source frames.
+    ///
+    /// The kept frames divided by the read rate, because a voice read faster is over sooner. This
+    /// is the length of the hit, and it is what a row drawn at the voice's own length measures.
+    func outputFrameCount(sampleCount: Int) -> Int {
+        let kept = keptFrameCount(sampleCount: sampleCount)
+        guard kept > 0 else { return 0 }
+        return max(1, Int((Double(kept) / playbackRate).rounded(.up)))
+    }
+
+    /// The outline of this voice's hit: `points` peaks across the frames it plays, each scaled
+    /// against the voice's own loudest point.
+    ///
+    /// Read through `value(of:voice:at:)` — the reader live playback, export and the preview all
+    /// use — so the picture cannot flatter a voice the ear will not hear. Peaks rather than an
+    /// average, because averaging a decaying hit gives a smaller copy of it rather than its
+    /// outline; scaled per voice, so a quiet voice's shape is legible instead of flat.
+    func envelope(of sample: [Float], points: Int) -> [Double] {
+        guard points > 1 else { return [] }
+        let frames = outputFrameCount(sampleCount: sample.count)
+        guard frames > 0 else { return Array(repeating: 0, count: points) }
+
+        var peaks = Array(repeating: 0.0, count: points)
+        var loudest = 0.0
+        for point in 0..<points {
+            let start = frames * point / points
+            let end = max(start + 1, frames * (point + 1) / points)
+            for position in start..<end {
+                peaks[point] = max(peaks[point], abs(Self.value(of: sample, voice: self, at: Double(position))))
+            }
+            loudest = max(loudest, peaks[point])
+        }
+        guard loudest > 0 else { return peaks }
+        return peaks.map { $0 / loudest }
+    }
+
+    /// The value this voice contributes from a supplied sample at a fractional read position.
+    ///
+    /// Live playback, export and the Sound Lab preview all read through here. A voice shaped one
+    /// way while it plays and another way in a file would be worse than no shape at all, and two
+    /// copies of a resampling loop is how the drum names came to be swapped in the first place.
+    static func value(of sample: [Float], voice: ByteDrumVoice, at position: Double) -> Double {
+        let kept = voice.keptFrameCount(sampleCount: sample.count)
+        guard kept > 0 else { return 0 }
+        let frame = position * voice.playbackRate
+        guard frame < Double(kept) else { return 0 }
+        let index = min(kept - 1, max(0, Int(frame)))
+        let next = min(kept - 1, index + 1)
+        let blend = frame - Double(index)
+        let interpolated = Double(sample[index]) + (Double(sample[next]) - Double(sample[index])) * blend
+        // Ease the final twelfth of the tail out. A trimmed one-shot otherwise ends on a step
+        // from whatever level the cut landed at, which clicks.
+        let remaining = Double(kept) - frame
+        let fadeFrames = Double(max(1, kept / 12))
+        return interpolated * min(1.0, max(0.0, remaining / fadeFrames))
+    }
+
+    /// The order the kit is checked in: from the floor up, the way a player walks a kit.
+    ///
+    /// Written out rather than taken from `allCases`, so the run is pinned by design. The test
+    /// asserts it covers every voice exactly once, which `allCases` would satisfy by definition.
+    static let auditionOrder: [ByteDrumVoice] = [.kick, .snare, .hiHat, .perc]
+
+    /// How far apart the run places its voices, in sixteenth-note steps: four is one beat, so
+    /// the four voices land on the four beats of the bar and a listener can count the run back.
+    ///
+    /// At a fixed interval the same four hits are an arbitrary rhythm that happens to be a
+    /// different tempo from the loop behind them — the ear hears four hits, not a bar.
+    static let auditionStepsPerVoice = 4
+
+    /// Seconds between voices in the run, read from the transport's own sixteenth so the run
+    /// tracks the project tempo instead of carrying a tempo of its own.
+    static func auditionInterval(bpm: Int) -> Double {
+        ByteTransportClock.stepDuration(bpm: bpm) * Double(auditionStepsPerVoice)
+    }
+
+    /// The walk up the kit as hits on the step grid, which is how a pattern's drum row arrives.
+    ///
+    /// Both kit checks are then the same thing — a list of hits walked a step at a time — so one
+    /// runner plays them, at one tempo, with one highlight.
+    static let auditionWalk: [ByteDrumHit] = auditionOrder.enumerated().map { index, voice in
+        ByteDrumHit(step: index * auditionStepsPerVoice, voice: voice)
+    }
+
+    /// What the shape does to the sound, in words — the reader should know what to listen for
+    /// before tapping. Both halves are derived from the numbers above, so the caption cannot
+    /// end up describing a shape the voice no longer has.
+    var character: String { "\(pitchWord) · \(lengthWord)" }
+
+    private var pitchWord: String {
+        switch playbackRate {
+        case ..<0.93: return "DEEPER"
+        case ..<1.07: return "NATIVE"
+        case ..<1.35: return "BRIGHTER"
+        default: return "TIGHTER"
+        }
+    }
+
+    private var lengthWord: String {
+        switch keptFraction {
+        case ..<0.45: return "CLICK"
+        case ..<0.72: return "SHORT"
+        case ..<0.95: return "LONG"
+        default: return "FULL"
+        }
+    }
+}
+
+/// Where a shuffled drum row puts its backbeat.
+///
+/// The backbeat is the one thing a randomizer must not guess at — take the snare off beats 2 and 4
+/// and the bar stops having a middle — so the feel is chosen first and the rest of the row is
+/// filled around it. Sixteen steps read as four beats of four, which is why the step numbers below
+/// are multiples of four.
+///
+/// Half time is the same backbeat heard half as often: the snare lands on beat 3 instead of 2 and
+/// 4, and the second half of the bar opens up for a fill.
+enum ByteDrumFeel: Sendable, CaseIterable {
+    case straight
+    case halfTime
+
+    var title: String {
+        switch self {
+        case .straight: return "SNARE ON 2 & 4"
+        case .halfTime: return "HALF TIME · SNARE ON 3"
+        }
+    }
+
+    /// Steps the snare fills, and never yields. Everything else moves around these.
+    var snareSteps: [Int] {
+        switch self {
+        case .straight: return [4, 12]
+        case .halfTime: return [8]
+        }
+    }
+
+    /// The kick's fixed steps: the bar's downbeat in both feels, plus beat 3 when the snare has
+    /// vacated it, so a straight beat still walks and a half-time beat still has an anchor late in
+    /// the bar.
+    var kickAnchors: [Int] {
+        switch self {
+        case .straight: return [0, 8]
+        case .halfTime: return [0]
+        }
+    }
+
+    /// Steps an extra kick may take this roll. All are offbeats or the "and" of a beat, and none
+    /// is a snare step, so a fill kick can never eat the backbeat.
+    var kickCandidates: [Int] {
+        switch self {
+        case .straight: return [3, 6, 7, 10, 11, 14]
+        case .halfTime: return [6, 7, 10, 11, 14]
+        }
+    }
+}
+
+/// One hit of a drum row: the voice, and the step it lands on.
+///
+/// A plain value so a pattern's row and the walk up the kit can both be handed to one runner, and
+/// so a test can assert the music a kit check will play without playing it.
+struct ByteDrumHit: Equatable, Sendable {
+    let step: Int
+    let voice: ByteDrumVoice
 }
 
 enum ByteChannel: String, CaseIterable, Codable, Identifiable, Sendable {
@@ -149,21 +375,16 @@ enum ByteChannel: String, CaseIterable, Codable, Identifiable, Sendable {
 
     var title: String {
         switch self {
-        case .pulseA: return "PULSE"
-        case .pulseB: return "SQUARE"
+        case .pulseA: return "PULSE 1"
+        case .pulseB: return "PULSE 2"
         case .wave: return "TRIANGLE"
         case .drum: return "DRUM"
         }
     }
 
-    var shortTitle: String {
-        switch self {
-        case .pulseA: return "P"
-        case .pulseB: return "S"
-        case .wave: return "T"
-        case .drum: return "D"
-        }
-    }
+    /// The compact token for this channel, derived from the title so the two cannot disagree.
+    /// Spelled out, it drifted: PULSE 2 carried an "S" left over from an earlier SQUARE naming.
+    var shortTitle: String { String(title.prefix(1)) }
 
     var systemImage: String {
         switch self {
@@ -181,23 +402,53 @@ enum ByteChannel: String, CaseIterable, Codable, Identifiable, Sendable {
         case .drum: return ByteDrumVoice.allCases.map(\.baseNote)
         }
     }
+
+    /// The tap-to-place note for a melodic channel keeps the same root pitch class as
+    /// the project's key while preserving each channel's comfortable register.
+    func rootNote(for key: Int) -> Int {
+        guard self != .drum else { return ByteDrumVoice.kick.baseNote }
+        let root = min(11, max(0, key))
+        switch self {
+        case .pulseA: return 60 + root
+        case .pulseB: return 48 + root
+        case .wave: return 36 + root
+        case .drum: return ByteDrumVoice.kick.baseNote
+        }
+    }
 }
 
 enum ByteEffect: String, CaseIterable, Codable, Identifiable, Hashable, Sendable {
     case echo
     case bitCrush
-    case vibrato
-    case widePulse
-    case delay
 
     var id: String { rawValue }
     var title: String {
         switch self {
         case .echo: return "ECHO"
         case .bitCrush: return "BIT CRUSH"
-        case .vibrato: return "VIBRATO"
-        case .widePulse: return "WIDE PULSE"
-        case .delay: return "DELAY"
+        }
+    }
+}
+
+enum ByteOctaveFlutterPattern: Int, CaseIterable, Codable, Identifiable, Sendable {
+    case baseUp = 0
+    case upBase = 1
+    case baseUpTwoUp = 2
+
+    var id: Int { rawValue }
+    var title: String {
+        switch self {
+        case .baseUp: return "BASE / +1"
+        case .upBase: return "+1 / BASE"
+        case .baseUpTwoUp: return "BASE / +1 / +2 / +1"
+        }
+    }
+
+    var octaveSteps: [Int] {
+        switch self {
+        case .baseUp: return [0, 1]
+        case .upBase: return [1, 0]
+        case .baseUpTwoUp: return [0, 1, 2, 1]
         }
     }
 }
@@ -266,6 +517,10 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
     var vibratoDelay: Int
     var bendRange: Int
     var vibratoRate: Int
+    /// Per-channel NES-style octave flutter speed. Zero disables it.
+    var octaveFlutterAmount: Int
+    /// Per-channel octave path: 0 base/+1, 1 +1/base, 2 base/+1/+2/+1.
+    var octaveFlutterPattern: Int
     var envelopeIncrease: Bool
     var envelopePace: Int
     var sweepPace: Int
@@ -274,6 +529,8 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
     var waveVolume: Int
     /// Fixed wave preset index plus simple tone and decay controls.
     var waveShape: Int
+    /// Retained for project compatibility. Nothing renders it, so the Sound Lab no longer offers
+    /// it as a control: a FILTER row that filtered nothing was the panel lying about the patch.
     var waveFilter: Int
     var waveEnvelope: Int
     // Retained privately for old project compatibility; Drum UI exposes voice controls instead.
@@ -284,7 +541,12 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
     var panRight: Bool
     var lengthCounter: Bool
     var length: Int
-    /// Drum voice used by the Sound Lab selector: 0 kick, 1 snare, 2 hi-hat, 3 crash.
+    /// Mixer state is project data so mute/solo survives autosave and export.
+    var muted: Bool
+    var soloed: Bool
+    /// Drum voice used by the Sound Lab selector: one `ByteDrumVoice` per index, in its order —
+    /// 0 kick, 1 snare, 2 hi-hat, 3 perc. The drum voices themselves decide what each index is
+    /// called; this field only holds the index, so it must not name the voices again.
     var drumVoice: Int
     /// Selected supplied sample (1 or 2) for kick, snare, hi-hat, and perc.
     var drumSamples: [Int]
@@ -294,7 +556,7 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case channel, duty, initialVolume, masterVolume, octave, tremolo, portamento, portamentoTime, envelopeAttack, envelopeDecay, envelopeSustain, envelopeRelease, filter, envelope, vibratoDepth, vibratoCycleLength, vibratoDelay, bendRange, vibratoRate, envelopeIncrease, envelopePace, sweepPace, sweepIncrease, sweepShift
-        case waveVolume, waveShape, waveFilter, waveEnvelope, noiseWidth7Bit, noiseClockShift, noiseDivider, panLeft, panRight, lengthCounter, length
+        case waveVolume, waveShape, waveFilter, waveEnvelope, noiseWidth7Bit, noiseClockShift, noiseDivider, panLeft, panRight, lengthCounter, length, muted, soloed, octaveFlutterAmount, octaveFlutterPattern
         case drumVoice, drumSamples, drumVolumes, drumLengths
     }
 
@@ -317,6 +579,8 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
         self.vibratoDelay = 0
         self.bendRange = 2
         self.vibratoRate = 5
+        self.octaveFlutterAmount = 0
+        self.octaveFlutterPattern = ByteOctaveFlutterPattern.baseUp.rawValue
         self.envelopeIncrease = false
         self.envelopePace = 0
         self.sweepPace = channel == .pulseA ? 2 : 0
@@ -332,6 +596,8 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
         self.panLeft = true
         self.panRight = true
         self.lengthCounter = channel == .drum
+        self.muted = false
+        self.soloed = false
         self.length = 63
         self.drumVoice = 0
         self.drumSamples = [1, 1, 1, 1]
@@ -360,6 +626,8 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
         vibratoDelay = min(100, max(0, try container.decodeIfPresent(Int.self, forKey: .vibratoDelay) ?? vibratoDelay))
         bendRange = min(24, max(0, try container.decodeIfPresent(Int.self, forKey: .bendRange) ?? bendRange))
         vibratoRate = min(12, max(1, try container.decodeIfPresent(Int.self, forKey: .vibratoRate) ?? vibratoRate))
+        octaveFlutterAmount = min(100, max(0, try container.decodeIfPresent(Int.self, forKey: .octaveFlutterAmount) ?? octaveFlutterAmount))
+        octaveFlutterPattern = min(ByteOctaveFlutterPattern.allCases.count - 1, max(0, try container.decodeIfPresent(Int.self, forKey: .octaveFlutterPattern) ?? octaveFlutterPattern))
         envelopeIncrease = try container.decodeIfPresent(Bool.self, forKey: .envelopeIncrease) ?? envelopeIncrease
         envelopePace = try container.decodeIfPresent(Int.self, forKey: .envelopePace) ?? envelopePace
         sweepPace = try container.decodeIfPresent(Int.self, forKey: .sweepPace) ?? sweepPace
@@ -375,6 +643,8 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
         panLeft = try container.decodeIfPresent(Bool.self, forKey: .panLeft) ?? panLeft
         panRight = try container.decodeIfPresent(Bool.self, forKey: .panRight) ?? panRight
         lengthCounter = try container.decodeIfPresent(Bool.self, forKey: .lengthCounter) ?? lengthCounter
+        muted = try container.decodeIfPresent(Bool.self, forKey: .muted) ?? muted
+        soloed = try container.decodeIfPresent(Bool.self, forKey: .soloed) ?? soloed
         length = try container.decodeIfPresent(Int.self, forKey: .length) ?? length
         drumVoice = min(3, max(0, try container.decodeIfPresent(Int.self, forKey: .drumVoice) ?? drumVoice))
         if let samples = try container.decodeIfPresent([Int].self, forKey: .drumSamples), samples.count == 4 {
@@ -408,6 +678,8 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
         try container.encode(vibratoDelay, forKey: .vibratoDelay)
         try container.encode(bendRange, forKey: .bendRange)
         try container.encode(vibratoRate, forKey: .vibratoRate)
+        try container.encode(octaveFlutterAmount, forKey: .octaveFlutterAmount)
+        try container.encode(octaveFlutterPattern, forKey: .octaveFlutterPattern)
         try container.encode(envelopeIncrease, forKey: .envelopeIncrease)
         try container.encode(envelopePace, forKey: .envelopePace)
         try container.encode(sweepPace, forKey: .sweepPace)
@@ -423,6 +695,8 @@ struct ByteChannelPatch: Codable, Hashable, Sendable {
         try container.encode(panLeft, forKey: .panLeft)
         try container.encode(panRight, forKey: .panRight)
         try container.encode(lengthCounter, forKey: .lengthCounter)
+        try container.encode(muted, forKey: .muted)
+        try container.encode(soloed, forKey: .soloed)
         try container.encode(length, forKey: .length)
         try container.encode(drumVoice, forKey: .drumVoice)
         try container.encode(drumSamples, forKey: .drumSamples)
@@ -442,63 +716,339 @@ struct ByteInstrumentPreset: Identifiable, Hashable, Sendable {
     let patch: ByteChannelPatch
     let waveform: [Int]
 
+    /// Shared waveform table for the seeded starter sounds. Kept off
+    /// ByteProject.starter so building the library can never recursively trigger
+    /// starter init.
+    static let defaultWaveform: [Int] = [8, 10, 13, 15, 14, 12, 9, 6, 3, 1, 0, 1, 3, 6, 9, 12, 14, 13, 11, 8, 5, 2, 1, 2, 4, 7, 10, 13, 15, 14, 11, 8]
+
+    /// Hand-tuned starter patches. No longer a user-facing Sound Lab bank — the
+    /// presets exist so ByteProject.starter can seed its channels with sounds that
+    /// map to parameters the live audio engine actually renders.
     static func library(for channel: ByteChannel) -> [ByteInstrumentPreset] {
         switch channel {
         case .pulseA:
             return [
-                preset("lead", "LEAD", channel, duty: 1, volume: 15, envelopePace: 0, sweepPace: 0, sweepShift: 0),
-                preset("laser", "LASER", channel, duty: 0, volume: 15, envelopePace: 2, sweepPace: 2, sweepIncrease: false, sweepShift: 3),
-                preset("jump", "JUMP", channel, duty: 2, volume: 14, envelopePace: 1, sweepPace: 3, sweepIncrease: true, sweepShift: 2),
-                preset("arp", "ARPEGGIO", channel, duty: 1, volume: 13, envelopePace: 0, sweepPace: 0, sweepShift: 0),
-                preset("bell", "BELL", channel, duty: 3, volume: 12, envelopePace: 3, sweepPace: 1, sweepIncrease: true, sweepShift: 1),
-                preset("coin", "COIN", channel, duty: 0, volume: 14, envelopePace: 1, sweepPace: 2, sweepIncrease: true, sweepShift: 2),
-                preset("zap", "ZAP", channel, duty: 0, volume: 15, envelopePace: 1, sweepPace: 1, sweepIncrease: false, sweepShift: 5)
+                tuned("chipLead", "CHIP LEAD", channel) { p in
+                    p.duty = 1
+                    p.initialVolume = 15
+                    p.envelopeDecay = 22
+                    p.envelopeSustain = 100
+                    p.envelopeRelease = 14
+                    p.vibratoDepth = 26
+                    p.vibratoCycleLength = 50
+                    p.vibratoDelay = 30
+                },
+                tuned("laser", "LASER", channel) { p in
+                    p.duty = 0
+                    p.initialVolume = 15
+                    p.envelopeAttack = 2
+                    p.envelopeDecay = 55
+                    p.envelopeSustain = 30
+                    p.sweepPace = 2
+                    p.sweepShift = 3
+                    p.sweepIncrease = false
+                },
+                tuned("coin", "COIN", channel) { p in
+                    p.duty = 0
+                    p.initialVolume = 15
+                    p.envelopeDecay = 40
+                    p.envelopeSustain = 20
+                    p.envelopeRelease = 8
+                    p.sweepPace = 2
+                    p.sweepShift = 4
+                    p.sweepIncrease = true
+                },
+                tuned("zap", "ZAP", channel) { p in
+                    p.duty = 0
+                    p.initialVolume = 15
+                    p.envelopeDecay = 70
+                    p.envelopeSustain = 15
+                    p.sweepPace = 3
+                    p.sweepShift = 5
+                    p.sweepIncrease = false
+                },
+                tuned("bell", "BELL", channel) { p in
+                    p.duty = 3
+                    p.initialVolume = 15
+                    p.envelopeAttack = 18
+                    p.envelopeDecay = 15
+                    p.envelopeSustain = 95
+                    p.envelopeRelease = 60
+                    p.vibratoDepth = 12
+                    p.vibratoCycleLength = 40
+                    p.vibratoDelay = 10
+                },
+                tuned("arp16", "ARP 16TH", channel) { p in
+                    p.duty = 1
+                    p.initialVolume = 14
+                    p.envelopeDecay = 45
+                    p.envelopeSustain = 40
+                    p.envelopeRelease = 4
+                    p.octaveFlutterAmount = 16
+                    p.octaveFlutterPattern = ByteOctaveFlutterPattern.baseUp.rawValue
+                },
+                tuned("ghost", "GHOST", channel) { p in
+                    p.duty = 2
+                    p.initialVolume = 14
+                    p.envelopeSustain = 90
+                    p.envelopeRelease = 10
+                    p.octaveFlutterAmount = 8
+                    p.octaveFlutterPattern = ByteOctaveFlutterPattern.baseUpTwoUp.rawValue
+                    p.vibratoDepth = 18
+                    p.vibratoCycleLength = 60
+                    p.portamento = 30
+                    p.portamentoTime = 45
+                    p.bendRange = 4
+                },
+                tuned("sawChip", "SAW CHIP", channel) { p in
+                    p.duty = 2
+                    p.initialVolume = 15
+                    p.envelopeDecay = 15
+                    p.envelopeSustain = 100
+                    p.envelopeRelease = 10
+                    p.vibratoDepth = 30
+                    p.vibratoCycleLength = 40
+                    p.vibratoDelay = 20
+                    p.tremolo = 12
+                },
+                tuned("siren", "SIREN", channel) { p in
+                    p.duty = 1
+                    p.initialVolume = 14
+                    p.envelopeAttack = 8
+                    p.envelopeSustain = 100
+                    p.vibratoDepth = 55
+                    p.vibratoCycleLength = 85
+                    p.portamento = 55
+                    p.portamentoTime = 70
+                    p.bendRange = 12
+                },
+                tuned("tremPulse", "TREM PULSE", channel) { p in
+                    p.duty = 1
+                    p.initialVolume = 15
+                    p.envelopeAttack = 2
+                    p.envelopeDecay = 15
+                    p.envelopeSustain = 100
+                    p.envelopeRelease = 10
+                    p.tremolo = 60
+                }
             ]
         case .pulseB:
             return [
-                preset("bass", "BASS", channel, duty: 2, volume: 15, envelopePace: 0),
-                preset("pluck", "PLUCK", channel, duty: 0, volume: 14, envelopePace: 2),
-                preset("chord", "CHORD STAB", channel, duty: 1, volume: 12, envelopePace: 3),
-                preset("warm", "WARM LEAD", channel, duty: 3, volume: 13, envelopePace: 1),
-                preset("sub", "SUB BASS", channel, duty: 2, volume: 15, envelopePace: 0),
-                preset("marimba", "MARIMBA", channel, duty: 0, volume: 13, envelopePace: 2),
-                preset("wide", "WIDE PULSE", channel, duty: 3, volume: 12, envelopePace: 1)
+                tuned("bassDub", "BASS DUB", channel) { p in
+                    p.duty = 2
+                    p.initialVolume = 15
+                    p.octave = -1
+                    p.envelopeAttack = 3
+                    p.envelopeDecay = 38
+                    p.envelopeSustain = 70
+                    p.envelopeRelease = 6
+                    p.portamento = 35
+                    p.portamentoTime = 40
+                    p.bendRange = 2
+                },
+                tuned("subBass", "SUB BASS", channel) { p in
+                    p.duty = 2
+                    p.initialVolume = 15
+                    p.octave = -1
+                    p.envelopeAttack = 2
+                    p.envelopeDecay = 12
+                    p.envelopeSustain = 100
+                    p.envelopeRelease = 2
+                },
+                tuned("pluck", "PLUCK", channel) { p in
+                    p.duty = 0
+                    p.initialVolume = 14
+                    p.envelopeDecay = 65
+                    p.envelopeSustain = 25
+                    p.envelopeRelease = 6
+                    p.portamento = 25
+                    p.portamentoTime = 30
+                    p.bendRange = 3
+                },
+                tuned("chordStab", "CHORD STAB", channel) { p in
+                    p.duty = 1
+                    p.initialVolume = 12
+                    p.envelopeAttack = 2
+                    p.envelopeDecay = 45
+                    p.envelopeSustain = 45
+                    p.envelopeRelease = 15
+                },
+                tuned("marimba", "MARIMBA", channel) { p in
+                    p.duty = 0
+                    p.initialVolume = 13
+                    p.envelopeDecay = 72
+                    p.envelopeSustain = 18
+                    p.envelopeRelease = 18
+                    p.portamento = 30
+                    p.portamentoTime = 25
+                    p.bendRange = 4
+                },
+                tuned("warmLead", "WARM LEAD", channel) { p in
+                    p.duty = 3
+                    p.initialVolume = 13
+                    p.envelopeAttack = 6
+                    p.envelopeDecay = 18
+                    p.envelopeSustain = 100
+                    p.envelopeRelease = 16
+                    p.vibratoDepth = 22
+                    p.vibratoCycleLength = 55
+                    p.vibratoDelay = 35
+                },
+                tuned("squareBass", "SQUARE BASS", channel) { p in
+                    p.duty = 1
+                    p.initialVolume = 15
+                    p.octave = -1
+                    p.envelopeAttack = 2
+                    p.envelopeDecay = 42
+                    p.envelopeSustain = 55
+                    p.envelopeRelease = 4
+                },
+                tuned("vibe", "VIBE", channel) { p in
+                    p.duty = 1
+                    p.initialVolume = 14
+                    p.envelopeDecay = 15
+                    p.envelopeSustain = 95
+                    p.envelopeRelease = 20
+                    p.vibratoDepth = 42
+                    p.vibratoCycleLength = 30
+                    p.vibratoDelay = 15
+                    p.tremolo = 10
+                },
+                tuned("arpBass", "ARP BASS", channel) { p in
+                    p.duty = 2
+                    p.initialVolume = 15
+                    p.octave = -1
+                    p.envelopeAttack = 2
+                    p.envelopeDecay = 30
+                    p.envelopeSustain = 60
+                    p.octaveFlutterAmount = 16
+                    p.octaveFlutterPattern = ByteOctaveFlutterPattern.baseUp.rawValue
+                },
+                tuned("organPulse", "ORGAN PULSE", channel) { p in
+                    p.duty = 3
+                    p.initialVolume = 13
+                    p.envelopeAttack = 2
+                    p.envelopeDecay = 10
+                    p.envelopeSustain = 100
+                    p.envelopeRelease = 8
+                    p.tremolo = 25
+                }
             ]
         case .wave:
             return [
-                wavePreset("waveBass", "WAVE BASS", channel, [8, 10, 12, 14, 15, 14, 12, 10, 8, 6, 4, 2, 1, 2, 4, 6, 8, 10, 12, 14, 15, 14, 12, 10, 8, 6, 4, 2, 1, 2, 4, 6], volume: 0),
-                wavePreset("triangle", "TRIANGLE", channel, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0], volume: 0),
-                wavePreset("organ", "ORGAN", channel, [8, 12, 14, 12, 8, 4, 2, 4, 8, 12, 14, 12, 8, 4, 2, 4, 8, 12, 14, 12, 8, 4, 2, 4, 8, 12, 14, 12, 8, 4, 2, 4], volume: 1),
-                wavePreset("metal", "METAL", channel, [8, 15, 2, 13, 1, 12, 3, 14, 0, 15, 4, 11, 2, 13, 1, 14, 8, 0, 13, 2, 15, 3, 12, 1, 14, 4, 11, 2, 15, 0, 13, 3], volume: 1),
-                wavePreset("ramp", "RAMP", channel, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], volume: 2),
-                wavePreset("pluck", "PLUCK WAVE", channel, [8, 15, 14, 10, 5, 2, 1, 2, 4, 7, 10, 12, 13, 12, 10, 8, 8, 6, 4, 2, 1, 2, 4, 7, 10, 12, 13, 12, 10, 8, 8, 8], volume: 1),
-                wavePreset("pulse", "PULSE WAVE", channel, [8, 15, 15, 15, 8, 0, 0, 0, 8, 15, 15, 15, 8, 0, 0, 0, 8, 15, 15, 15, 8, 0, 0, 0, 8, 15, 15, 15, 8, 0, 0, 0], volume: 0)
+                tuned("waveBass", "WAVE BASS", channel) { p in
+                    p.waveShape = ByteWaveShape.waveBass.rawValue
+                    p.waveVolume = 0
+                    p.octave = -1
+                    p.envelopeAttack = 2
+                    p.envelopeDecay = 15
+                    p.envelopeSustain = 100
+                },
+                tuned("triLead", "TRI LEAD", channel) { p in
+                    p.waveShape = ByteWaveShape.triangle.rawValue
+                    p.waveVolume = 0
+                    p.envelopeDecay = 15
+                    p.envelopeSustain = 95
+                    p.envelopeRelease = 12
+                    p.vibratoDepth = 26
+                    p.vibratoCycleLength = 50
+                    p.vibratoDelay = 30
+                },
+                tuned("organ", "ORGAN", channel) { p in
+                    p.waveShape = ByteWaveShape.organ.rawValue
+                    p.waveVolume = 1
+                    p.envelopeAttack = 3
+                    p.envelopeDecay = 10
+                    p.envelopeSustain = 100
+                    p.envelopeRelease = 8
+                    p.tremolo = 15
+                },
+                tuned("metal", "METAL", channel) { p in
+                    p.waveShape = ByteWaveShape.metal.rawValue
+                    p.waveVolume = 1
+                    p.envelopeDecay = 20
+                    p.envelopeSustain = 90
+                    p.octaveFlutterAmount = 10
+                    p.octaveFlutterPattern = ByteOctaveFlutterPattern.baseUp.rawValue
+                },
+                tuned("ramp", "RAMP", channel) { p in
+                    p.waveShape = ByteWaveShape.ramp.rawValue
+                    p.waveVolume = 1
+                    p.envelopeSustain = 100
+                    p.portamento = 40
+                    p.portamentoTime = 50
+                    p.bendRange = 6
+                    p.vibratoDepth = 12
+                    p.vibratoCycleLength = 45
+                },
+                tuned("wavePluck", "WAVE PLUCK", channel) { p in
+                    p.waveShape = ByteWaveShape.triangle.rawValue
+                    p.waveVolume = 0
+                    p.envelopeDecay = 65
+                    p.envelopeSustain = 22
+                    p.envelopeRelease = 8
+                },
+                tuned("arpWave", "ARP WAVE", channel) { p in
+                    p.waveShape = ByteWaveShape.waveBass.rawValue
+                    p.waveVolume = 0
+                    p.envelopeDecay = 30
+                    p.envelopeSustain = 50
+                    p.octaveFlutterAmount = 18
+                    p.octaveFlutterPattern = ByteOctaveFlutterPattern.baseUp.rawValue
+                },
+                tuned("bassFlutter", "BASS FLUTTER", channel) { p in
+                    p.waveShape = ByteWaveShape.waveBass.rawValue
+                    p.waveVolume = 0
+                    p.octave = -1
+                    p.envelopeAttack = 2
+                    p.envelopeDecay = 25
+                    p.envelopeSustain = 80
+                    p.octaveFlutterAmount = 12
+                    p.octaveFlutterPattern = ByteOctaveFlutterPattern.baseUpTwoUp.rawValue
+                },
+                tuned("triVibe", "TRI VIBE", channel) { p in
+                    p.waveShape = ByteWaveShape.triangle.rawValue
+                    p.waveVolume = 0
+                    p.envelopeSustain = 100
+                    p.envelopeRelease = 22
+                    p.vibratoDepth = 48
+                    p.vibratoCycleLength = 35
+                    p.vibratoDelay = 10
+                },
+                tuned("rampBass", "RAMP BASS", channel) { p in
+                    p.waveShape = ByteWaveShape.ramp.rawValue
+                    p.waveVolume = 1
+                    p.octave = -1
+                    p.envelopeSustain = 100
+                    p.portamento = 30
+                    p.portamentoTime = 45
+                    p.bendRange = 3
+                }
             ]
         case .drum:
             return [
                 drumPreset("kick", "KICK", channel, width7Bit: false, clockShift: 8, divider: 6, volume: 15, length: 18),
                 drumPreset("snare", "SNARE", channel, width7Bit: false, clockShift: 5, divider: 3, volume: 15, length: 26),
                 drumPreset("hat", "HI-HAT", channel, width7Bit: true, clockShift: 1, divider: 0, volume: 13, length: 8),
-                drumPreset("crash", "CRASH", channel, width7Bit: false, clockShift: 3, divider: 1, volume: 15, length: 48)
+                drumPreset("perc", "PERC", channel, width7Bit: false, clockShift: 3, divider: 1, volume: 15, length: 48)
             ]
         }
     }
 
-    private static func preset(_ id: String, _ name: String, _ channel: ByteChannel, duty: Int, volume: Int, envelopePace: Int, sweepPace: Int = 0, sweepIncrease: Bool = false, sweepShift: Int = 0) -> ByteInstrumentPreset {
+    /// Builds a hand-tuned patch. The optional waveform lets wave presets carry the
+    /// exact table for their selected fixed shape.
+    private static func tuned(_ id: String, _ name: String, _ channel: ByteChannel, waveform: [Int]? = nil, _ tune: (inout ByteChannelPatch) -> Void) -> ByteInstrumentPreset {
         var patch = ByteChannelPatch(channel: channel)
-        patch.duty = duty
-        patch.initialVolume = volume
-        patch.envelopePace = envelopePace
-        patch.sweepPace = sweepPace
-        patch.sweepIncrease = sweepIncrease
-        patch.sweepShift = sweepShift
-        return ByteInstrumentPreset(id: id, name: name, channel: channel, patch: patch, waveform: ByteProject.starter.waveform)
-    }
-
-    private static func wavePreset(_ id: String, _ name: String, _ channel: ByteChannel, _ table: [Int], volume: Int) -> ByteInstrumentPreset {
-        var patch = ByteChannelPatch(channel: channel)
-        patch.waveVolume = volume
-        patch.waveShape = ["waveBass": 0, "triangle": 1, "organ": 2, "metal": 3, "ramp": 4][id] ?? 0
+        tune(&patch)
+        let table: [Int]
+        if let waveform {
+            table = waveform
+        } else if channel == .wave {
+            let shape = ByteWaveShape.allCases[min(ByteWaveShape.allCases.count - 1, max(0, patch.waveShape))]
+            table = shape.table
+        } else {
+            table = Self.defaultWaveform
+        }
         return ByteInstrumentPreset(id: id, name: name, channel: channel, patch: patch, waveform: table)
     }
 
@@ -508,13 +1058,16 @@ struct ByteInstrumentPreset: Identifiable, Hashable, Sendable {
         patch.noiseClockShift = clockShift
         patch.noiseDivider = divider
         patch.initialVolume = volume
-        patch.drumVoice = ["kick", "snare", "hat", "crash"].firstIndex(of: id) ?? 0
+        // Seeded under the voice's own title, so this kit cannot end up calling a voice
+        // something `ByteDrumVoice` does not. Note 49 is the crash-cymbal note in the general
+        // MIDI kit, which is where the CRASH name this used to carry came from.
+        patch.drumVoice = ByteDrumVoice.allCases.firstIndex { $0.title == name } ?? 0
         patch.drumVolumes[patch.drumVoice] = volume
         patch.drumLengths[patch.drumVoice] = length
         patch.envelopePace = id == "kick" ? 3 : id == "snare" ? 3 : id == "hat" ? 1 : 2
         patch.lengthCounter = true
         patch.length = length
-        return ByteInstrumentPreset(id: id, name: name, channel: channel, patch: patch, waveform: ByteProject.starter.waveform)
+        return ByteInstrumentPreset(id: id, name: name, channel: channel, patch: patch, waveform: Self.defaultWaveform)
     }
 }
 
@@ -530,6 +1083,8 @@ enum BytePatchParameter: String, CaseIterable, Identifiable, Hashable, Sendable 
     case vibratoCycleLength
     case vibratoDepth
     case vibratoDelay
+    case octaveFlutterSpeed
+    case octaveFlutterPattern
     case bendRange
     case octave
     case tremolo
@@ -564,6 +1119,8 @@ enum BytePatchParameter: String, CaseIterable, Identifiable, Hashable, Sendable 
         case .vibratoCycleLength: return "VIB CYCLE"
         case .vibratoDepth: return "VIB DEPTH"
         case .vibratoDelay: return "VIB DELAY"
+        case .octaveFlutterSpeed: return "OCT FLUTTER"
+        case .octaveFlutterPattern: return "FLUTTER PATH"
         case .bendRange: return "BEND RANGE"
         case .octave: return "OCTAVE"
         case .tremolo: return "TREMOLO"
@@ -588,7 +1145,8 @@ enum BytePatchParameter: String, CaseIterable, Identifiable, Hashable, Sendable 
 
     var range: ClosedRange<Int> {
         switch self {
-        case .tone, .envelopeAttack, .envelopeDecay, .envelopeSustain, .envelopeRelease, .portamento, .portamentoTime, .vibratoCycleLength, .vibratoDepth, .vibratoDelay, .tremolo, .envelope: return 0...100
+        case .tone, .envelopeAttack, .envelopeDecay, .envelopeSustain, .envelopeRelease, .portamento, .portamentoTime, .vibratoCycleLength, .vibratoDepth, .vibratoDelay, .octaveFlutterSpeed, .tremolo, .envelope: return 0...100
+        case .octaveFlutterPattern: return 0...(ByteOctaveFlutterPattern.allCases.count - 1)
         case .duty: return 0...3
         case .bendRange: return 0...24
         case .octave: return -2...2
@@ -604,15 +1162,69 @@ enum BytePatchParameter: String, CaseIterable, Identifiable, Hashable, Sendable 
     }
 }
 
+/// Musical response curve shared by faders and sends. Perceptual loudness is roughly
+/// logarithmic, so a linear 0–100 knob wastes the bottom of its travel. The square-root
+/// taper boosts low percentages: 25% of fader travel now delivers 50% of the gain, which
+/// keeps quiet settings audible and gives the top of the range fine control.
+enum ByteAudioTaper {
+    static func gain(for percent: Int) -> Double {
+        let clamped = Double(min(100, max(0, percent)))
+        return pow(clamped / 100.0, 0.5)
+    }
+}
+
 struct ByteEffects: Codable, Hashable, Sendable {
+    /// Bit Crush is intentionally softened: UI 0–100 maps to the former effective 0–25 range.
+    static func bitCrushEffectiveAmount(for amount: Int) -> Double {
+        Double(min(100, max(0, amount))) * 0.25
+    }
+
+    /// Converts the softened Bit Crush response into a stable quantizer resolution.
+    static func bitCrushLevels(for effectiveAmount: Double) -> Double {
+        max(1.0, 16.0 - min(25.0, max(0.0, effectiveAmount)) / 100.0 * 14.0)
+    }
+
+    /// Holds crushed samples slightly longer as the control rises for audible downsampling.
+    static func bitCrushHoldFrames(for amount: Int) -> Int {
+        let clamped = min(100, max(0, amount))
+        return max(1, 18 - (clamped * 17 / 100))
+    }
+
+    /// Legacy FX helper retained for old projects; channel patches now own flutter settings.
+    static func octaveFlutterDivision(for amount: Int) -> Int {
+        let clamped = min(100, max(0, amount))
+        guard clamped > 0 else { return 0 }
+        return min(4, (clamped - 1) / 20)
+    }
+
+    static func octaveFlutterDivisionTitle(for amount: Int) -> String {
+        ["OFF", "1/16", "1/32", "1/64", "1/128", "1/256"][octaveFlutterDivision(for: amount) + (amount > 0 ? 1 : 0)]
+    }
+
+    /// Returns a hard, tempo-synced octave arpeggio multiplier.
+    static func octaveFlutterMultiplier(
+        at time: Double,
+        bpm: Int,
+        amount: Int,
+        pattern: ByteOctaveFlutterPattern = .baseUp
+    ) -> Double {
+        guard amount > 0 else { return 1.0 }
+        let divisionBeats = [0.25, 0.125, 0.0625, 0.03125, 0.015625][octaveFlutterDivision(for: amount)]
+        let divisionDuration = 60.0 / Double(max(1, bpm)) * divisionBeats
+        let index = Int(max(0, time) / max(0.001, divisionDuration)) % pattern.octaveSteps.count
+        return pow(2.0, Double(pattern.octaveSteps[index]))
+    }
+
     // Amounts are percentages so the FX Station can behave like compact hardware knobs.
-    // The booleans remain for project-file compatibility with older builds.
+    // The booleans and retired fields remain for project-file compatibility with older builds.
     var echo = false
     var echoAmount = 0
     var bitCrush = false
     var bitCrushAmount = 0
     var vibrato = false
     var vibratoAmount = 0
+    var octaveFlutterPattern = ByteOctaveFlutterPattern.baseUp.rawValue
+    // Legacy fields remain Codable so older projects still open, but they are no longer active.
     var widePulse = false
     var widePulseAmount = 0
     /// Per-channel effect sends: Pulse, Square, Triangle, Drum.
@@ -622,7 +1234,7 @@ struct ByteEffects: Codable, Hashable, Sendable {
     var delay = 0
 
     private enum CodingKeys: String, CodingKey {
-        case echo, echoAmount, bitCrush, bitCrushAmount, vibrato, vibratoAmount, widePulse, widePulseAmount, channelSends, delay
+        case echo, echoAmount, bitCrush, bitCrushAmount, vibrato, vibratoAmount, octaveFlutterPattern, widePulse, widePulseAmount, channelSends, delay
     }
 
     init() {}
@@ -635,6 +1247,7 @@ struct ByteEffects: Codable, Hashable, Sendable {
         bitCrushAmount = min(100, max(0, try container.decodeIfPresent(Int.self, forKey: .bitCrushAmount) ?? (bitCrush ? 100 : 0)))
         vibrato = try container.decodeIfPresent(Bool.self, forKey: .vibrato) ?? false
         vibratoAmount = min(100, max(0, try container.decodeIfPresent(Int.self, forKey: .vibratoAmount) ?? (vibrato ? 100 : 0)))
+        octaveFlutterPattern = min(ByteOctaveFlutterPattern.allCases.count - 1, max(0, try container.decodeIfPresent(Int.self, forKey: .octaveFlutterPattern) ?? ByteOctaveFlutterPattern.baseUp.rawValue))
         widePulse = try container.decodeIfPresent(Bool.self, forKey: .widePulse) ?? false
         widePulseAmount = min(100, max(0, try container.decodeIfPresent(Int.self, forKey: .widePulseAmount) ?? (widePulse ? 100 : 0)))
         if let sends = try container.decodeIfPresent([Int].self, forKey: .channelSends), sends.count == ByteChannel.allCases.count {
@@ -653,6 +1266,7 @@ struct ByteEffects: Codable, Hashable, Sendable {
         try container.encode(bitCrushAmount, forKey: .bitCrushAmount)
         try container.encode(vibratoAmount > 0, forKey: .vibrato)
         try container.encode(vibratoAmount, forKey: .vibratoAmount)
+        try container.encode(octaveFlutterPattern, forKey: .octaveFlutterPattern)
         try container.encode(widePulseAmount > 0, forKey: .widePulse)
         try container.encode(widePulseAmount, forKey: .widePulseAmount)
         try container.encode(channelSends.map { min(100, max(0, $0)) }, forKey: .channelSends)
@@ -664,9 +1278,6 @@ struct ByteEffects: Codable, Hashable, Sendable {
         switch effect {
         case .echo: return echoAmount > 0
         case .bitCrush: return bitCrushAmount > 0
-        case .vibrato: return vibratoAmount > 0
-        case .widePulse: return widePulseAmount > 0
-        case .delay: return delay > 0
         }
     }
 
@@ -674,14 +1285,15 @@ struct ByteEffects: Codable, Hashable, Sendable {
         switch effect {
         case .echo: echoAmount = echoAmount > 0 ? 0 : 100; echo = echoAmount > 0
         case .bitCrush: bitCrushAmount = bitCrushAmount > 0 ? 0 : 100; bitCrush = bitCrushAmount > 0
-        case .vibrato: vibratoAmount = vibratoAmount > 0 ? 0 : 100; vibrato = vibratoAmount > 0
-        case .widePulse: widePulseAmount = widePulseAmount > 0 ? 0 : 100; widePulse = widePulseAmount > 0
-        case .delay: delay = 0
         }
     }
 }
 
 struct BytePattern: Codable, Hashable, Identifiable, Sendable {
+    /// Every pattern is one bar of sixteenths. A kit check walks this many steps, so a check
+    /// ends on the bar line however sparse the row is rather than as soon as the hits run out.
+    static let barSteps = 16
+
     var id: UUID
     var name: String
     /// Each pattern can be one or two bars while the project remains backward compatible.
@@ -723,6 +1335,19 @@ struct BytePattern: Codable, Hashable, Identifiable, Sendable {
         try container.encode(loopLength, forKey: .loopLength)
         try container.encode(steps, forKey: .steps)
         try container.encode(noteLengths, forKey: .noteLengths)
+    }
+
+    /// The drum row as the sequence plays it: one hit per filled step, in step order.
+    ///
+    /// A kit check walks this rather than a hand-written stand-in for the row, so what is heard
+    /// in isolation is the bar the transport will play — a check that could disagree with the
+    /// pattern would be worth less than no check at all.
+    var drumHits: [ByteDrumHit] {
+        guard let row = ByteChannel.allCases.firstIndex(of: .drum),
+              steps.indices.contains(row) else { return [] }
+        return steps[row].enumerated().compactMap { step, note in
+            note.map { ByteDrumHit(step: step, voice: ByteDrumVoice.voice(for: $0)) }
+        }
     }
 
     static func starterSteps() -> [[Int?]] {
@@ -789,6 +1414,61 @@ struct BytePattern: Codable, Hashable, Identifiable, Sendable {
         }
     }
 
+    /// Replaces the drum row with a random beat and reports the feel it built.
+    ///
+    /// Unlike `randomizeMelody`, which only has to keep its notes in a scale, this row has a rule
+    /// the ear will notice immediately: the snare has to fall on the backbeat. So the feel is
+    /// picked first, the snare is written where that feel says — beats 2 and 4, or beat 3 for a
+    /// half-time loop — and kick, hi-hat, and perc are then filled into the steps the snare left
+    /// empty, in that order. The order is load-bearing: a drum row holds one voice per step, so
+    /// each pass may only take a step that is still free rather than layering onto it.
+    ///
+    /// The injected picker keeps the whole thing testable, and every loop below is bounded by
+    /// something other than the picker's answer, so a degenerate picker (one that always returns
+    /// the same value) cannot spin.
+    @discardableResult
+    mutating func shuffleDrums(nextInt: (ClosedRange<Int>) -> Int) -> ByteDrumFeel {
+        guard let row = ByteChannel.allCases.firstIndex(of: .drum) else { return .straight }
+        let feel: ByteDrumFeel = nextInt(0...3) == 0 ? .halfTime : .straight
+        steps[row] = Array(repeating: nil, count: 16)
+        noteLengths[row] = Array(repeating: 1, count: 16)
+
+        var hits: [Int: ByteDrumVoice] = [:]
+        for step in feel.snareSteps { hits[step] = .snare }
+        for step in feel.kickAnchors { hits[step] = .kick }
+
+        // One to three extra kicks, so two rolls of the same feel still differ where it matters
+        // most. Capped by the candidate list rather than by the picker, so a stuck picker exits.
+        let wantedFills = nextInt(0...2)
+        var placedFills = 0
+        var attempts = 0
+        while placedFills < wantedFills, attempts < feel.kickCandidates.count {
+            attempts += 1
+            let candidate = feel.kickCandidates[nextInt(0...(feel.kickCandidates.count - 1))]
+            guard hits[candidate] == nil else { continue }
+            hits[candidate] = .kick
+            placedFills += 1
+        }
+
+        // Hi-hats carry the pulse: the offbeat eighth of every beat is the spine, and a busier
+        // sixteenth feel is a per-roll garnish rather than a rewrite of that spine.
+        for step in stride(from: 2, to: 16, by: 4) where hits[step] == nil { hits[step] = .hiHat }
+        if nextInt(0...99) < 45 {
+            for step in [1, 5, 9, 13] where hits[step] == nil {
+                if nextInt(0...99) < 60 { hits[step] = .hiHat }
+            }
+        }
+
+        // Perc lands on the "a" of a beat when it lands at all, and never on a kick or snare.
+        if nextInt(0...99) < 55 {
+            let open = [3, 7, 11, 15].filter { hits[$0] == nil }
+            if !open.isEmpty { hits[open[nextInt(0...(open.count - 1))]] = .perc }
+        }
+
+        for (step, voice) in hits { steps[row][step] = ByteDrumVoice.note(voice: voice) }
+        return feel
+    }
+
     static func empty(name: String) -> BytePattern {
         BytePattern(name: name, steps: ByteChannel.allCases.map { _ in Array(repeating: nil, count: 16) })
     }
@@ -841,6 +1521,14 @@ struct ByteSongSlot: Codable, Hashable, Sendable {
 
 struct ByteProject: Codable, Hashable, Identifiable, Sendable {
     static let maximumPatternCount = 16
+    static let songArrangementLengths = [16, 32, 64]
+    /// Shape version written by this build. Files produced before versioning existed omit the
+    /// field, and their shape is what version 1 describes, so absence decodes as 1 — which is
+    /// also why old data can never be mistaken for something from a newer build.
+    static let currentSchemaVersion = 1
+    /// Shape version of files written before this field existed. Kept separate from
+    /// `currentSchemaVersion` so bumping that constant cannot retroactively relabel legacy data.
+    static let legacySchemaVersion = 1
 
     var id: UUID
     var name: String
@@ -854,6 +1542,8 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
     var arrangement: [UUID]
     /// Song Mode slots play in reading order. A continuation slot belongs to the 32-step slot before it.
     var songArrangement: [ByteSongSlot]
+    /// Number of bars visible and played by Song Mode. Legacy projects default to 16.
+    var songArrangementLength: Int
     /// Song Mode can be enabled independently so older projects keep their pattern-list playback.
     var songModeEnabled: Bool
     /// Exactly 32 four-bit samples, stored as integers from 0 through 15.
@@ -862,12 +1552,17 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
     var effects: ByteEffects
     var createdAt: Date
     var modifiedAt: Date
+    /// Shape version this project was read from or written as. Carries a value above
+    /// `currentSchemaVersion` only when a newer build produced the data, which is how that is
+    /// detected instead of being silently absorbed by the per-field decoding defaults.
+    var schemaVersion: Int
 
     init(
         id: UUID = UUID(),
         name: String = "UNTITLED QUEST",
         tempo: Int = 132,
         loopLength: Int = 16,
+        songArrangementLength: Int = 16,
         key: Int = 0,
         mode: ByteScaleMode = .chromatic,
         patterns: [BytePattern] = [BytePattern()],
@@ -882,6 +1577,7 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         self.name = name
         self.tempo = tempo
         self.loopLength = 16
+        self.songArrangementLength = Self.normalizedSongArrangementLength(songArrangementLength)
         self.key = min(11, max(0, key))
         self.mode = mode
         var resizedPatterns = Array(patterns.prefix(Self.maximumPatternCount))
@@ -891,7 +1587,7 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         for index in resizedPatterns.indices { resizedPatterns[index].resize(to: 16) }
         self.patterns = resizedPatterns
         self.arrangement = Self.normalizedArrangement(arrangement ?? resizedPatterns.map(\.id), patterns: resizedPatterns)
-        self.songArrangement = Array(repeating: .empty, count: 16)
+        self.songArrangement = Array(repeating: .empty, count: self.songArrangementLength)
         if let first = resizedPatterns.first { self.songArrangement[0] = ByteSongSlot(patternID: first.id, isContinuation: false) }
         self.songModeEnabled = false
         self.waveform = Array(waveform.prefix(32)) + Array(repeating: 8, count: max(0, 32 - waveform.count))
@@ -899,9 +1595,99 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         self.effects = effects
         self.createdAt = createdAt
         self.modifiedAt = modifiedAt
+        self.schemaVersion = Self.currentSchemaVersion
     }
 
-    static let starter = ByteProject()
+    /// Default project: a ready-to-play groove in C major. Two patterns seed a two-bar
+    /// song with preset patches and a light echo, so the very first play already sounds
+    /// like a track instead of an empty grid.
+    ///
+    /// New installs open `blank` instead; `starter` remains as the demo document used
+    /// by tests, previews, and the fallback waveform seed.
+    static let starter: ByteProject = {
+        let groove = BytePattern(
+            name: "GROOVE",
+            steps: [
+                // PULSE 1 — eighth-note lead motif in C major: E G A C5 A G E D.
+                [64, nil, 67, nil, 69, nil, 72, nil, 69, nil, 67, nil, 64, nil, 62, 67],
+                // PULSE 2 — quarter-note bass: C G F G.
+                [36, nil, nil, nil, 43, nil, nil, nil, 41, nil, nil, nil, 43, nil, nil, nil],
+                // TRIANGLE — held root and fifth an octave up.
+                [48, nil, nil, nil, nil, nil, nil, nil, 55, nil, nil, nil, nil, nil, nil, nil],
+                // DRUM — kick on 0/8, snare on 4/12, offbeat hats.
+                [36, nil, 42, nil, 38, nil, 42, nil, 36, nil, 42, nil, 38, nil, 42, nil]
+            ],
+            noteLengths: [
+                [1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+                [4, 1, 1, 1, 4, 1, 1, 1, 4, 1, 1, 1, 4, 1, 1, 1],
+                [8, 1, 1, 1, 1, 1, 1, 1, 8, 1, 1, 1, 1, 1, 1, 1],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+            ]
+        )
+        let breakdown = BytePattern(
+            name: "BREAK",
+            steps: [
+                // PULSE 1 — sparse C5 A G E line with a pickup.
+                [72, nil, nil, nil, 69, nil, nil, nil, 67, nil, nil, nil, 64, nil, nil, 67],
+                // PULSE 2 — longer bass tones.
+                [36, nil, nil, nil, nil, nil, 43, nil, nil, nil, nil, nil, 36, nil, nil, nil],
+                // TRIANGLE — one sustained root.
+                [48, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil],
+                // DRUM — four-on-the-floor kick, snare on 2/10, hats on 6/14.
+                [36, nil, 38, nil, 36, nil, 42, nil, 36, nil, 38, nil, 36, nil, 42, nil]
+            ],
+            noteLengths: [
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+                [6, 1, 1, 1, 1, 1, 6, 1, 1, 1, 1, 1, 4, 1, 1, 1],
+                [16, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+            ]
+        )
+
+        var project = ByteProject(
+            name: "FIRST BEAT",
+            tempo: 138,
+            key: 0,
+            mode: .major,
+            patterns: [groove, breakdown]
+        )
+        // Hand-tuned starter sounds (from the seed library) so the groove sounds
+        // right immediately.
+        var patches = ByteChannelPatch.defaults
+        if let lead = ByteInstrumentPreset.library(for: .pulseA).first(where: { $0.id == "chipLead" }) { patches[0] = lead.patch }
+        if let bass = ByteInstrumentPreset.library(for: .pulseB).first(where: { $0.id == "bassDub" }) { patches[1] = bass.patch }
+        if let triangle = ByteInstrumentPreset.library(for: .wave).first(where: { $0.id == "waveBass" }) { patches[2] = triangle.patch }
+        // Balanced quick mix; the square-root taper keeps these settings musical.
+        patches[0].masterVolume = 58
+        patches[1].masterVolume = 62
+        patches[2].masterVolume = 60
+        patches[3].masterVolume = 66
+        project.channelPatches = patches
+
+        // Light echo on the lead and drums; bass stays mostly dry.
+        project.effects.echoAmount = 22
+        project.effects.echo = true
+        project.effects.channelSends = [52, 30, 42, 68]
+
+        // Seed Song Mode with a two-bar idea: GROOVE then BREAK. The remaining slots
+        // stay empty so a new user learns to build the arrangement themselves.
+        let a = groove.id
+        let b = breakdown.id
+        project.arrangement = [a, b]
+        project.songArrangement = (0..<16).map { index in
+            let patternID: UUID? = index == 0 ? a : (index == 1 ? b : nil)
+            return ByteSongSlot(patternID: patternID, isContinuation: false)
+        }
+        return project
+    }()
+
+    /// First-launch project: a truly empty single pattern, so a new user opens onto a
+    /// silent drum-pad grid and builds from scratch rather than hearing the demo groove.
+    static let blank: ByteProject = {
+        var project = ByteProject(name: "FIRST BEAT", patterns: [BytePattern.empty(name: "PATTERN 01")])
+        project.channelPatches = ByteChannelPatch.defaults
+        return project
+    }()
 
     var arrangedPatterns: [BytePattern] {
         let lookup = Dictionary(uniqueKeysWithValues: patterns.map { ($0.id, $0) })
@@ -909,18 +1695,33 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         return result.isEmpty ? patterns : result
     }
 
+    /// Returns one playback bar for every arrangement slot through the last assigned
+    /// pattern. Empty bars between patterns stay silent rather than compacted away, so
+    /// bar numbers hold — but trailing empty slots are excluded, so a short arrangement
+    /// loops on its music instead of playing dead air. Silence is structural only when
+    /// a later slot carries a pattern again.
     var songPatterns: [BytePattern] {
         let lookup = Dictionary(uniqueKeysWithValues: patterns.map { ($0.id, $0) })
-        return songArrangement.compactMap { slot in
-            guard !slot.isContinuation, let patternID = slot.patternID else { return nil }
-            return lookup[patternID]
+        let slots = songArrangement.prefix(songArrangementLength)
+        guard let lastAssigned = slots.lastIndex(where: { !$0.isContinuation && $0.patternID != nil && lookup[$0.patternID!] != nil }) else {
+            return []
+        }
+        return slots.prefix(through: lastAssigned).map { slot in
+            guard !slot.isContinuation, let patternID = slot.patternID, let pattern = lookup[patternID] else {
+                return BytePattern.empty(name: "EMPTY BAR")
+            }
+            return pattern
         }
     }
 
+    /// Each playback pattern maps directly to its arrangement bar, including structural
+    /// silent bars. Mirrors the songPatterns trim so playback always covers real music.
     var songSlotIndices: [Int] {
-        songArrangement.enumerated().compactMap { index, slot in
-            slot.isContinuation || slot.patternID == nil ? nil : index
-        }
+        Array(0..<songPatterns.count)
+    }
+
+    var hasAssignedSongPattern: Bool {
+        songArrangement.prefix(songArrangementLength).contains { $0.patternID != nil && !$0.isContinuation }
     }
 
     /// Returns the selected pattern for Beatpad and Sound Lab playback.
@@ -932,6 +1733,10 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         patterns.first(where: { $0.id == id })
     }
 
+    private static func normalizedSongArrangementLength(_ value: Int) -> Int {
+        songArrangementLengths.min(by: { abs($0 - value) < abs($1 - value) }) ?? 16
+    }
+
     private static func normalizedArrangement(_ arrangement: [UUID], patterns: [BytePattern]) -> [UUID] {
         let validIDs = Set(patterns.map(\.id))
         let filtered = arrangement.filter { validIDs.contains($0) }
@@ -939,7 +1744,7 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, tempo, loopLength, key, mode, patterns, arrangement, songArrangement, songModeEnabled, waveform, channelPatches, effects, createdAt, modifiedAt
+        case id, name, tempo, loopLength, songArrangementLength, key, mode, patterns, arrangement, songArrangement, songModeEnabled, waveform, channelPatches, effects, createdAt, modifiedAt, schemaVersion
     }
 
     init(from decoder: Decoder) throws {
@@ -948,6 +1753,7 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         name = try container.decode(String.self, forKey: .name)
         tempo = try container.decode(Int.self, forKey: .tempo)
         loopLength = 16
+        songArrangementLength = Self.normalizedSongArrangementLength(try container.decodeIfPresent(Int.self, forKey: .songArrangementLength) ?? 16)
         key = min(11, max(0, try container.decodeIfPresent(Int.self, forKey: .key) ?? 0))
         mode = try container.decodeIfPresent(ByteScaleMode.self, forKey: .mode) ?? .chromatic
         patterns = Array(try container.decode([BytePattern].self, forKey: .patterns).prefix(Self.maximumPatternCount))
@@ -958,12 +1764,12 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         let decodedArrangement = try container.decodeIfPresent([UUID].self, forKey: .arrangement) ?? []
         arrangement = Self.normalizedArrangement(decodedArrangement, patterns: patterns)
         let validPatternIDs = Set(patterns.map(\.id))
-        let decodedSongArrangement = try container.decodeIfPresent([ByteSongSlot].self, forKey: .songArrangement) ?? Array(repeating: .empty, count: 16)
-        songArrangement = decodedSongArrangement.prefix(16).map { slot in
+        let decodedSongArrangement = try container.decodeIfPresent([ByteSongSlot].self, forKey: .songArrangement) ?? Array(repeating: .empty, count: songArrangementLength)
+        songArrangement = decodedSongArrangement.prefix(songArrangementLength).map { slot in
             guard !slot.isContinuation, let patternID = slot.patternID, validPatternIDs.contains(patternID) else { return .empty }
             return ByteSongSlot(patternID: patternID, isContinuation: false)
         }
-        if songArrangement.count < 16 { songArrangement.append(contentsOf: Array(repeating: .empty, count: 16 - songArrangement.count)) }
+        if songArrangement.count < songArrangementLength { songArrangement.append(contentsOf: Array(repeating: .empty, count: songArrangementLength - songArrangement.count)) }
         songModeEnabled = try container.decodeIfPresent(Bool.self, forKey: .songModeEnabled) ?? false
 
         if let values = try? container.decode([Int].self, forKey: .waveform) {
@@ -977,6 +1783,8 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         effects = try container.decodeIfPresent(ByteEffects.self, forKey: .effects) ?? ByteEffects()
         createdAt = try container.decode(Date.self, forKey: .createdAt)
         modifiedAt = try container.decode(Date.self, forKey: .modifiedAt)
+        // Absent means the file predates versioning, whose shape is version 1.
+        schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? Self.legacySchemaVersion
         waveform = Array(waveform.prefix(32)) + Array(repeating: 8, count: max(0, 32 - waveform.count))
         if channelPatches.count != ByteChannel.allCases.count { channelPatches = ByteChannelPatch.defaults }
     }
@@ -987,6 +1795,7 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         try container.encode(name, forKey: .name)
         try container.encode(tempo, forKey: .tempo)
         try container.encode(loopLength, forKey: .loopLength)
+        try container.encode(songArrangementLength, forKey: .songArrangementLength)
         try container.encode(key, forKey: .key)
         try container.encode(mode, forKey: .mode)
         try container.encode(patterns, forKey: .patterns)
@@ -998,6 +1807,8 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
         try container.encode(effects, forKey: .effects)
         try container.encode(createdAt, forKey: .createdAt)
         try container.encode(modifiedAt, forKey: .modifiedAt)
+        // Always the shape this build writes, never a version inherited from the data it read.
+        try container.encode(Self.currentSchemaVersion, forKey: .schemaVersion)
     }
 }
 
@@ -1005,37 +1816,70 @@ struct ByteProject: Codable, Hashable, Identifiable, Sendable {
 
 extension UTType {
     static let bytePocketProject = UTType(exportedAs: "com.bytepocket.project")
-    static let bytePocketWave = UTType(filenameExtension: "wav") ?? .data
 }
 
-struct ByteProjectDocument: FileDocument {
-    static var readableContentTypes: [UTType] { [.bytePocketProject, .json] }
-    var project: ByteProject
-
-    init(project: ByteProject = .starter) { self.project = project }
-
-    init(configuration: ReadConfiguration) throws {
-        project = try JSONDecoder.bytePocketDecoder.decode(ByteProject.self, from: configuration.file.regularFileContents ?? Data())
+/// The file a rendered WAV lives in while it is being written, shared, or saved.
+///
+/// The render streams straight into this file, and both handovers read it from here: the activity
+/// sheet hands the URL to whichever app the user picked, and the Files picker copies the file to
+/// wherever they chose. Neither needs the audio in memory, which is what makes a long take possible
+/// at all. One fixed name in the app's own temporary directory, so a second render replaces the
+/// first instead of leaving a copy of every take behind in the sandbox — and so a cached URL keeps
+/// meaning the same take after a re-render.
+///
+/// The name is the project's, lowercased and stripped of path separators, so what a recipient sees
+/// is what the Files picker would have named the same take: a project called "FIRST BEAT" arrives as
+/// `first beat.wav` either way.
+enum ByteWaveFile {
+    static func url(named name: String) -> URL {
+        let separators = CharacterSet(charactersIn: "/\\:")
+        let safeName = name.lowercased().components(separatedBy: separators).joined(separator: "-")
+        return FileManager.default.temporaryDirectory.appending(path: safeName).appendingPathExtension("wav")
     }
 
-    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
-        FileWrapper(regularFileWithContents: try JSONEncoder.bytePocketEncoder.encode(project))
+    /// Runs `body` against a staging file and promotes it to `url` only if the whole write succeeds.
+    ///
+    /// Writing into the destination directly would leave a fragment where a finished take belongs if
+    /// the app died mid-render — and the destination has a stable name, which the export cache keeps
+    /// nothing but a URL for, so a share would then hand out half a song. Staging beside it and
+    /// moving it into place in one step makes the swap all or nothing: what sits at `url` is either
+    /// the previous complete take or the new one.
+    static func withStagingFile(at url: URL, _ body: (FileHandle) throws -> Void) throws {
+        let staging = url.appendingPathExtension("partial")
+        try? FileManager.default.removeItem(at: staging)
+        guard FileManager.default.createFile(atPath: staging.path, contents: nil) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        let handle = try FileHandle(forWritingTo: staging)
+        do {
+            try body(handle)
+            try handle.close()
+        } catch {
+            try? handle.close()
+            try? FileManager.default.removeItem(at: staging)
+            throw error
+        }
+        try? FileManager.default.removeItem(at: url)
+        try FileManager.default.moveItem(at: staging, to: url)
     }
-}
-
-struct ByteWaveDocument: FileDocument {
-    static var readableContentTypes: [UTType] { [.bytePocketWave] }
-    let data: Data
-
-    init(data: Data = Data()) { self.data = data }
-    init(configuration: ReadConfiguration) throws { data = configuration.file.regularFileContents ?? Data() }
-    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper { FileWrapper(regularFileWithContents: data) }
 }
 
 extension JSONEncoder {
+    /// Used for the project library files the user keeps in the pocket. Pretty printing and key
+    /// sorting cost real time, but they buy a file that opens readably in a text editor and that
+    /// diffs cleanly, which is why stored projects keep them.
     static var bytePocketEncoder: JSONEncoder {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        return encoder
+    }
+
+    /// Used for the app's own stored payloads, which nothing reads by eye. Same JSON, same decoder,
+    /// minus the formatting that only exists for export files — the library is rewritten on every
+    /// edit, so this is the encoding that runs on the hot path.
+    static var bytePocketStorageEncoder: JSONEncoder {
+        let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         return encoder
     }
